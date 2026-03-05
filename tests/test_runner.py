@@ -192,7 +192,9 @@ class TestRunner:
 
 
 class TestPipelineMetadata:
-    def test_local_default(self):
+    def test_local_default(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        monkeypatch.delenv("GITLAB_CI", raising=False)
         meta = _pipeline_metadata()
         assert meta["provider"] == "local"
 
@@ -210,6 +212,7 @@ class TestPipelineMetadata:
         assert meta["commit_sha"] == "abc123"
 
     def test_gitlab_ci(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setenv("GITLAB_CI", "true")
         monkeypatch.setenv("CI_PIPELINE_ID", "67890")
         monkeypatch.setenv("CI_COMMIT_SHA", "def456")
