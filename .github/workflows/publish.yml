@@ -35,3 +35,27 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+
+  dispatch-submodule-update:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    environment: dispatch
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+          owner: Mipiti
+          repositories: mipiti
+
+      - name: Trigger submodule update in parent repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api repos/Mipiti/mipiti/dispatches \
+            -f event_type=submodule-update \
+            -f 'client_payload[submodule]=verify' \
+            -f 'client_payload[ref]=${{ github.sha }}'
