@@ -1,0 +1,26 @@
+Copyright (c) 2026 Mipiti, LLC. All rights reserved.
+
+This software and associated documentation files (the "Software") are the
+proprietary property of Mipiti, LLC. The Software is made available as source code
+for transparency and to facilitate integration with CI/CD pipelines.
+
+Permission is hereby granted, free of charge, to any person who has accepted
+the Mipiti Terms of Service (https://mipiti.io/terms), to use, copy, and run
+the Software solely for the purpose of verifying security controls against
+codebases and submitting evidence to Mipiti's services.
+
+The following restrictions apply:
+
+1. You may NOT modify, merge, publish, distribute, sublicense, or sell copies
+   of the Software.
+2. You may NOT use the Software to connect to any service other than Mipiti's
+   official API.
+3. You may NOT create derivative works based on the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

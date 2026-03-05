@@ -1,0 +1,58 @@
+name: Mipiti Verify
+description: Run security control verification against Mipiti threat models
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  model-id:
+    description: Mipiti threat model ID
+    required: true
+  api-key:
+    description: Mipiti API key
+    required: true
+  base-url:
+    description: API base URL (default https://api.mipiti.io)
+    required: false
+    default: "https://api.mipiti.io"
+  tier2-provider:
+    description: "AI provider for Tier 2 verification: openai, anthropic, or ollama"
+    required: true
+  tier2-model:
+    description: Model name (e.g. gpt-4o, claude-sonnet-4-5-20250514)
+    required: false
+    default: ""
+  tier2-api-key:
+    description: Provider API key (OpenAI or Anthropic)
+    required: false
+    default: ""
+  project-root:
+    description: Project root directory
+    required: false
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    - name: Install mipiti-verify
+      shell: bash
+      run: pip install "mipiti-verify[all]"
+
+    - name: Run verification
+      shell: bash
+      env:
+        MIPITI_API_KEY: ${{ inputs.api-key }}
+        MIPITI_BASE_URL: ${{ inputs.base-url }}
+        OPENAI_API_KEY: ${{ inputs.tier2-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.tier2-api-key }}
+      run: |
+        ARGS="run ${{ inputs.model-id }}"
+        ARGS="$ARGS --project-root ${{ inputs.project-root }}"
+        ARGS="$ARGS --tier2-provider ${{ inputs.tier2-provider }}"
+        ARGS="$ARGS --output github"
+
+        if [ -n "${{ inputs.tier2-model }}" ]; then
+          ARGS="$ARGS --tier2-model ${{ inputs.tier2-model }}"
+        fi
+
+        mipiti-verify $ARGS
