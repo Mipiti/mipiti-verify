@@ -96,6 +96,16 @@ class MipitiClient:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # Model listing (for --all mode)
+    # ------------------------------------------------------------------
+
+    def list_models(self) -> list[dict[str, Any]]:
+        """GET /api/models — list models accessible by this API key's workspace."""
+        resp = self._client.get("/api/models")
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # Model / controls info (for context)
     # ------------------------------------------------------------------
 

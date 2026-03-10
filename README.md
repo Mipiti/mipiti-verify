@@ -11,8 +11,14 @@ pip install mipiti-verify[all]
 ## Usage
 
 ```bash
-# Run verification
+# Verify a single model
 mipiti-verify run <model_id> \
+  --api-key $MIPITI_API_KEY \
+  --tier2-provider openai \
+  --project-root .
+
+# Verify all models in the workspace
+mipiti-verify run --all \
   --api-key $MIPITI_API_KEY \
   --tier2-provider openai \
   --project-root .
@@ -23,6 +29,8 @@ mipiti-verify list <model_id>
 # Show verification report
 mipiti-verify report <model_id>
 ```
+
+API keys are workspace-scoped — `--all` verifies every model accessible by the key.
 
 ## GitHub Action
 

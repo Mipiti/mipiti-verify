@@ -22,7 +22,8 @@ def main() -> None:
 
 
 @main.command()
-@click.argument("model_id")
+@click.argument("model_id", required=False, default=None)
+@click.option("--all", "run_all", is_flag=True, help="Verify all models in the API key's workspace")
 @click.option("--api-key", envvar="MIPITI_API_KEY", help="Mipiti API key")
 @click.option("--base-url", envvar="MIPITI_BASE_URL", default=None, help="API base URL")
 @click.option("--project-root", type=click.Path(exists=True), default=".", help="Project root directory")
@@ -46,7 +47,8 @@ def main() -> None:
 @click.option("--dry-run", is_flag=True, help="Run verifiers but don't submit results")
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 def run(
-    model_id: str,
+    model_id: str | None,
+    run_all: bool,
     api_key: str | None,
     base_url: str | None,
     project_root: str,
@@ -59,12 +61,36 @@ def run(
     dry_run: bool,
     verbose: bool,
 ) -> None:
-    """Run verification against pending assertions for MODEL_ID."""
+    """Run verification against pending assertions for MODEL_ID.
+
+    Use --all to verify all models in the workspace associated with the API key.
+    """
+    if not model_id and not run_all:
+        console.print("[red]Error:[/red] Provide MODEL_ID or use --all")
+        sys.exit(1)
+
     try:
         client = MipitiClient(api_key=api_key, base_url=base_url)
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
+
+    # Resolve model IDs to verify
+    if run_all:
+        try:
+            models = client.list_models()
+        except Exception as e:
+            console.print(f"[red]Error:[/red] Failed to list models: {e}")
+            client.close()
+            sys.exit(1)
+        model_ids = [m["id"] for m in models]
+        if not model_ids:
+            console.print("[yellow]No models found in workspace.[/yellow]")
+            client.close()
+            return
+        console.print(f"Verifying {len(model_ids)} model(s)...")
+    else:
+        model_ids = [model_id]
 
     runner = Runner(
         client=client,
@@ -78,26 +104,60 @@ def run(
         verbose=verbose,
     )
 
-    try:
-        report = runner.run(model_id)
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
-    finally:
-        client.close()
+    has_failures = False
+    all_reports: list[dict] = []
 
-    if output_format == "json":
-        click.echo(json.dumps(report, indent=2))
-    elif output_format == "github":
-        _github_output(report)
-    else:
-        _text_output(report, verbose)
+    for mid in model_ids:
+        if run_all:
+            console.print(f"\n[bold]--- {mid} ---[/bold]")
+        try:
+            report = runner.run(mid)
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            has_failures = True
+            continue
 
-    if (
-        report.get("tier1_fail", 0) > 0
-        or report.get("tier2_fail", 0) > 0
-        or report.get("suff_insufficient", 0) > 0
-    ):
+        report["model_id"] = mid
+        all_reports.append(report)
+
+        if (
+            report.get("tier1_fail", 0) > 0
+            or report.get("tier2_fail", 0) > 0
+            or report.get("suff_insufficient", 0) > 0
+        ):
+            has_failures = True
+
+        if not run_all:
+            # Single model — output immediately
+            if output_format == "json":
+                click.echo(json.dumps(report, indent=2))
+            elif output_format == "github":
+                _github_output(report)
+            else:
+                _text_output(report, verbose)
+
+    client.close()
+
+    if run_all:
+        if output_format == "json":
+            click.echo(json.dumps(all_reports, indent=2))
+        elif output_format == "github":
+            for report in all_reports:
+                _github_output(report)
+        else:
+            for report in all_reports:
+                _text_output(report, verbose)
+            # Summary
+            total = len(all_reports)
+            failed = sum(
+                1 for r in all_reports
+                if r.get("tier1_fail", 0) > 0 or r.get("tier2_fail", 0) > 0 or r.get("suff_insufficient", 0) > 0
+            )
+            console.print(f"\n[bold]Summary:[/bold] {total} model(s) verified, "
+                          f"[green]{total - failed} passed[/green], "
+                          f"[red]{failed} failed[/red]")
+
+    if has_failures:
         sys.exit(1)
 
 
