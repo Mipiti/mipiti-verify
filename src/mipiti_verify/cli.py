@@ -101,6 +101,178 @@ def run(
         sys.exit(1)
 
 
+@main.command()
+@click.argument("assertions_file", type=click.Path(exists=True))
+@click.option("--project-root", type=click.Path(exists=True), default=".", help="Project root directory")
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json", "github"], case_sensitive=False),
+    default="text",
+    help="Output format",
+)
+@click.option("--verbose", is_flag=True, help="Show per-assertion detail")
+def check(
+    assertions_file: str,
+    project_root: str,
+    output_format: str,
+    verbose: bool,
+) -> None:
+    """Verify assertions locally from a JSON file (no API key needed).
+
+    ASSERTIONS_FILE is a JSON file containing an array of assertion objects,
+    each with "type", "params", and "description" fields. Only Tier 1
+    (mechanical) verification is performed.
+
+    Example file:
+
+    \b
+    [
+      {"type": "function_exists", "params": {"file": "app/auth.py", "name": "verify_token"}, "description": "Auth token verification exists"},
+      {"type": "pattern_matches", "params": {"file": "nginx.conf", "pattern": "Strict-Transport-Security"}, "description": "HSTS header configured"}
+    ]
+    """
+    from pathlib import Path
+
+    from .verifiers import get_verifier
+
+    try:
+        with open(assertions_file, encoding="utf-8") as f:
+            assertions = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        console.print(f"[red]Error:[/red] Failed to read assertions file: {e}")
+        sys.exit(1)
+
+    if not isinstance(assertions, list):
+        console.print("[red]Error:[/red] Assertions file must contain a JSON array")
+        sys.exit(1)
+
+    root = Path(project_root).resolve()
+    results: list[dict] = []
+    passed_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    for i, assertion in enumerate(assertions):
+        a_type = assertion.get("type", "")
+        params = assertion.get("params", {})
+        desc = assertion.get("description", f"assertion[{i}]")
+        a_id = assertion.get("id", f"local_{i:03d}")
+
+        verifier = get_verifier(a_type)
+        if verifier is None:
+            results.append({"id": a_id, "type": a_type, "description": desc, "passed": False, "details": f"No verifier for type '{a_type}'"})
+            skipped_count += 1
+            continue
+
+        try:
+            result = verifier.verify(params, root)
+            results.append({"id": a_id, "type": a_type, "description": desc, "passed": result.passed, "details": result.details})
+            if result.passed:
+                passed_count += 1
+            else:
+                failed_count += 1
+        except Exception as e:
+            results.append({"id": a_id, "type": a_type, "description": desc, "passed": False, "details": f"Verifier error: {e}"})
+            failed_count += 1
+
+    report = {"passed": passed_count, "failed": failed_count, "skipped": skipped_count, "total": len(assertions), "results": results}
+
+    if output_format == "json":
+        click.echo(json.dumps(report, indent=2))
+    elif output_format == "github":
+        for r in results:
+            if not r["passed"]:
+                click.echo(f"::error title=Check Failed::{r['id']} ({r['type']}): {r['details']}")
+        if failed_count:
+            click.echo(f"::error title=Check Summary::{failed_count} failures out of {len(assertions)} assertions")
+        else:
+            click.echo(f"::notice title=Check Passed::{passed_count} assertions verified locally")
+    else:
+        console.print(f"\n[bold]Local Check Results[/bold]\n")
+        console.print(f"  [green]{passed_count} pass[/green]  [red]{failed_count} fail[/red]  [yellow]{skipped_count} skip[/yellow]")
+        if verbose or failed_count:
+            console.print()
+            for r in results:
+                color = "green" if r["passed"] else "red"
+                console.print(f"  [{color}]{r['id']}[/{color}] ({r['type']}): {r['details']}")
+                if verbose:
+                    console.print(f"    {r['description']}")
+        console.print()
+
+    if failed_count > 0:
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("assertion_type")
+@click.option("--param", "-p", multiple=True, help="Assertion parameter as key=value (repeatable)")
+@click.option("--project-root", type=click.Path(exists=True), default=".", help="Project root directory")
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"], case_sensitive=False),
+    default="text",
+    help="Output format",
+)
+def verify(
+    assertion_type: str,
+    param: tuple[str, ...],
+    project_root: str,
+    output_format: str,
+) -> None:
+    """Verify a single assertion locally (no API key needed).
+
+    Run a Tier 1 mechanical check against the local codebase.
+
+    \b
+    Examples:
+      mipiti-verify verify function_exists -p file=app/auth.py -p name=verify_token
+      mipiti-verify verify pattern_matches -p file=nginx.conf -p pattern="Strict-Transport-Security"
+      mipiti-verify verify dependency_exists -p manifest=requirements.txt -p package=bcrypt
+      mipiti-verify verify import_present -p file=app/main.py -p module=fastapi
+    """
+    from pathlib import Path
+
+    from .verifiers import get_verifier
+
+    verifier = get_verifier(assertion_type)
+    if verifier is None:
+        if output_format == "json":
+            click.echo(json.dumps({"passed": False, "type": assertion_type, "details": f"No verifier for type '{assertion_type}'"}))
+        else:
+            console.print(f"[red]FAIL[/red] No verifier for type '{assertion_type}'")
+        sys.exit(1)
+
+    params: dict[str, str] = {}
+    for p in param:
+        if "=" not in p:
+            console.print(f"[red]Error:[/red] Invalid param '{p}' — use key=value format")
+            sys.exit(1)
+        key, value = p.split("=", 1)
+        params[key] = value
+
+    root = Path(project_root).resolve()
+    try:
+        result = verifier.verify(params, root)
+    except Exception as e:
+        if output_format == "json":
+            click.echo(json.dumps({"passed": False, "type": assertion_type, "params": params, "details": f"Verifier error: {e}"}))
+        else:
+            console.print(f"[red]FAIL[/red] ({assertion_type}) Verifier error: {e}")
+        sys.exit(1)
+
+    if output_format == "json":
+        click.echo(json.dumps({"passed": result.passed, "type": assertion_type, "params": params, "details": result.details}))
+    else:
+        color = "green" if result.passed else "red"
+        label = "PASS" if result.passed else "FAIL"
+        console.print(f"[{color}]{label}[/{color}] ({assertion_type}) {result.details}")
+
+    if not result.passed:
+        sys.exit(1)
+
+
 @main.command(name="list")
 @click.argument("model_id")
 @click.option("--api-key", envvar="MIPITI_API_KEY", help="Mipiti API key")
@@ -116,6 +288,9 @@ def list_pending(model_id: str, api_key: str | None, base_url: str | None) -> No
     try:
         t1 = client.get_pending(model_id, tier=1)
         t2 = client.get_pending(model_id, tier=2)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
     finally:
         client.close()
 
@@ -147,6 +322,9 @@ def report(model_id: str, api_key: str | None, base_url: str | None) -> None:
 
     try:
         data = client.get_verification_report(model_id)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
     finally:
         client.close()
 
