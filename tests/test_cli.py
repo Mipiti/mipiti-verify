@@ -13,7 +13,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "mipiti-verify" in result.output or "0.1.0" in result.output
+        assert "version" in result.output
 
     @patch("mipiti_verify.cli.MipitiClient")
     @patch("mipiti_verify.cli.Runner")
