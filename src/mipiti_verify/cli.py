@@ -45,6 +45,7 @@ def main() -> None:
     help="Output format",
 )
 @click.option("--dry-run", is_flag=True, help="Run verifiers but don't submit results")
+@click.option("--reverify", is_flag=True, help="Re-verify all assertions, not just pending")
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 def run(
     model_id: str | None,
@@ -59,11 +60,13 @@ def run(
     oidc_token: str | None,
     output_format: str,
     dry_run: bool,
+    reverify: bool,
     verbose: bool,
 ) -> None:
     """Run verification against pending assertions for MODEL_ID.
 
     Use --all to verify all models in the workspace associated with the API key.
+    Use --reverify to re-verify all assertions (not just pending).
     """
     if not model_id and not run_all:
         console.print("[red]Error:[/red] Provide MODEL_ID or use --all")
@@ -101,6 +104,7 @@ def run(
         ollama_url=ollama_url,
         oidc_token=oidc_token,
         dry_run=dry_run,
+        reverify=reverify,
         verbose=verbose,
     )
 

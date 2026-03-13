@@ -29,6 +29,7 @@ class Runner:
         ollama_url: str = "http://localhost:11434",
         oidc_token: str | None = None,
         dry_run: bool = False,
+        reverify: bool = False,
         verbose: bool = False,
     ) -> None:
         self.client = client
@@ -39,6 +40,7 @@ class Runner:
         self.ollama_url = ollama_url
         self.oidc_token = oidc_token or _auto_detect_oidc()
         self.dry_run = dry_run
+        self.reverify = reverify
         self.verbose = verbose
 
     def run(self, model_id: str) -> dict[str, Any]:
@@ -96,7 +98,10 @@ class Runner:
         self, model_id: str, tier: int
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Run verification for a single tier. Returns (api_results, detail_records)."""
-        pending = self.client.get_pending(model_id, tier=tier)
+        if self.reverify:
+            pending = self.client.get_all_assertions(model_id)
+        else:
+            pending = self.client.get_pending(model_id, tier=tier)
         controls = pending.get("controls", {})
         if not controls:
             if self.verbose:

@@ -61,6 +61,21 @@ class MipitiClient:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # All assertions (for --reverify mode)
+    # ------------------------------------------------------------------
+
+    def get_all_assertions(self, model_id: str) -> dict[str, Any]:
+        """GET /api/models/{id}/verification/assertions
+
+        Returns ``{"model_id": ..., "controls": {ctrl_id: [assertions]}}``
+        """
+        resp = self._client.get(
+            f"/api/models/{model_id}/verification/assertions",
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # Submit results
     # ------------------------------------------------------------------
 
