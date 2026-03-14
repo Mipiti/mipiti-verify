@@ -33,9 +33,18 @@ class OpenAIProvider(Tier2Provider):
 
     def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
         messages = [{"role": "user", "content": _build_message(prompt, source_code)}]
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, temperature=0, max_tokens=1000
-        )
+        # Newer OpenAI models (o-series, gpt-5+) require max_completion_tokens
+        # instead of max_tokens.  Try the new param first, fall back on error.
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model, messages=messages, temperature=0,
+                max_completion_tokens=1000,
+            )
+        except Exception:
+            resp = self.client.chat.completions.create(
+                model=self.model, messages=messages, temperature=0,
+                max_tokens=1000,
+            )
         text = resp.choices[0].message.content or ""
         return _parse_response(text)
 
