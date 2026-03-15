@@ -38,7 +38,14 @@ class Runner:
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
         self.ollama_url = ollama_url
-        self.oidc_token = oidc_token or _auto_detect_oidc()
+        # Fetch attestation audience from backend
+        _aud = ""
+        try:
+            _config = client.get_verification_config()
+            _aud = _config.get("attestation_audience", "")
+        except Exception:
+            pass  # backend may not support this endpoint yet
+        self.oidc_token = oidc_token or _auto_detect_oidc(_aud)
         self.dry_run = dry_run
         self.reverify = reverify
         self.verbose = verbose
@@ -310,7 +317,7 @@ class Runner:
         return results
 
 
-def _auto_detect_oidc() -> str:
+def _auto_detect_oidc(audience: str = "") -> str:
     """Auto-detect OIDC token from CI environment."""
     # GitHub Actions
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
@@ -319,7 +326,11 @@ def _auto_detect_oidc() -> str:
         try:
             import httpx
 
-            resp = httpx.get(url, headers={"Authorization": f"Bearer {token}"})
+            if audience:
+                aud_url = f"{url}&audience={audience}" if "?" in url else f"{url}?audience={audience}"
+            else:
+                aud_url = url
+            resp = httpx.get(aud_url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
             return resp.json().get("value", "")
         except Exception:
