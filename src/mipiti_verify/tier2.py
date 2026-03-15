@@ -38,12 +38,10 @@ class OpenAIProvider(Tier2Provider):
         try:
             resp = self.client.chat.completions.create(
                 model=self.model, messages=messages, temperature=0,
-                max_completion_tokens=1000,
             )
         except Exception:
             resp = self.client.chat.completions.create(
                 model=self.model, messages=messages, temperature=0,
-                max_tokens=1000,
             )
         text = resp.choices[0].message.content or ""
         return _parse_response(text)
@@ -64,7 +62,7 @@ class AnthropicProvider(Tier2Provider):
     def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
         message = self.client.messages.create(
             model=self.model,
-            max_tokens=1000,
+            max_tokens=8192,  # Anthropic requires max_tokens; high ceiling, model finishes naturally
             messages=[{"role": "user", "content": _build_message(prompt, source_code)}],
         )
         text = message.content[0].text if message.content else ""
