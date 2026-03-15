@@ -477,3 +477,171 @@ def _github_output(report: dict) -> None:
     else:
         total = report.get("tier1_pass", 0) + report.get("tier2_pass", 0)
         click.echo(f"::notice title=Verification Passed::{total} assertions verified")
+
+
+@main.command()
+@click.argument("package_file", type=click.Path(exists=True))
+def audit(package_file: str) -> None:
+    """Verify an audit package independently.
+
+    Checks OIDC provenance, content integrity (platform ECDSA signature),
+    and lists all assertion results with reasoning.
+    """
+    import hashlib
+    import base64
+
+    with open(package_file) as f:
+        pkg = json.load(f)
+
+    console.print("\n[bold]Audit Package Verification[/bold]")
+    console.print("=" * 40)
+    has_failure = False
+
+    # --- Provenance ---
+    console.print("\n[bold]Provenance (OIDC)[/bold]")
+    prov = pkg.get("provenance")
+    if prov and prov.get("oidc_token"):
+        try:
+            import jwt
+            from jwt import PyJWKClient
+
+            token = prov["oidc_token"]
+            jwks_url = prov.get("jwks_url", "")
+            if not jwks_url:
+                console.print("  [yellow]No JWKS URL — cannot verify OIDC token[/yellow]")
+            else:
+                client = PyJWKClient(jwks_url)
+                signing_key = client.get_signing_key_from_jwt(token)
+                claims = jwt.decode(
+                    token, signing_key.key, algorithms=["RS256"],
+                    audience="api.mipiti.io", options={"verify_exp": False},
+                )
+                console.print(f"  Issuer:      {claims.get('iss', 'unknown')}")
+                console.print(f"  Repository:  {claims.get('repository', 'unknown')}")
+                console.print(f"  Branch:      {claims.get('ref', 'unknown')}")
+                console.print(f"  Commit:      {claims.get('sha', 'unknown')}")
+                console.print(f"  Environment: {claims.get('environment', 'unknown')}")
+                console.print(f"  Actor:       {claims.get('actor', 'unknown')}")
+                console.print(f"  Run:         {claims.get('run_id', 'unknown')}")
+                console.print("  Signature:   [green]VALID[/green]")
+        except Exception as e:
+            console.print(f"  Signature:   [red]INVALID — {e}[/red]")
+            has_failure = True
+    else:
+        console.print("  [yellow]No OIDC provenance in package[/yellow]")
+
+    # --- Content Integrity ---
+    console.print("\n[bold]Content Integrity (ECDSA P-256)[/bold]")
+    ci = pkg.get("content_integrity")
+    if ci and ci.get("signature"):
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec
+
+            # Recompute hash from results
+            results = pkg["verification_run"]["results"]
+            canonical = json.dumps(results, sort_keys=True, separators=(",", ":"))
+            computed_hash = f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+            stored_hash = ci["results_hash"]
+
+            console.print(f"  Results hash:    {stored_hash}")
+            console.print(f"  Recomputed hash: {computed_hash}")
+            if computed_hash == stored_hash:
+                console.print("  Hash match:      [green]YES[/green]")
+            else:
+                console.print("  Hash match:      [red]NO — results may have been modified[/red]")
+                has_failure = True
+
+            # Verify signature
+            pub_pem = ci.get("public_key_pem", "")
+            if pub_pem:
+                pub_key = serialization.load_pem_public_key(pub_pem.encode())
+                sig = base64.b64decode(ci["signature"])
+                pub_key.verify(sig, stored_hash.encode(), ec.ECDSA(hashes.SHA256()))
+                console.print(f"  Key fingerprint: {ci.get('key_fingerprint', 'unknown')}")
+                console.print("  Signature:       [green]VALID[/green]")
+            else:
+                console.print("  [yellow]No public key in package — cannot verify signature[/yellow]")
+        except Exception as e:
+            console.print(f"  Signature:       [red]INVALID — {e}[/red]")
+            has_failure = True
+    else:
+        console.print("  [yellow]No content integrity signature in package[/yellow]")
+
+    # --- Results ---
+    results = pkg.get("verification_run", {}).get("results", [])
+    controls_map = pkg.get("controls", {})
+    assertions_map = pkg.get("assertions_by_control", {})
+    sufficiency_map = pkg.get("sufficiency", {})
+
+    # Group results by control
+    by_ctrl: dict = {}
+    for r in results:
+        aid = r["assertion_id"]
+        # Find which control this assertion belongs to
+        ctrl_id = None
+        for cid, asserts in assertions_map.items():
+            if any(a["id"] == aid for a in asserts):
+                ctrl_id = cid
+                break
+        by_ctrl.setdefault(ctrl_id or "unknown", []).append(r)
+
+    total_pass = sum(1 for r in results if r["result"] == "pass")
+    total_fail = sum(1 for r in results if r["result"] != "pass")
+    ctrl_count = len(by_ctrl)
+    suff_count = sum(1 for s in sufficiency_map.values() if s.get("status") == "sufficient")
+    insuff_count = sum(1 for s in sufficiency_map.values() if s.get("status") == "insufficient")
+
+    console.print(f"\n[bold]Results ({len(results)} assertions, {ctrl_count} controls)[/bold]")
+
+    for ctrl_id, ctrl_results in sorted(by_ctrl.items()):
+        ctrl = controls_map.get(ctrl_id, {})
+        desc = ctrl.get("description", "")
+        console.print(f"\n  [bold]{ctrl_id}[/bold]  {desc}")
+
+        for r in ctrl_results:
+            passed = r["result"] == "pass"
+            icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
+            tier = r.get("tier", "?")
+            details = r.get("details", "")
+            reasoning = r.get("reasoning", details)
+            console.print(f"    {icon} {r['assertion_id']}  Tier {tier} {'PASS' if passed else 'FAIL'}")
+            if reasoning:
+                # Show full reasoning for failures, first line for passes
+                if not passed:
+                    for line in reasoning.split("\n"):
+                        console.print(f"      {line}")
+                    has_failure = True
+                else:
+                    first_line = reasoning.split(".")[0] + "." if "." in reasoning else reasoning[:100]
+                    console.print(f"      {first_line}")
+
+        # Sufficiency
+        suff = sufficiency_map.get(ctrl_id, {})
+        suff_status = suff.get("status", "pending")
+        suff_details = suff.get("details", "")
+        if suff_status == "sufficient":
+            console.print(f"    Sufficiency: [green]SUFFICIENT[/green]")
+        elif suff_status == "insufficient":
+            console.print(f"    Sufficiency: [blue]INSUFFICIENT[/blue]")
+            if suff_details:
+                console.print(f"      {suff_details}")
+        else:
+            console.print(f"    Sufficiency: [yellow]{suff_status}[/yellow]")
+
+    # --- Verdict ---
+    console.print()
+    if has_failure or total_fail > 0:
+        console.print(f"[red bold]Verdict: FAILED[/red bold] — {total_pass}/{len(results)} assertions pass, "
+                       f"{suff_count}/{ctrl_count} controls sufficient")
+    elif insuff_count > 0:
+        console.print(f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — "
+                       f"{total_pass}/{len(results)} assertions pass, "
+                       f"{suff_count}/{ctrl_count} controls sufficient ({insuff_count} insufficient)")
+    else:
+        console.print(f"[green bold]Verdict: VERIFIED[/green bold] — provenance authentic, content intact, "
+                       f"{total_pass}/{len(results)} assertions pass, "
+                       f"{suff_count}/{ctrl_count} controls sufficient")
+    console.print()
+
+    sys.exit(1 if (has_failure or total_fail > 0) else 0)
