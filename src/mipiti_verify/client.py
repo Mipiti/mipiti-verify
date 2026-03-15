@@ -47,15 +47,18 @@ class MipitiClient:
     # ------------------------------------------------------------------
 
     def get_pending(
-        self, model_id: str, tier: int = 1, stale_after: int = 24
+        self, model_id: str, tier: int = 1, stale_after: int = 24, repo: str = "",
     ) -> dict[str, Any]:
-        """GET /api/models/{id}/verification/pending?tier={t}
+        """GET /api/models/{id}/verification/pending?tier={t}&repo={r}
 
         Returns ``{"model_id": ..., "tier": ..., "controls": {ctrl_id: [assertions]}}``
         """
+        params: dict[str, Any] = {"tier": tier, "stale_after": stale_after}
+        if repo:
+            params["repo"] = repo
         resp = self._client.get(
             f"/api/models/{model_id}/verification/pending",
-            params={"tier": tier, "stale_after": stale_after},
+            params=params,
         )
         resp.raise_for_status()
         return resp.json()
@@ -64,13 +67,17 @@ class MipitiClient:
     # All assertions (for --reverify mode)
     # ------------------------------------------------------------------
 
-    def get_all_assertions(self, model_id: str) -> dict[str, Any]:
-        """GET /api/models/{id}/verification/assertions
+    def get_all_assertions(self, model_id: str, repo: str = "") -> dict[str, Any]:
+        """GET /api/models/{id}/verification/assertions?repo={r}
 
         Returns ``{"model_id": ..., "controls": {ctrl_id: [assertions]}}``
         """
+        params: dict[str, Any] = {}
+        if repo:
+            params["repo"] = repo
         resp = self._client.get(
             f"/api/models/{model_id}/verification/assertions",
+            params=params,
         )
         resp.raise_for_status()
         return resp.json()
