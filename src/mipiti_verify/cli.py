@@ -456,11 +456,20 @@ def _text_output(report: dict, verbose: bool) -> None:
 
 
 def _github_output(report: dict) -> None:
-    """Print GitHub Actions annotations."""
-    for detail in report.get("details", []):
-        if not detail["passed"]:
-            click.echo(f"::error title=Verification Failed::{detail['assertion_id']} "
-                       f"({detail['type']}): {detail['details']}")
+    """Print GitHub Actions annotations with per-assertion detail."""
+    details = report.get("details", [])
+    # Group by tier for clear output
+    for tier in (1, 2):
+        tier_details = [d for d in details if d.get("tier") == tier]
+        if not tier_details:
+            continue
+        passed = [d for d in tier_details if d["passed"]]
+        failed = [d for d in tier_details if not d["passed"]]
+        for d in passed:
+            click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details'][:200]}")
+        for d in failed:
+            click.echo(f"::error title=Verification Failed::{d['assertion_id']} "
+                       f"({d['type']}): {d['details']}")
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
     if t1f or t2f:
