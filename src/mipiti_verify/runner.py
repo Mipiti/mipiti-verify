@@ -31,9 +31,11 @@ class Runner:
         dry_run: bool = False,
         reverify: bool = False,
         verbose: bool = False,
+        repo: str = "",
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
+        self.repo = repo or _auto_detect_repo(self.project_root)
         self.tier2_provider_name = tier2_provider
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
@@ -106,9 +108,9 @@ class Runner:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Run verification for a single tier. Returns (api_results, detail_records)."""
         if self.reverify:
-            pending = self.client.get_all_assertions(model_id)
+            pending = self.client.get_all_assertions(model_id, repo=self.repo)
         else:
-            pending = self.client.get_pending(model_id, tier=tier)
+            pending = self.client.get_pending(model_id, tier=tier, repo=self.repo)
         controls = pending.get("controls", {})
         if not controls:
             if self.verbose:
@@ -315,6 +317,34 @@ class Runner:
                         console.print(f"  Failed to submit sufficiency results: {e}")
 
         return results
+
+
+def _auto_detect_repo(project_root: Path) -> str:
+    """Auto-detect repository name from CI environment or git remote."""
+    # GitHub Actions
+    gh_repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if gh_repo:
+        return gh_repo
+    # GitLab CI
+    gl_repo = os.environ.get("CI_PROJECT_PATH", "")
+    if gl_repo:
+        return gl_repo
+    # Git remote
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, cwd=str(project_root),
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            for prefix in ("git@github.com:", "https://github.com/",
+                           "git@gitlab.com:", "https://gitlab.com/"):
+                if url.startswith(prefix):
+                    return url[len(prefix):].removesuffix(".git")
+    except Exception:
+        pass
+    return ""
 
 
 def _auto_detect_oidc(audience: str = "") -> str:

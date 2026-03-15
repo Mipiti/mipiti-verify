@@ -47,6 +47,7 @@ def main() -> None:
 @click.option("--dry-run", is_flag=True, help="Run verifiers but don't submit results")
 @click.option("--reverify", is_flag=True, help="Re-verify all assertions, not just pending")
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
+@click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 def run(
     model_id: str | None,
     run_all: bool,
@@ -62,6 +63,7 @@ def run(
     dry_run: bool,
     reverify: bool,
     verbose: bool,
+    repo: str,
 ) -> None:
     """Run verification against pending assertions for MODEL_ID.
 
@@ -106,6 +108,7 @@ def run(
         dry_run=dry_run,
         reverify=reverify,
         verbose=verbose,
+        repo=repo,
     )
 
     has_failures = False
