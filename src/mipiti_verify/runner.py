@@ -227,7 +227,7 @@ class Runner:
             passed, reasoning = provider.evaluate(tier2_prompt, source_code)
             return {
                 "status": "pass" if passed else "fail",
-                "details": reasoning[:500],
+                "details": reasoning,
                 "reasoning": reasoning,
                 "reviewer": f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}",
             }
@@ -290,7 +290,7 @@ class Runner:
                     results.append({
                         "control_id": ctrl_id,
                         "result": result,
-                        "details": reasoning[:500],
+                        "details": reasoning,
                     })
                 except Exception as e:
                     results.append({
