@@ -466,7 +466,7 @@ def _github_output(report: dict) -> None:
         passed = [d for d in tier_details if d["passed"]]
         failed = [d for d in tier_details if not d["passed"]]
         for d in passed:
-            click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details'][:200]}")
+            click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details']}")
         for d in failed:
             click.echo(f"::error title=Verification Failed::{d['assertion_id']} "
                        f"({d['type']}): {d['details']}")
