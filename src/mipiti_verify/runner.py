@@ -184,8 +184,25 @@ class Runner:
             if fpath.is_file():
                 try:
                     content = fpath.read_text(encoding="utf-8", errors="replace")
-                    # Truncate to ~4K tokens (~16K chars)
-                    if len(content) > 16000:
+                    # For pattern_matches/pattern_absent, center context around
+                    # the match rather than taking the file head — ensures the
+                    # reviewer sees the relevant code even in large files.
+                    pattern = params.get("pattern", "")
+                    a_type = assertion.get("type", "")
+                    if len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
+                        import re
+                        match = re.search(pattern, content)
+                        if match:
+                            center = match.start()
+                            # Take ~8K chars before and after the match
+                            start = max(0, center - 8000)
+                            end = min(len(content), center + 8000)
+                            prefix = "... (truncated)\n" if start > 0 else ""
+                            suffix = "\n... (truncated)" if end < len(content) else ""
+                            content = prefix + content[start:end] + suffix
+                        else:
+                            content = content[:16000] + "\n... (truncated)"
+                    elif len(content) > 16000:
                         content = content[:16000] + "\n... (truncated)"
                     source_code = content
                 except Exception:
