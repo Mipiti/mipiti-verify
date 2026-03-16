@@ -16,6 +16,28 @@ from .verifiers import get_verifier
 console = Console(stderr=True)
 
 
+def extract_gap_summary(details: str, max_len: int = 120) -> str:
+    """Extract a concise one-line gap summary from verbose sufficiency details."""
+    import re
+    if not details or not details.strip():
+        return ""
+    sentences = re.split(r'(?<=[.!?])\s+', details.strip())
+    gap_keywords = re.compile(
+        r'missing|not covered|not proven|not evidenced|lacks|absent|no assertion|no evidence|gap|does not cover|does not prove|does not address',
+        re.IGNORECASE,
+    )
+    gap_sentences = [s for s in sentences if gap_keywords.search(s)]
+    if gap_sentences:
+        summary = " ".join(gap_sentences)
+        summary = re.sub(r'\*\*', '', summary)
+    else:
+        summary = sentences[0] if sentences else details[:max_len]
+        summary = re.sub(r'\*\*', '', summary)
+    if len(summary) > max_len:
+        summary = summary[:max_len - 3].rsplit(" ", 1)[0] + "..."
+    return summary
+
+
 class Runner:
     """Orchestrates the pull → verify → submit flow."""
 
@@ -101,6 +123,7 @@ class Runner:
             "tier2_run_id": t2_run_id,
             "dry_run": self.dry_run,
             "details": details,
+            "suff_details": suff_results,
         }
 
     def _run_tier(
