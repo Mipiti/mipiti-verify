@@ -16,8 +16,8 @@ from .verifiers import get_verifier
 console = Console(stderr=True)
 
 
-def extract_gap_summary(details: str, max_len: int = 120) -> str:
-    """Extract a concise one-line gap summary from verbose sufficiency details."""
+def extract_gap_summary(details: str) -> str:
+    """Extract the actionable gap description from verbose sufficiency details."""
     import re
     if not details or not details.strip():
         return ""
@@ -29,12 +29,9 @@ def extract_gap_summary(details: str, max_len: int = 120) -> str:
     gap_sentences = [s for s in sentences if gap_keywords.search(s)]
     if gap_sentences:
         summary = " ".join(gap_sentences)
-        summary = re.sub(r'\*\*', '', summary)
     else:
-        summary = sentences[0] if sentences else details[:max_len]
-        summary = re.sub(r'\*\*', '', summary)
-    if len(summary) > max_len:
-        summary = summary[:max_len - 3].rsplit(" ", 1)[0] + "..."
+        summary = details.strip()
+    summary = re.sub(r'\*\*', '', summary)
     return summary
 
 
