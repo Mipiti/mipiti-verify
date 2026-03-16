@@ -486,7 +486,11 @@ def _github_output(report: dict) -> None:
         if sd.get("result") == "insufficient":
             gap = extract_gap_summary(sd.get("details", ""))
             if gap:
-                click.echo(f"::warning title=Insufficient Coverage::{sd['control_id']}: {gap}")
+                ctrl_id = sd["control_id"]
+                for line in gap.split("\n"):
+                    line = line.strip()
+                    if line:
+                        click.echo(f"::warning title=Insufficient Coverage::{ctrl_id}: {line}")
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
     if t1f or t2f:
