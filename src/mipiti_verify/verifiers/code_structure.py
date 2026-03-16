@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import VerifierResult, register
+from . import PathTraversalError, VerifierResult, register, safe_read_file, safe_regex_search
 
 
 @register("function_exists")
@@ -23,12 +23,14 @@ class FunctionExistsVerifier:
     ]
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
         name = re.escape(params["name"])
-        content = file_path.read_text(encoding="utf-8", errors="replace")
 
         for pattern_template in self._PATTERNS:
             pattern = pattern_template.format(name=name)
@@ -56,12 +58,14 @@ class ClassExistsVerifier:
     ]
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
         name = re.escape(params["name"])
-        content = file_path.read_text(encoding="utf-8", errors="replace")
 
         for pattern_template in self._PATTERNS:
             pattern = pattern_template.format(name=name)
@@ -81,11 +85,13 @@ class DecoratorPresentVerifier:
     """Check that a decorator is applied to a function."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         decorator = re.escape(params["decorator"])
         function = re.escape(params["function"])
 
@@ -110,11 +116,13 @@ class FunctionCallsVerifier:
     """Check that a function calls another function."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         caller = params["caller"]
         callee = params["callee"]
 
@@ -159,11 +167,13 @@ class ImportPresentVerifier:
     """Check that a module is imported in a file."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         module = params["module"]
 
         # Python: import X, from X import ...

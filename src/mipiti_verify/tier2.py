@@ -136,6 +136,8 @@ def _parse_response(text: str) -> Tuple[bool, str]:
         return True, reasoning
     if re.match(r"^(NO|FAIL|FAILED|NOT\s+VERIFIED|INCOHERENT|INSUFFICIENT)\b", first_line):
         return False, reasoning
+    if "INJECTION_DETECTED" in first_line:
+        return False, "Prompt injection detected in assertion content."
 
     # Fallback: look for keywords anywhere in first line
     if any(w in first_line for w in ("YES", "PASS", "VERIFIED", "SUFFICIENT")):

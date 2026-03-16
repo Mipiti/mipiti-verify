@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
-from . import VerifierResult, register
+from . import (
+    PathTraversalError,
+    RegexTimeoutError,
+    VerifierResult,
+    register,
+    safe_read_file,
+    safe_regex_search,
+    safe_resolve_path,
+)
 
 
 @register("file_exists")
 class FileExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if file_path.is_file():
+        try:
+            resolved = safe_resolve_path(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if resolved.is_file():
             return VerifierResult(passed=True, details=f"File exists: {params['file']}")
         return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
@@ -21,8 +31,11 @@ class FileExistsVerifier:
 @register("file_hash")
 class FileHashVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            resolved = safe_resolve_path(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if not resolved.is_file():
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
         algorithm = params.get("algorithm", "sha256")
@@ -30,7 +43,7 @@ class FileHashVerifier:
 
         try:
             h = hashlib.new(algorithm)
-            h.update(file_path.read_bytes())
+            h.update(resolved.read_bytes())
             actual = h.hexdigest()
         except ValueError:
             return VerifierResult(passed=False, details=f"Unsupported hash algorithm: {algorithm}")
@@ -43,14 +56,19 @@ class FileHashVerifier:
 @register("pattern_matches")
 class PatternMatchesVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         pattern = params["pattern"]
+        try:
+            match = safe_regex_search(pattern, content)
+        except RegexTimeoutError as e:
+            return VerifierResult(passed=False, details=str(e))
 
-        match = re.search(pattern, content)
         if match:
             return VerifierResult(passed=True, details=f"Pattern found: {pattern}")
         return VerifierResult(passed=False, details=f"Pattern not found: {pattern}")
@@ -59,14 +77,19 @@ class PatternMatchesVerifier:
 @register("pattern_absent")
 class PatternAbsentVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         pattern = params["pattern"]
+        try:
+            match = safe_regex_search(pattern, content)
+        except RegexTimeoutError as e:
+            return VerifierResult(passed=False, details=str(e))
 
-        match = re.search(pattern, content)
         if match:
             return VerifierResult(passed=False, details=f"Pattern found (should be absent): {pattern}")
         return VerifierResult(passed=True, details=f"Pattern correctly absent: {pattern}")
@@ -75,17 +98,21 @@ class PatternAbsentVerifier:
 @register("no_plaintext_secret")
 class NoPlaintextSecretVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         patterns = params.get("patterns", [])
         found = []
-
         for pattern in patterns:
-            if re.search(pattern, content):
-                found.append(pattern)
+            try:
+                if safe_regex_search(pattern, content):
+                    found.append(pattern)
+            except RegexTimeoutError:
+                found.append(f"{pattern} (timed out)")
 
         if found:
             return VerifierResult(passed=False, details=f"Plaintext secrets found: {', '.join(found)}")

@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-from . import VerifierResult, register
+from . import PathTraversalError, VerifierResult, register, safe_resolve_path
 
 
 def _parse_manifest(file_path: Path) -> dict[str, str]:
@@ -148,7 +148,10 @@ def _parse_pom_xml(content: str) -> dict[str, str]:
 @register("dependency_exists")
 class DependencyExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        manifest_path = project_root / params["manifest"]
+        try:
+            manifest_path = safe_resolve_path(project_root, params["manifest"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
         if not manifest_path.is_file():
             return VerifierResult(passed=False, details=f"Manifest not found: {params['manifest']}")
 
@@ -170,7 +173,10 @@ class DependencyExistsVerifier:
 @register("dependency_version")
 class DependencyVersionVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        manifest_path = project_root / params["manifest"]
+        try:
+            manifest_path = safe_resolve_path(project_root, params["manifest"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
         if not manifest_path.is_file():
             return VerifierResult(passed=False, details=f"Manifest not found: {params['manifest']}")
 

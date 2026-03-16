@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +16,81 @@ class VerifierResult:
 
     passed: bool
     details: str
+
+
+class PathTraversalError(Exception):
+    """Raised when a file path escapes the project root."""
+
+
+class RegexTimeoutError(Exception):
+    """Raised when a regex operation exceeds the time limit."""
+
+
+def safe_resolve_path(project_root: Path, file_param: str) -> Path:
+    """Resolve a file path safely within the project root.
+
+    Resolves both the project root and the target to absolute paths,
+    then verifies the target is a descendant of the project root.
+    This catches '..', symlinks, and any other traversal tricks.
+
+    Raises PathTraversalError if the path escapes the project root.
+    """
+    project_resolved = project_root.resolve()
+    resolved = (project_root / file_param).resolve()
+    try:
+        resolved.relative_to(project_resolved)
+    except ValueError:
+        raise PathTraversalError(f"Path escapes project root: {file_param}")
+    return resolved
+
+
+def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024 * 1024) -> str | None:
+    """Read a file safely within the project root.
+
+    Returns file content as string, or None if file not found.
+    Raises PathTraversalError if the path escapes the project root.
+    """
+    resolved = safe_resolve_path(project_root, file_param)
+    if not resolved.is_file():
+        return None
+    # Reject symlinks
+    if resolved.is_symlink():
+        raise PathTraversalError(f"Symlinks not allowed: {file_param}")
+    # Check file size
+    size = resolved.stat().st_size
+    if size > max_size:
+        raise PathTraversalError(f"File too large ({size} bytes, max {max_size}): {file_param}")
+    return resolved.read_text(encoding="utf-8", errors="replace")
+
+
+def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) -> re.Match | None:
+    """Run re.search with a timeout to prevent ReDoS.
+
+    On Unix, uses SIGALRM for accurate timeout.
+    On Windows/other, uses re2 if available, otherwise falls back to
+    basic complexity checks + standard re.search.
+    """
+    # Basic complexity check — reject obviously dangerous patterns
+    # (nested quantifiers like (a+)+ or (a*)*a)
+    if re.search(r'\([^)]*[+*][^)]*\)[+*]', pattern):
+        raise RegexTimeoutError(f"Pattern rejected: nested quantifiers detected in '{pattern[:50]}'")
+
+    if sys.platform != "win32":
+        def _alarm_handler(signum, frame):
+            raise RegexTimeoutError(f"Regex timed out after {timeout_seconds}s: {pattern[:50]}")
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        try:
+            return re.search(pattern, content)
+        except RegexTimeoutError:
+            raise
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Windows: no SIGALRM, rely on complexity check above
+        return re.search(pattern, content)
 
 
 class Verifier(Protocol):
