@@ -6,13 +6,16 @@ import json
 import re
 from pathlib import Path
 
-from . import VerifierResult, register
+from . import PathTraversalError, VerifierResult, register, safe_read_file, safe_resolve_path
 
 
-def _parse_config(file_path: Path) -> dict | None:
+def _parse_config(project_root: Path, file_param: str) -> dict | None:
     """Parse config file (JSON, YAML, TOML, INI, .env) into a dict."""
+    content = safe_read_file(project_root, file_param)
+    if content is None:
+        return None
+    file_path = safe_resolve_path(project_root, file_param)
     suffix = file_path.suffix.lower()
-    content = file_path.read_text(encoding="utf-8", errors="replace")
 
     if suffix == ".json":
         return json.loads(content)
@@ -103,11 +106,10 @@ def _nested_get(d: dict, key: str):
 @register("config_key_exists")
 class ConfigKeyExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        config = _parse_config(file_path)
+        try:
+            config = _parse_config(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
         if config is None:
             return VerifierResult(passed=False, details=f"Could not parse config file: {params['file']}")
 
@@ -124,11 +126,10 @@ class ConfigKeyExistsVerifier:
 @register("config_value_matches")
 class ConfigValueMatchesVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        config = _parse_config(file_path)
+        try:
+            config = _parse_config(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
         if config is None:
             return VerifierResult(passed=False, details=f"Could not parse config file: {params['file']}")
 
@@ -148,11 +149,12 @@ class ConfigValueMatchesVerifier:
 @register("env_var_referenced")
 class EnvVarReferencedVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         variable = params["variable"]
 
         # Look for common env var access patterns

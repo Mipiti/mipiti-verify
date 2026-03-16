@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import PathTraversalError, safe_read_file
+
 from . import VerifierResult, register
 
 
@@ -17,11 +19,12 @@ class ParameterValidatedVerifier:
     """Tier 1: Check function exists and references the parameter name."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         function = params["function"]
         parameter = params["parameter"]
 
@@ -47,11 +50,12 @@ class ErrorHandledVerifier:
     """Tier 1: Check function has error handling constructs."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         function = params["function"]
 
         # Check function exists
@@ -91,11 +95,12 @@ class MiddlewareRegisteredVerifier:
     """Tier 1: Check middleware name appears in file."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         middleware = params["middleware"]
 
         # Look for middleware registration patterns
@@ -125,11 +130,12 @@ class HttpHeaderSetVerifier:
     """Tier 1: Check HTTP header name appears in file."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
-        file_path = project_root / params["file"]
-        if not file_path.is_file():
+        try:
+            content = safe_read_file(project_root, params["file"])
+        except PathTraversalError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
-
-        content = file_path.read_text(encoding="utf-8", errors="replace")
         header = params["header"]
 
         # Case-insensitive search for the header name
