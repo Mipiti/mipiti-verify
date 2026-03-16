@@ -447,9 +447,9 @@ def _text_output(report: dict, verbose: bool) -> None:
         from .runner import extract_gap_summary
         for sd in report.get("suff_details", []):
             if sd.get("result") == "insufficient":
-                gap = extract_gap_summary(sd.get("details", ""))
-                if gap:
-                    console.print(f"    [red]{sd['control_id']}[/red]: [blue]{gap}[/blue]")
+                details = sd.get("details", "").strip()
+                if details:
+                    console.print(f"    [red]{sd['control_id']}[/red]: [blue]{details}[/blue]")
 
     if report.get("dry_run"):
         console.print("\n  [yellow]Dry run — results not submitted[/yellow]")
@@ -495,13 +495,12 @@ def _github_output(report: dict) -> None:
     suff_details = report.get("suff_details", [])
     insufficient = [sd for sd in suff_details if sd.get("result") == "insufficient"]
     if insufficient:
-        from .runner import extract_gap_summary
         click.echo(f"::group::Sufficiency — coverage gaps ({len(insufficient)} controls)")
         for sd in insufficient:
-            gap = extract_gap_summary(sd.get("details", ""))
-            if gap:
+            details = sd.get("details", "").strip()
+            if details:
                 ctrl_id = sd["control_id"]
-                for line in gap.split("\n"):
+                for line in details.split("\n"):
                     line = line.strip()
                     if line:
                         click.echo(f"::warning title=Insufficient Coverage::{ctrl_id}: {line}")
