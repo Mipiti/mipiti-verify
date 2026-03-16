@@ -447,9 +447,9 @@ def _text_output(report: dict, verbose: bool) -> None:
         from .runner import extract_gap_summary
         for sd in report.get("suff_details", []):
             if sd.get("result") == "insufficient":
-                gap = extract_gap_summary(sd.get("details", ""))
-                if gap:
-                    console.print(f"    [red]{sd['control_id']}[/red]: [blue]{gap}[/blue]")
+                details = sd.get("details", "").strip()
+                if details:
+                    console.print(f"    [red]{sd['control_id']}[/red]: [blue]{details}[/blue]")
 
     if report.get("dry_run"):
         console.print("\n  [yellow]Dry run — results not submitted[/yellow]")
@@ -473,24 +473,16 @@ def _github_output(report: dict) -> None:
         tier_details = [d for d in details if d.get("tier") == tier]
         if not tier_details:
             continue
+        click.echo(f"::group::Tier {tier} — assertion verification")
         passed = [d for d in tier_details if d["passed"]]
         failed = [d for d in tier_details if not d["passed"]]
         for d in passed:
             click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details']}")
         for d in failed:
-            click.echo(f"::error title=Verification Failed::{d['assertion_id']} "
+            click.echo(f"::error title=Tier {tier} Failed::{d['assertion_id']} "
                        f"({d['type']}): {d['details']}")
-    # Sufficiency gaps as warnings
-    from .runner import extract_gap_summary
-    for sd in report.get("suff_details", []):
-        if sd.get("result") == "insufficient":
-            gap = extract_gap_summary(sd.get("details", ""))
-            if gap:
-                ctrl_id = sd["control_id"]
-                for line in gap.split("\n"):
-                    line = line.strip()
-                    if line:
-                        click.echo(f"::warning title=Insufficient Coverage::{ctrl_id}: {line}")
+        click.echo("::endgroup::")
+
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
     if t1f or t2f:
@@ -498,6 +490,21 @@ def _github_output(report: dict) -> None:
     else:
         total = report.get("tier1_pass", 0) + report.get("tier2_pass", 0)
         click.echo(f"::notice title=Verification Passed::{total} assertions verified")
+
+    # Sufficiency gaps — separate section after verification results
+    suff_details = report.get("suff_details", [])
+    insufficient = [sd for sd in suff_details if sd.get("result") == "insufficient"]
+    if insufficient:
+        click.echo(f"::group::Sufficiency — coverage gaps ({len(insufficient)} controls)")
+        for sd in insufficient:
+            details = sd.get("details", "").strip()
+            if details:
+                ctrl_id = sd["control_id"]
+                for line in details.split("\n"):
+                    line = line.strip()
+                    if line:
+                        click.echo(f"::warning title=Insufficient Coverage::{ctrl_id}: {line}")
+        click.echo("::endgroup::")
 
 
 @main.command()

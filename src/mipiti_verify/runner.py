@@ -16,25 +16,6 @@ from .verifiers import get_verifier
 console = Console(stderr=True)
 
 
-def extract_gap_summary(details: str) -> str:
-    """Extract the actionable gap description from verbose sufficiency details."""
-    import re
-    if not details or not details.strip():
-        return ""
-    sentences = re.split(r'(?<=[.!?])\s+', details.strip())
-    gap_keywords = re.compile(
-        r'missing|not covered|not proven|not evidenced|lacks|absent|no assertion|no evidence|gap|does not cover|does not prove|does not address',
-        re.IGNORECASE,
-    )
-    gap_sentences = [s for s in sentences if gap_keywords.search(s)]
-    if gap_sentences:
-        summary = " ".join(gap_sentences)
-    else:
-        summary = details.strip()
-    summary = re.sub(r'\*\*', '', summary)
-    return summary
-
-
 class Runner:
     """Orchestrates the pull → verify → submit flow."""
 
