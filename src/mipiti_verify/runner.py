@@ -109,6 +109,26 @@ class Runner:
         # --- Sufficiency ---
         suff_results = self._run_sufficiency(model_id)
 
+        # Merge existing sufficiency results from the verification report
+        # so CI output shows ALL insufficient controls, not just newly evaluated ones
+        suff_all = list(suff_results)  # start with what we just evaluated
+        evaluated_ids = {r["control_id"] for r in suff_results}
+        try:
+            vr = self.client.get_verification_report(model_id)
+            for ctrl in vr.get("control_details", []):
+                ctrl_id = ctrl.get("control_id", "")
+                if ctrl_id in evaluated_ids:
+                    continue  # already have a fresh result
+                suff = ctrl.get("sufficiency")
+                if suff and suff.get("status") in ("sufficient", "insufficient"):
+                    suff_all.append({
+                        "control_id": ctrl_id,
+                        "result": suff["status"],
+                        "details": suff.get("details", ""),
+                    })
+        except Exception:
+            pass  # non-critical — just won't show existing results
+
         return {
             "tier1_pass": sum(1 for r in t1_results if r["result"] == "pass"),
             "tier1_fail": sum(1 for r in t1_results if r["result"] == "fail"),
@@ -116,14 +136,14 @@ class Runner:
             "tier2_pass": sum(1 for r in t2_results if r["result"] == "pass"),
             "tier2_fail": sum(1 for r in t2_results if r["result"] == "fail"),
             "tier2_skip": sum(1 for r in t2_results if r["result"] == "skipped"),
-            "suff_sufficient": sum(1 for r in suff_results if r["result"] == "sufficient"),
-            "suff_insufficient": sum(1 for r in suff_results if r["result"] == "insufficient"),
+            "suff_sufficient": sum(1 for r in suff_all if r["result"] == "sufficient"),
+            "suff_insufficient": sum(1 for r in suff_all if r["result"] == "insufficient"),
             "suff_skip": sum(1 for r in suff_results if r["result"] == "skipped"),
             "tier1_run_id": t1_run_id,
             "tier2_run_id": t2_run_id,
             "dry_run": self.dry_run,
             "details": details,
-            "suff_details": suff_results,
+            "suff_details": suff_all,
         }
 
     def _run_tier(
