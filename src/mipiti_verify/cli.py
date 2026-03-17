@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import click
@@ -11,6 +12,10 @@ from rich.table import Table
 
 from .client import MipitiClient
 from .runner import Runner
+
+# Force unbuffered output so CI and MCP tool runners see progress in real-time.
+# Python buffers stdout/stderr when not connected to a TTY (CI, pipes, subprocesses).
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 console = Console()
 
