@@ -247,7 +247,8 @@ class Runner:
                 api_key=self.tier2_api_key,
                 ollama_url=self.ollama_url,
             )
-            passed, reasoning = provider.evaluate(tier2_prompt, source_code)
+            boundary_token = assertion.get("tier2_boundary_token", "")
+            passed, reasoning = provider.evaluate(tier2_prompt, source_code, boundary_token)
             return {
                 "status": "pass" if passed else "fail",
                 "details": reasoning,

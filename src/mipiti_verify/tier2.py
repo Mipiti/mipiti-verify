@@ -12,10 +12,11 @@ class Tier2Provider(ABC):
     """Abstract base for Tier 2 semantic verification providers."""
 
     @abstractmethod
-    def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
+    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
         """Evaluate an assertion semantically.
 
         Returns (passed, reasoning).
+        If boundary_token is provided, source code is wrapped in boundary guards.
         """
 
 
@@ -31,8 +32,8 @@ class OpenAIProvider(Tier2Provider):
         self.model = model or "gpt-4o"
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
 
-    def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
-        messages = [{"role": "user", "content": _build_message(prompt, source_code)}]
+    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
+        messages = [{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}]
         # Newer OpenAI models (o-series, gpt-5+) require max_completion_tokens
         # instead of max_tokens.  Try the new param first, fall back on error.
         try:
@@ -59,11 +60,11 @@ class AnthropicProvider(Tier2Provider):
         self.model = model or "claude-sonnet-4-5-20250514"
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
-    def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
+    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
         message = self.client.messages.create(
             model=self.model,
             max_tokens=8192,  # Anthropic requires max_tokens; high ceiling, model finishes naturally
-            messages=[{"role": "user", "content": _build_message(prompt, source_code)}],
+            messages=[{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}],
         )
         text = message.content[0].text if message.content else ""
         return _parse_response(text)
@@ -83,12 +84,12 @@ class OllamaProvider(Tier2Provider):
         self.url = ollama_url.rstrip("/")
         self._client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=300.0))
 
-    def evaluate(self, prompt: str, source_code: str) -> Tuple[bool, str]:
+    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
         resp = self._client.post(
             f"{self.url}/api/chat",
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": _build_message(prompt, source_code)}],
+                "messages": [{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}],
                 "stream": False,
                 "options": {"temperature": 0},
             },
@@ -116,9 +117,16 @@ def get_provider(
         raise ValueError(f"Unknown Tier 2 provider: {name}. Choose: openai, anthropic, ollama")
 
 
-def _build_message(prompt: str, source_code: str) -> str:
-    """Build the full prompt message with source code context."""
+def _build_message(prompt: str, source_code: str, boundary_token: str = "") -> str:
+    """Build the full prompt message with source code context.
+
+    If a boundary_token is provided, wraps the source code in the same
+    boundary guards used for assertion descriptions in the prompt.
+    """
     if source_code:
+        if boundary_token:
+            wrapped = f"<{boundary_token}>\n{source_code}\n</{boundary_token}>"
+            return f"{prompt}\n\n--- Source Code ---\n{wrapped}"
         return f"{prompt}\n\n--- Source Code ---\n{source_code}"
     return prompt
 
