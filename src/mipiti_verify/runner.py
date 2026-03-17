@@ -214,11 +214,26 @@ class Runner:
             if fpath.is_file():
                 try:
                     content = fpath.read_text(encoding="utf-8", errors="replace")
+                    # If scope_start/scope_end provided, extract scoped section
+                    # for tier 2 review — more focused and token-efficient.
+                    a_type = assertion.get("type", "")
+                    scope_start = params.get("scope_start", "")
+                    if scope_start and a_type in ("pattern_matches", "pattern_absent"):
+                        import re
+                        s_match = re.search(scope_start, content, re.MULTILINE)
+                        if s_match:
+                            s_pos = s_match.start()
+                            scope_end = params.get("scope_end", "")
+                            if scope_end:
+                                e_match = re.search(scope_end, content[s_match.end():], re.MULTILINE)
+                                e_pos = s_match.end() + e_match.start() if e_match else len(content)
+                            else:
+                                e_pos = len(content)
+                            content = content[s_pos:e_pos]
                     # For pattern_matches/pattern_absent, center context around
                     # the match rather than taking the file head — ensures the
                     # reviewer sees the relevant code even in large files.
                     pattern = params.get("pattern", "")
-                    a_type = assertion.get("type", "")
                     if len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
                         import re
                         match = re.search(pattern, content)

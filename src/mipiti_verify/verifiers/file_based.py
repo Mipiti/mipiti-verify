@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 from . import (
@@ -14,6 +15,30 @@ from . import (
     safe_regex_search,
     safe_resolve_path,
 )
+
+
+def _extract_scope(content: str, params: dict) -> str:
+    """Extract the section of content between scope_start and scope_end patterns.
+
+    Returns the full content if no scope params are provided.
+    """
+    scope_start = params.get("scope_start")
+    if not scope_start:
+        return content
+
+    start_match = re.search(scope_start, content, re.MULTILINE)
+    if not start_match:
+        return ""  # scope_start not found — nothing to search
+
+    start_pos = start_match.start()
+    scope_end = params.get("scope_end")
+    if scope_end:
+        end_match = re.search(scope_end, content[start_match.end():], re.MULTILINE)
+        end_pos = start_match.end() + end_match.start() if end_match else len(content)
+    else:
+        end_pos = len(content)
+
+    return content[start_pos:end_pos]
 
 
 @register("file_exists")
@@ -63,6 +88,10 @@ class PatternMatchesVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
+        content = _extract_scope(content, params)
+        if not content and params.get("scope_start"):
+            return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
+
         pattern = params["pattern"]
         try:
             match = safe_regex_search(pattern, content)
@@ -83,6 +112,10 @@ class PatternAbsentVerifier:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
             return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+
+        content = _extract_scope(content, params)
+        if not content and params.get("scope_start"):
+            return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
 
         pattern = params["pattern"]
         try:
