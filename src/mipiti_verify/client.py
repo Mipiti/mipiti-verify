@@ -157,7 +157,7 @@ class MipitiClient:
         return resp.json()
 
     # ------------------------------------------------------------------
-    # Evidence sufficiency (CI pull + submit)
+    # Assertion sufficiency (CI pull + submit)
     # ------------------------------------------------------------------
 
     def get_pending_sufficiency(self, model_id: str) -> dict[str, Any]:
