@@ -276,7 +276,7 @@ class Runner:
             return {"status": "fail", "details": f"Tier 2 error: {e}"}
 
     def _run_sufficiency(self, model_id: str) -> list[dict[str, Any]]:
-        """Run collective sufficiency evaluation for controls marked as evidence complete."""
+        """Run collective sufficiency evaluation for controls with pending assertions."""
         try:
             pending = self.client.get_pending_sufficiency(model_id)
         except Exception as e:
