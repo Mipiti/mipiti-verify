@@ -247,6 +247,30 @@ class Runner:
                             content = prefix + content[start:end] + suffix
                         else:
                             content = content[:16000] + "\n... (truncated)"
+                    # For function_exists/class_exists, locate the definition
+                    # and center context around it so the tier 2 reviewer can
+                    # see the implementation body, not just the file head.
+                    elif len(content) > 16000 and a_type in ("function_exists", "class_exists"):
+                        import re
+                        name = params.get("name", "")
+                        if name:
+                            if a_type == "function_exists":
+                                def_pat = rf'^[ \t]*(async\s+)?def\s+{re.escape(name)}\s*\('
+                            else:
+                                def_pat = rf'^[ \t]*class\s+{re.escape(name)}[\s(:]'
+                            match = re.search(def_pat, content, re.MULTILINE)
+                            if match:
+                                center = match.start()
+                                # Bias toward showing the body (4K before, 12K after)
+                                start = max(0, center - 4000)
+                                end = min(len(content), center + 12000)
+                                prefix = "... (truncated)\n" if start > 0 else ""
+                                suffix = "\n... (truncated)" if end < len(content) else ""
+                                content = prefix + content[start:end] + suffix
+                            else:
+                                content = content[:16000] + "\n... (truncated)"
+                        else:
+                            content = content[:16000] + "\n... (truncated)"
                     elif len(content) > 16000:
                         content = content[:16000] + "\n... (truncated)"
                     source_code = content
