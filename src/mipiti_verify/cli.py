@@ -54,6 +54,7 @@ def main() -> None:
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 @click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
+@click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
 def run(
     model_id: str | None,
     run_all: bool,
@@ -71,6 +72,7 @@ def run(
     verbose: bool,
     repo: str,
     changed_files_path: str | None,
+    concurrency: int,
 ) -> None:
     """Run verification against pending assertions for MODEL_ID.
 
@@ -129,6 +131,7 @@ def run(
         verbose=verbose,
         repo=repo,
         changed_files=changed_files,
+        concurrency=concurrency,
     )
 
     has_failures = False

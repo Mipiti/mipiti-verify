@@ -264,6 +264,56 @@ class TestChangedFilesFilter:
         assert report["tier1_pass"] + report["tier1_fail"] + report["tier1_skip"] == 1
 
 
+class TestConcurrency:
+    def test_tier2_concurrent(self, tmp_path):
+        """Tier 2 runs concurrently when concurrency > 1."""
+        (tmp_path / "auth.py").write_text("def verify_token():\n    pass\n")
+
+        client = MagicMock()
+        client.get_pending.side_effect = [
+            {"model_id": "m1", "controls": {}},  # tier 1
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}, "tier2_prompt": "Check it"},
+                        {"id": "asrt_002", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}, "tier2_prompt": "Check it"},
+                    ],
+                },
+            },
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path), concurrency=4, tier2_provider=None)
+        report = runner.run("m1")
+
+        # Both skipped (no provider), but verifies concurrent path doesn't crash
+        assert report["tier2_skip"] == 2
+
+    def test_concurrency_default_sequential(self, tmp_path):
+        """Default concurrency=1 runs sequentially (existing behavior)."""
+        (tmp_path / "auth.py").write_text("def verify_token():\n    pass\n")
+
+        client = MagicMock()
+        client.get_pending.side_effect = [
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}},
+                    ],
+                },
+            },
+            {"model_id": "m1", "controls": {}},
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path))
+        assert runner.concurrency == 1
+        report = runner.run("m1")
+        assert report["tier1_pass"] == 1
+
+
 class TestPipelineMetadata:
     def test_local_default(self, monkeypatch):
         monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
