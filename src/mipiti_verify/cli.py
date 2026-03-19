@@ -53,6 +53,7 @@ def main() -> None:
 @click.option("--reverify", is_flag=True, help="Re-verify all assertions, not just pending")
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
+@click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
 def run(
     model_id: str | None,
     run_all: bool,
@@ -69,6 +70,7 @@ def run(
     reverify: bool,
     verbose: bool,
     repo: str,
+    changed_files_path: str | None,
 ) -> None:
     """Run verification against pending assertions for MODEL_ID.
 
@@ -102,6 +104,18 @@ def run(
     else:
         model_ids = [model_id]
 
+    # Parse changed files list
+    changed_files: set[str] | None = None
+    if changed_files_path is not None:
+        if changed_files_path == "-":
+            lines = sys.stdin.read().splitlines()
+        else:
+            with open(changed_files_path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        changed_files = {line.strip().replace("\\", "/") for line in lines if line.strip()}
+        if verbose:
+            console.print(f"Changed files filter: {len(changed_files)} file(s)")
+
     runner = Runner(
         client=client,
         project_root=project_root,
@@ -114,6 +128,7 @@ def run(
         reverify=reverify,
         verbose=verbose,
         repo=repo,
+        changed_files=changed_files,
     )
 
     has_failures = False

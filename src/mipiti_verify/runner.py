@@ -32,6 +32,7 @@ class Runner:
         reverify: bool = False,
         verbose: bool = False,
         repo: str = "",
+        changed_files: set[str] | None = None,
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
@@ -51,6 +52,7 @@ class Runner:
         self.dry_run = dry_run
         self.reverify = reverify
         self.verbose = verbose
+        self.changed_files = changed_files
 
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
@@ -137,6 +139,27 @@ class Runner:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
             return [], []
+
+        # Filter to assertions referencing changed files when --changed-files is set.
+        # Assertions without a file param are always included (can't be scoped).
+        if self.changed_files is not None:
+            filtered: dict[str, list] = {}
+            skipped = 0
+            for ctrl_id, assertions in controls.items():
+                kept = []
+                for a in assertions:
+                    a_file = a.get("params", {}).get("file", "")
+                    if not a_file or a_file in self.changed_files:
+                        kept.append(a)
+                    else:
+                        skipped += 1
+                if kept:
+                    filtered[ctrl_id] = kept
+            if self.verbose and skipped:
+                console.print(f"  Tier {tier}: skipped {skipped} assertions (files unchanged)")
+            controls = filtered
+            if not controls:
+                return [], []
 
         total = sum(len(assertions) for assertions in controls.values())
         results: list[dict[str, Any]] = []

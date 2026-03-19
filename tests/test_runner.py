@@ -191,6 +191,79 @@ class TestRunner:
         assert report["tier1_fail"] == 1  # missing.txt
 
 
+class TestChangedFilesFilter:
+    def test_filters_to_changed_files(self, tmp_path):
+        (tmp_path / "auth.py").write_text("def verify_token():\n    pass\n")
+        (tmp_path / "config.json").write_text('{"key": "value"}')
+
+        client = MagicMock()
+        client.get_pending.side_effect = [
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}},
+                        {"id": "asrt_002", "type": "file_exists", "params": {"file": "config.json"}},
+                    ],
+                },
+            },
+            {"model_id": "m1", "controls": {}},
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"auth.py"})
+        report = runner.run("m1")
+
+        assert report["tier1_pass"] == 1  # only auth.py verified
+        assert report["tier1_fail"] == 0
+
+    def test_none_verifies_all(self, tmp_path):
+        (tmp_path / "auth.py").write_text("def verify_token():\n    pass\n")
+        (tmp_path / "config.json").write_text('{"key": "value"}')
+
+        client = MagicMock()
+        client.get_pending.side_effect = [
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}},
+                        {"id": "asrt_002", "type": "file_exists", "params": {"file": "config.json"}},
+                    ],
+                },
+            },
+            {"model_id": "m1", "controls": {}},
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files=None)
+        report = runner.run("m1")
+
+        assert report["tier1_pass"] == 2  # both verified
+
+    def test_includes_assertions_without_file_param(self, tmp_path):
+        client = MagicMock()
+        client.get_pending.side_effect = [
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "other.py", "name": "foo"}},
+                        {"id": "asrt_002", "type": "config_key_exists", "params": {"manifest": "config.json", "key": "db"}},
+                    ],
+                },
+            },
+            {"model_id": "m1", "controls": {}},
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"unrelated.py"})
+        report = runner.run("m1")
+
+        # asrt_001 filtered out (file=other.py not in changed), asrt_002 included (no file param)
+        assert report["tier1_pass"] + report["tier1_fail"] + report["tier1_skip"] == 1
+
+
 class TestPipelineMetadata:
     def test_local_default(self, monkeypatch):
         monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
