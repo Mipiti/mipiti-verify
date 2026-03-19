@@ -1,6 +1,6 @@
 [project]
 name = "mipiti-verify"
-version = "0.8.1"
+version = "0.8.2"
 description = "Turnkey CI verification for Mipiti threat model assertions"
 readme = "README.md"
 license = "LicenseRef-Proprietary"
