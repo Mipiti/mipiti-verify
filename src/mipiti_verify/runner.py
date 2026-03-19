@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ class Runner:
         verbose: bool = False,
         repo: str = "",
         changed_files: set[str] | None = None,
+        concurrency: int = 1,
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
@@ -53,6 +55,7 @@ class Runner:
         self.reverify = reverify
         self.verbose = verbose
         self.changed_files = changed_files
+        self.concurrency = max(1, concurrency)
 
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
@@ -165,6 +168,11 @@ class Runner:
         results: list[dict[str, Any]] = []
         details: list[dict[str, Any]] = []
 
+        # Flatten assertions for processing
+        all_assertions = [
+            a for _ctrl_id, assertions in controls.items() for a in assertions
+        ]
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -172,8 +180,37 @@ class Runner:
         ) as progress:
             task = progress.add_task(f"Tier {tier}: verifying {total} assertions", total=total)
 
-            for _ctrl_id, assertions in controls.items():
-                for assertion in assertions:
+            if tier == 2 and self.concurrency > 1:
+                # Parallel tier2 verification
+                futures = {}
+                with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                    for assertion in all_assertions:
+                        future = pool.submit(self._verify_tier2, assertion)
+                        futures[future] = assertion
+                    for future in as_completed(futures):
+                        assertion = futures[future]
+                        a_id = assertion["id"]
+                        a_type = assertion["type"]
+                        result = future.result()
+                        results.append({
+                            "assertion_id": a_id,
+                            "tier": tier,
+                            "result": result["status"],
+                            "details": result["details"],
+                            "reasoning": result.get("reasoning", ""),
+                            "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
+                        })
+                        details.append({
+                            "assertion_id": a_id,
+                            "type": a_type,
+                            "tier": tier,
+                            "passed": result["status"] == "pass",
+                            "details": result["details"],
+                        })
+                        progress.advance(task)
+            else:
+                # Sequential (tier1 or concurrency=1)
+                for assertion in all_assertions:
                     a_id = assertion["id"]
                     a_type = assertion["type"]
 
