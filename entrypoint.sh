@@ -23,8 +23,8 @@ if [ -n "$INPUT_TIER2_MODEL" ]; then
   ARGS="$ARGS --tier2-model $INPUT_TIER2_MODEL"
 fi
 
-if [ "$INPUT_REVERIFY" = "true" ]; then
-  ARGS="$ARGS --reverify"
+if [ "$INPUT_REVERIFY" = "false" ]; then
+  ARGS="$ARGS --no-reverify"
 fi
 
 if [ "$INPUT_DRY_RUN" = "true" ]; then

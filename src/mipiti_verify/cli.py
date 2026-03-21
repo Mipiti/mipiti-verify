@@ -50,7 +50,7 @@ def main() -> None:
     help="Output format",
 )
 @click.option("--dry-run", is_flag=True, help="Run verifiers but don't submit results")
-@click.option("--reverify", is_flag=True, help="Re-verify all assertions, not just pending")
+@click.option("--reverify/--no-reverify", default=True, help="Re-verify all assertions, not just pending (default: on)")
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 @click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
@@ -77,7 +77,7 @@ def run(
     """Run verification against pending assertions for MODEL_ID.
 
     Use --all to verify all models in the workspace associated with the API key.
-    Use --reverify to re-verify all assertions (not just pending).
+    Use --no-reverify to only verify pending assertions.
     """
     if not model_id and not run_all:
         console.print("[red]Error:[/red] Provide MODEL_ID or use --all")
