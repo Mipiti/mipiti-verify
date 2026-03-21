@@ -498,9 +498,13 @@ def _github_output(report: dict) -> None:
             continue
         click.echo(f"::group::Tier {tier} — assertion verification")
         passed = [d for d in tier_details if d["passed"]]
-        failed = [d for d in tier_details if not d["passed"]]
+        skipped = [d for d in tier_details if d.get("skipped")]
+        failed = [d for d in tier_details if not d["passed"] and not d.get("skipped")]
         for d in passed:
             click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details']}")
+        for d in skipped:
+            click.echo(f"::warning title=Tier {tier} Skipped::{d['assertion_id']} "
+                       f"({d['type']}): {d['details']}")
         for d in failed:
             click.echo(f"::error title=Tier {tier} Failed::{d['assertion_id']} "
                        f"({d['type']}): {d['details']}")
@@ -508,11 +512,15 @@ def _github_output(report: dict) -> None:
 
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
+    t2s = report.get("tier2_skip", 0)
     if t1f or t2f:
         click.echo(f"::error title=Verification Summary::{t1f} tier1 failures, {t2f} tier2 failures")
     else:
         total = report.get("tier1_pass", 0) + report.get("tier2_pass", 0)
-        click.echo(f"::notice title=Verification Passed::{total} assertions verified")
+        msg = f"{total} assertions verified"
+        if t2s:
+            msg += f", {t2s} tier2 skipped (no provider configured)"
+        click.echo(f"::notice title=Verification Passed::{msg}")
 
     # Sufficiency gaps — separate section after verification results
     suff_details = report.get("suff_details", [])

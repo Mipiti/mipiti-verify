@@ -205,6 +205,7 @@ class Runner:
                             "type": a_type,
                             "tier": tier,
                             "passed": result["status"] == "pass",
+                            "skipped": result["status"] == "skipped",
                             "details": result["details"],
                         })
                         progress.advance(task)
@@ -232,6 +233,7 @@ class Runner:
                         "type": a_type,
                         "tier": tier,
                         "passed": result["status"] == "pass",
+                        "skipped": result["status"] == "skipped",
                         "details": result["details"],
                     })
                     progress.advance(task)
