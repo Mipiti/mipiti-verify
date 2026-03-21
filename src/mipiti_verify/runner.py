@@ -30,7 +30,7 @@ class Runner:
         ollama_url: str = "http://localhost:11434",
         oidc_token: str | None = None,
         dry_run: bool = False,
-        reverify: bool = False,
+        reverify: bool = True,
         verbose: bool = False,
         repo: str = "",
         changed_files: set[str] | None = None,

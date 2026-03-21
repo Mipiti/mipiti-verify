@@ -37,9 +37,9 @@ inputs:
     required: false
     default: "."
   reverify:
-    description: Re-verify all assertions, not just pending
+    description: Re-verify all assertions, not just pending (default true)
     required: false
-    default: "false"
+    default: "true"
   dry-run:
     description: Run verifiers but don't submit results
     required: false
