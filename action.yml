@@ -1,23 +1,29 @@
 name: Mipiti Verify
-description: Run security control verification against Mipiti threat models
+description: Verify security controls against Mipiti threat models in CI. Runs typed assertions against your codebase and reports results.
 branding:
   icon: shield
   color: blue
 
 inputs:
   model-id:
-    description: Mipiti threat model ID
-    required: true
+    description: Mipiti threat model ID (omit if using all)
+    required: false
+    default: ""
+  all:
+    description: Verify all models in the workspace
+    required: false
+    default: "false"
   api-key:
-    description: Mipiti API key
+    description: Mipiti API key (MIPITI_API_KEY)
     required: true
   base-url:
-    description: API base URL (default https://api.mipiti.io)
+    description: API base URL
     required: false
     default: "https://api.mipiti.io"
   tier2-provider:
     description: "AI provider for Tier 2 verification: openai, anthropic, or ollama"
-    required: true
+    required: false
+    default: ""
   tier2-model:
     description: Model name (e.g. gpt-4o, claude-sonnet-4-5-20250514)
     required: false
@@ -30,29 +36,32 @@ inputs:
     description: Project root directory
     required: false
     default: "."
+  reverify:
+    description: Re-verify all assertions, not just pending
+    required: false
+    default: "false"
+  dry-run:
+    description: Run verifiers but don't submit results
+    required: false
+    default: "false"
+  concurrency:
+    description: Max concurrent Tier 2 LLM calls
+    required: false
+    default: "1"
 
 runs:
-  using: composite
-  steps:
-    - name: Install mipiti-verify
-      shell: bash
-      run: pip install "mipiti-verify[all]"
-
-    - name: Run verification
-      shell: bash
-      env:
-        MIPITI_API_KEY: ${{ inputs.api-key }}
-        MIPITI_BASE_URL: ${{ inputs.base-url }}
-        OPENAI_API_KEY: ${{ inputs.tier2-api-key }}
-        ANTHROPIC_API_KEY: ${{ inputs.tier2-api-key }}
-      run: |
-        ARGS="run ${{ inputs.model-id }}"
-        ARGS="$ARGS --project-root ${{ inputs.project-root }}"
-        ARGS="$ARGS --tier2-provider ${{ inputs.tier2-provider }}"
-        ARGS="$ARGS --output github"
-
-        if [ -n "${{ inputs.tier2-model }}" ]; then
-          ARGS="$ARGS --tier2-model ${{ inputs.tier2-model }}"
-        fi
-
-        mipiti-verify $ARGS
+  using: docker
+  image: Dockerfile
+  env:
+    MIPITI_API_KEY: ${{ inputs.api-key }}
+    MIPITI_BASE_URL: ${{ inputs.base-url }}
+    OPENAI_API_KEY: ${{ inputs.tier2-api-key }}
+    ANTHROPIC_API_KEY: ${{ inputs.tier2-api-key }}
+    INPUT_MODEL_ID: ${{ inputs.model-id }}
+    INPUT_ALL: ${{ inputs.all }}
+    INPUT_PROJECT_ROOT: ${{ inputs.project-root }}
+    INPUT_TIER2_PROVIDER: ${{ inputs.tier2-provider }}
+    INPUT_TIER2_MODEL: ${{ inputs.tier2-model }}
+    INPUT_REVERIFY: ${{ inputs.reverify }}
+    INPUT_DRY_RUN: ${{ inputs.dry-run }}
+    INPUT_CONCURRENCY: ${{ inputs.concurrency }}
