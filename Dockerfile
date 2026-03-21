@@ -1,5 +1,9 @@
 FROM python:3.12-slim
-WORKDIR /app
-COPY . .
-RUN pip install --no-cache-dir ".[all]"
-ENTRYPOINT ["mipiti-verify"]
+
+COPY . /action
+RUN pip install --no-cache-dir "/action[all]"
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
