@@ -10,7 +10,34 @@ from mipiti_verify.runner import Runner, _pipeline_metadata
 class TestRunner:
     def _make_runner(self, **kwargs) -> Runner:
         client = kwargs.pop("client", MagicMock())
+        kwargs.setdefault("reverify", False)
         return Runner(client=client, project_root=".", **kwargs)
+
+    def test_reverify_default_true(self, tmp_path):
+        """Default reverify=True calls get_all_assertions, not get_pending."""
+        (tmp_path / "auth.py").write_text("def verify_token():\n    pass\n")
+
+        client = MagicMock()
+        client.get_all_assertions.side_effect = [
+            {
+                "model_id": "m1",
+                "controls": {
+                    "CTRL-01": [
+                        {"id": "asrt_001", "type": "function_exists", "params": {"file": "auth.py", "name": "verify_token"}},
+                    ],
+                },
+            },
+            {"model_id": "m1", "controls": {}},
+        ]
+        client.submit_results.return_value = {"run_id": "run_1"}
+
+        runner = Runner(client=client, project_root=str(tmp_path))
+        assert runner.reverify is True
+        report = runner.run("m1")
+
+        assert report["tier1_pass"] == 1
+        client.get_all_assertions.assert_called()
+        client.get_pending.assert_not_called()
 
     def test_run_no_pending(self):
         client = MagicMock()
@@ -40,7 +67,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1
@@ -63,7 +90,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_fail"] == 1
@@ -91,7 +118,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), tier2_provider=None)
+        runner = Runner(client=client, project_root=str(tmp_path), tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier2_skip"] == 1
@@ -112,7 +139,7 @@ class TestRunner:
             {"model_id": "m1", "controls": {}},
         ]
 
-        runner = Runner(client=client, project_root=str(tmp_path), dry_run=True)
+        runner = Runner(client=client, project_root=str(tmp_path), dry_run=True, reverify=False)
         report = runner.run("m1")
 
         assert report["dry_run"] is True
@@ -133,7 +160,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=".")
+        runner = Runner(client=client, project_root=".", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_skip"] == 1
@@ -155,7 +182,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), verbose=True)
+        runner = Runner(client=client, project_root=str(tmp_path), verbose=True, reverify=False)
         report = runner.run("m1")
 
         assert len(report["details"]) == 1
@@ -184,7 +211,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # verify_token + config.json
@@ -211,7 +238,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"auth.py"})
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"auth.py"}, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1  # only auth.py verified
@@ -236,7 +263,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files=None)
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # both verified
@@ -257,7 +284,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"unrelated.py"})
+        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"unrelated.py"}, reverify=False)
         report = runner.run("m1")
 
         # asrt_001 filtered out (file=other.py not in changed), asrt_002 included (no file param)
@@ -284,7 +311,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), concurrency=4, tier2_provider=None)
+        runner = Runner(client=client, project_root=str(tmp_path), concurrency=4, tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         # Both skipped (no provider), but verifies concurrent path doesn't crash
@@ -308,7 +335,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
         assert runner.concurrency == 1
         report = runner.run("m1")
         assert report["tier1_pass"] == 1
