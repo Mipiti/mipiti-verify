@@ -1,6 +1,6 @@
 # mipiti-verify
 
-Turnkey CI verification for [Mipiti](https://mipiti.io) threat model assertions.
+Turnkey CI verification for [Mipiti](https://mipiti.io) threat model assertions. Security controls that never drift.
 
 ## Install
 
@@ -11,14 +11,15 @@ pip install mipiti-verify[all]
 ## Usage
 
 ```bash
-# Verify a single model
-mipiti-verify run <model_id> \
+# Verify all models in the workspace (recommended)
+mipiti-verify run --all \
   --api-key $MIPITI_API_KEY \
   --tier2-provider openai \
+  --tier2-model gpt-4o-mini \
   --project-root .
 
-# Verify all models in the workspace
-mipiti-verify run --all \
+# Verify a single model
+mipiti-verify run <model_id> \
   --api-key $MIPITI_API_KEY \
   --tier2-provider openai \
   --project-root .
@@ -32,23 +33,31 @@ mipiti-verify report <model_id>
 
 API keys are workspace-scoped — `--all` verifies every model accessible by the key.
 
+### Key flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--reverify / --no-reverify` | `--reverify` | Re-verify all assertions, not just pending. Catches regressions. |
+| `--changed-files FILE` | none | Only verify assertions referencing files listed in FILE. Use `git diff --name-only HEAD~1 > changed.txt`. |
+| `--concurrency N` | 1 | Max concurrent Tier 2 LLM calls. Tune based on API rate limits. |
+| `--dry-run` | off | Run verifiers but don't submit results. |
+| `--output github` | `text` | Emit GitHub Actions annotations (errors, warnings, notices). |
+| `--tier2-provider` | none | AI provider: `openai`, `anthropic`, or `ollama`. Omit for Tier 1 only. |
+| `--tier2-model` | `gpt-4o` | Model name (e.g., `gpt-4o-mini`, `claude-sonnet-4-5-20250514`). |
+
 ## GitHub Action
 
 ```yaml
-- uses: mipiti/mipiti-verify@v1
+- uses: Mipiti/mipiti-verify@v0.10.0
   with:
-    model-id: ${{ secrets.MIPITI_MODEL_ID }}
     api-key: ${{ secrets.MIPITI_API_KEY }}
+    all: true
     tier2-provider: openai
+    tier2-model: gpt-4o-mini
     tier2-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
 
-## Docker
-
-```bash
-docker run ghcr.io/mipiti/mipiti-verify:latest \
-  run <model_id> --api-key $MIPITI_API_KEY --tier2-provider openai
-```
+All assertions are re-verified by default. Use `reverify: false` to only check new assertions (e.g., to reduce Tier 2 API costs on PRs). Omitting `tier2-provider` runs Tier 1 only — controls won't reach "verified" status without Tier 2.
 
 ## Development
 
