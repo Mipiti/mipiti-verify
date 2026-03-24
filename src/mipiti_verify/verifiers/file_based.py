@@ -93,8 +93,13 @@ class PatternMatchesVerifier:
             return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
 
         pattern = params["pattern"]
+        flags = 0
+        if str(params.get("multiline", "")).lower() in ("true", "1"):
+            flags |= re.MULTILINE
+        if str(params.get("dotall", "")).lower() in ("true", "1"):
+            flags |= re.DOTALL
         try:
-            match = safe_regex_search(pattern, content)
+            match = safe_regex_search(pattern, content, flags=flags)
         except RegexTimeoutError as e:
             return VerifierResult(passed=False, details=str(e))
 
@@ -118,8 +123,13 @@ class PatternAbsentVerifier:
             return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
 
         pattern = params["pattern"]
+        flags = 0
+        if str(params.get("multiline", "")).lower() in ("true", "1"):
+            flags |= re.MULTILINE
+        if str(params.get("dotall", "")).lower() in ("true", "1"):
+            flags |= re.DOTALL
         try:
-            match = safe_regex_search(pattern, content)
+            match = safe_regex_search(pattern, content, flags=flags)
         except RegexTimeoutError as e:
             return VerifierResult(passed=False, details=str(e))
 

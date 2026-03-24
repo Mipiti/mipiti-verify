@@ -63,34 +63,40 @@ def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024
     return resolved.read_text(encoding="utf-8", errors="replace")
 
 
-def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) -> re.Match | None:
+def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, flags: int = 0) -> re.Match | None:
     """Run re.search with a timeout to prevent ReDoS.
 
     On Unix, uses SIGALRM for accurate timeout.
     On Windows/other, uses re2 if available, otherwise falls back to
     basic complexity checks + standard re.search.
+
+    Args:
+        flags: Additional re flags (e.g., re.DOTALL | re.MULTILINE for multiline patterns).
     """
     # Basic complexity check — reject obviously dangerous patterns
     # (nested quantifiers like (a+)+ or (a*)*a)
     if re.search(r'\([^)]*[+*][^)]*\)[+*]', pattern):
         raise RegexTimeoutError(f"Pattern rejected: nested quantifiers detected in '{pattern[:50]}'")
 
-    if sys.platform != "win32":
-        def _alarm_handler(signum, frame):
-            raise RegexTimeoutError(f"Regex timed out after {timeout_seconds}s: {pattern[:50]}")
+    try:
+        if sys.platform != "win32":
+            def _alarm_handler(signum, frame):
+                raise RegexTimeoutError(f"Regex timed out after {timeout_seconds}s: {pattern[:50]}")
 
-        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-        try:
-            return re.search(pattern, content)
-        except RegexTimeoutError:
-            raise
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old_handler)
-    else:
-        # Windows: no SIGALRM, rely on complexity check above
-        return re.search(pattern, content)
+            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+            try:
+                return re.search(pattern, content, flags)
+            except RegexTimeoutError:
+                raise
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+        else:
+            # Windows: no SIGALRM, rely on complexity check above
+            return re.search(pattern, content, flags)
+    except re.error as e:
+        raise RegexTimeoutError(f"Invalid regex pattern: {e}")
 
 
 class Verifier(Protocol):
