@@ -154,6 +154,7 @@ def run(
             report.get("tier1_fail", 0) > 0
             or report.get("tier2_fail", 0) > 0
             or report.get("suff_insufficient", 0) > 0
+            or (output_format == "github" and report.get("tier2_skip", 0) > 0)
         ):
             has_failures = True
 
@@ -473,6 +474,10 @@ def _text_output(report: dict, verbose: bool) -> None:
                 if details:
                     console.print(f"    [red]{sd['control_id']}[/red]: [blue]{details}[/blue]")
 
+    t2s = report.get("tier2_skip", 0)
+    if t2s:
+        console.print(f"\n  [yellow]{t2s} tier2 skipped — no provider configured. Controls cannot reach verified status without tier 2.[/yellow]")
+
     if report.get("dry_run"):
         console.print("\n  [yellow]Dry run — results not submitted[/yellow]")
     elif report.get("developer_key"):
@@ -520,7 +525,7 @@ def _github_output(report: dict) -> None:
         total = report.get("tier1_pass", 0) + report.get("tier2_pass", 0)
         msg = f"{total} assertions verified"
         if t2s:
-            msg += f", {t2s} tier2 skipped (no provider configured)"
+            click.echo(f"::error title=Tier 2 Skipped::{t2s} tier2 assertions skipped — no provider configured. Controls cannot reach verified status without tier 2.")
         click.echo(f"::notice title=Verification Passed::{msg}")
 
     # Sufficiency gaps — separate section after verification results

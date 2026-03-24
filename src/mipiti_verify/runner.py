@@ -271,29 +271,44 @@ class Runner:
 
         # Read source file for context
         params = assertion.get("params", {})
-        source_file = params.get("file", "")
+        a_type = assertion.get("type", "")
+        # For file_hash, tier 2 reviews the code that pins the hash (scope_file),
+        # not the hashed file itself.
+        if a_type == "file_hash":
+            source_file = params.get("scope_file", "")
+        else:
+            source_file = params.get("file", "")
         source_code = ""
         if source_file:
-            fpath = self.project_root / source_file
-            if fpath.is_file():
+            from .verifiers import safe_resolve_path, PathTraversalError
+            try:
+                fpath = safe_resolve_path(self.project_root, source_file)
+            except PathTraversalError:
+                fpath = None
+            if fpath and fpath.is_file():
                 try:
                     content = fpath.read_text(encoding="utf-8", errors="replace")
                     # If scope_start/scope_end provided, extract scoped section
                     # for tier 2 review — more focused and token-efficient.
-                    a_type = assertion.get("type", "")
+                    # scope_start only: from match to EOF
+                    # scope_end only: from BOF to match
+                    # both: from scope_start to scope_end
                     scope_start = params.get("scope_start", "")
-                    if scope_start and a_type in ("pattern_matches", "pattern_absent"):
+                    scope_end = params.get("scope_end", "")
+                    if (scope_start or scope_end) and a_type in ("pattern_matches", "pattern_absent", "file_hash"):
                         import re
-                        s_match = re.search(scope_start, content, re.MULTILINE)
-                        if s_match:
-                            s_pos = s_match.start()
-                            scope_end = params.get("scope_end", "")
-                            if scope_end:
-                                e_match = re.search(scope_end, content[s_match.end():], re.MULTILINE)
-                                e_pos = s_match.end() + e_match.start() if e_match else len(content)
-                            else:
-                                e_pos = len(content)
-                            content = content[s_pos:e_pos]
+                        s_pos = 0
+                        e_pos = len(content)
+                        if scope_start:
+                            s_match = re.search(scope_start, content, re.MULTILINE)
+                            if s_match:
+                                s_pos = s_match.start()
+                        if scope_end:
+                            search_from = s_pos if scope_start else 0
+                            e_match = re.search(scope_end, content[search_from:], re.MULTILINE)
+                            if e_match:
+                                e_pos = search_from + e_match.start()
+                        content = content[s_pos:e_pos]
                     # For pattern_matches/pattern_absent, center context around
                     # the match rather than taking the file head — ensures the
                     # reviewer sees the relevant code even in large files.
