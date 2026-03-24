@@ -467,7 +467,6 @@ def _text_output(report: dict, verbose: bool) -> None:
                       f"[red]{report.get('suff_insufficient', 0)} insufficient[/red]  "
                       f"[yellow]{report.get('suff_skip', 0)} skip[/yellow]")
         # Show per-control gap details for insufficient controls
-        from .runner import extract_gap_summary
         for sd in report.get("suff_details", []):
             if sd.get("result") == "insufficient":
                 details = sd.get("details", "").strip()
