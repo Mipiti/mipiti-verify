@@ -475,6 +475,8 @@ def _text_output(report: dict, verbose: bool) -> None:
 
     if report.get("dry_run"):
         console.print("\n  [yellow]Dry run — results not submitted[/yellow]")
+    elif report.get("developer_key"):
+        console.print("\n  [yellow]Developer key — results not submitted. Use a verifier key (mv_) for CI.[/yellow]")
     else:
         console.print(f"\n  Submitted: tier1 run={report.get('tier1_run_id', 'n/a')}  "
                       f"tier2 run={report.get('tier2_run_id', 'n/a')}")

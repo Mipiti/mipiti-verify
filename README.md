@@ -33,6 +33,15 @@ mipiti-verify report <model_id>
 
 API keys are workspace-scoped — `--all` verifies every model accessible by the key.
 
+### API key scopes
+
+| Prefix | Scope | Use |
+|--------|-------|-----|
+| `mk_` | Developer | Local development. Runs assertions but does not submit results. |
+| `mv_` | Verifier | CI pipelines. Runs assertions and submits results to update verification status. |
+
+Developer keys skip result submission automatically — no `--dry-run` needed.
+
 ### Key flags
 
 | Flag | Default | Description |

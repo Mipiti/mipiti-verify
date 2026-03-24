@@ -52,6 +52,7 @@ class Runner:
             pass  # backend may not support this endpoint yet
         self.oidc_token = oidc_token or _auto_detect_oidc(_aud)
         self.dry_run = dry_run
+        self._developer_key = client.key_scope == "developer"
         self.reverify = reverify
         self.verbose = verbose
         self.changed_files = changed_files
@@ -66,7 +67,7 @@ class Runner:
         details.extend(t1_details)
 
         t1_run_id = ""
-        if t1_results and not self.dry_run:
+        if t1_results and not self.dry_run and not self._developer_key:
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
@@ -80,7 +81,7 @@ class Runner:
         details.extend(t2_details)
 
         t2_run_id = ""
-        if t2_results and not self.dry_run:
+        if t2_results and not self.dry_run and not self._developer_key:
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
@@ -125,6 +126,7 @@ class Runner:
             "tier1_run_id": t1_run_id,
             "tier2_run_id": t2_run_id,
             "dry_run": self.dry_run,
+            "developer_key": self._developer_key,
             "details": details,
             "suff_details": suff_all,
         }
@@ -426,7 +428,7 @@ class Runner:
                 progress.advance(task)
 
         # Submit results
-        if results and not self.dry_run:
+        if results and not self.dry_run and not self._developer_key:
             submittable = [r for r in results if r["result"] in ("sufficient", "insufficient")]
             if submittable:
                 try:
