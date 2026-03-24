@@ -27,6 +27,7 @@ class MipitiClient:
                 "MIPITI_API_KEY is required. Set it as an environment variable "
                 "or pass api_key= to MipitiClient."
             )
+        self.key_scope = "verifier" if self.api_key.startswith("mv_") else "developer"
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={"X-API-Key": self.api_key},
