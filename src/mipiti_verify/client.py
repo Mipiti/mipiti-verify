@@ -157,31 +157,3 @@ class MipitiClient:
         resp.raise_for_status()
         return resp.json()
 
-    # ------------------------------------------------------------------
-    # Assertion sufficiency (CI pull + submit)
-    # ------------------------------------------------------------------
-
-    def get_pending_sufficiency(self, model_id: str) -> dict[str, Any]:
-        """GET /api/models/{id}/verification/pending-sufficiency
-
-        Returns ``{"model_id": ..., "controls": {ctrl_id: {control_description, assertion_count, sufficiency_prompt}}}``
-        """
-        resp = self._client.get(
-            f"/api/models/{model_id}/verification/pending-sufficiency"
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    def submit_sufficiency_results(
-        self,
-        model_id: str,
-        pipeline: dict[str, Any],
-        results: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """POST /api/models/{id}/verification/sufficiency-results"""
-        resp = self._client.post(
-            f"/api/models/{model_id}/verification/sufficiency-results",
-            json={"pipeline": pipeline, "results": results},
-        )
-        resp.raise_for_status()
-        return resp.json()
