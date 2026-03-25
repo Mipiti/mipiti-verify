@@ -91,27 +91,20 @@ class Runner:
             t2_run_id = resp.get("run_id", "")
 
         # --- Sufficiency ---
-        suff_results = self._run_sufficiency(model_id)
-
-        # Merge existing sufficiency results from the verification report
-        # so CI output shows ALL insufficient controls, not just newly evaluated ones
-        suff_all = list(suff_results)  # start with what we just evaluated
-        evaluated_ids = {r["control_id"] for r in suff_results}
+        # Evaluated server-side at assertion submission. Fetch for display.
+        suff_all: list[dict[str, Any]] = []
         try:
             vr = self.client.get_verification_report(model_id)
             for ctrl in vr.get("control_details", []):
-                ctrl_id = ctrl.get("control_id", "")
-                if ctrl_id in evaluated_ids:
-                    continue  # already have a fresh result
                 suff = ctrl.get("sufficiency")
                 if suff and suff.get("status") in ("sufficient", "insufficient"):
                     suff_all.append({
-                        "control_id": ctrl_id,
+                        "control_id": ctrl.get("control_id", ""),
                         "result": suff["status"],
                         "details": suff.get("details", ""),
                     })
         except Exception:
-            pass  # non-critical — just won't show existing results
+            pass
 
         return {
             "tier1_pass": sum(1 for r in t1_results if r["result"] == "pass"),
@@ -122,7 +115,7 @@ class Runner:
             "tier2_skip": sum(1 for r in t2_results if r["result"] == "skipped"),
             "suff_sufficient": sum(1 for r in suff_all if r["result"] == "sufficient"),
             "suff_insufficient": sum(1 for r in suff_all if r["result"] == "insufficient"),
-            "suff_skip": sum(1 for r in suff_results if r["result"] == "skipped"),
+            "suff_skip": 0,
             "tier1_run_id": t1_run_id,
             "tier2_run_id": t2_run_id,
             "dry_run": self.dry_run,
@@ -378,85 +371,6 @@ class Runner:
         except Exception as e:
             return {"status": "fail", "details": f"Tier 2 error: {e}"}
 
-    def _run_sufficiency(self, model_id: str) -> list[dict[str, Any]]:
-        """Run collective sufficiency evaluation for controls with pending assertions."""
-        try:
-            pending = self.client.get_pending_sufficiency(model_id)
-        except Exception as e:
-            if self.verbose:
-                console.print(f"  Sufficiency API not available: {e}")
-            return []
-
-        controls = pending.get("controls", {})
-        if not controls:
-            if self.verbose:
-                console.print("  No controls pending sufficiency evaluation")
-            return []
-
-        if self.tier2_provider_name is None:
-            if self.verbose:
-                console.print("  Skipping sufficiency: no --tier2-provider specified")
-            return [{"control_id": cid, "result": "skipped", "details": "No provider"} for cid in controls]
-
-        results: list[dict[str, Any]] = []
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                f"Sufficiency: evaluating {len(controls)} controls", total=len(controls)
-            )
-
-            for ctrl_id, ctrl_data in controls.items():
-                prompt = ctrl_data.get("sufficiency_prompt", "")
-                if not prompt:
-                    results.append({"control_id": ctrl_id, "result": "skipped", "details": "No prompt"})
-                    progress.advance(task)
-                    continue
-
-                try:
-                    from .tier2 import get_provider
-
-                    provider = get_provider(
-                        self.tier2_provider_name,
-                        model=self.tier2_model,
-                        api_key=self.tier2_api_key,
-                        ollama_url=self.ollama_url,
-                    )
-                    # No source code for sufficiency — platform-side evaluation
-                    # uses assertion descriptions + params, not actual source
-                    passed, reasoning = provider.evaluate(prompt, "")
-                    result = "sufficient" if passed else "insufficient"
-                    results.append({
-                        "control_id": ctrl_id,
-                        "result": result,
-                        "details": reasoning,
-                    })
-                except Exception as e:
-                    results.append({
-                        "control_id": ctrl_id,
-                        "result": "skipped",
-                        "details": f"Error: {e}",
-                    })
-                progress.advance(task)
-
-        # Submit results
-        if results and not self.dry_run and not self._developer_key:
-            submittable = [r for r in results if r["result"] in ("sufficient", "insufficient")]
-            if submittable:
-                try:
-                    self.client.submit_sufficiency_results(
-                        model_id,
-                        pipeline=_pipeline_metadata(),
-                        results=submittable,
-                    )
-                except Exception as e:
-                    if self.verbose:
-                        console.print(f"  Failed to submit sufficiency results: {e}")
-
-        return results
 
 
 def _auto_detect_repo(project_root: Path) -> str:
