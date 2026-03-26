@@ -552,19 +552,106 @@ def _github_output(report: dict) -> None:
         click.echo("::endgroup::")
 
 
+def _audit_html_report(content: str, key_url: str) -> None:
+    """Verify a signed HTML report."""
+    import base64
+    import hashlib
+    import re
+
+    console.print("\n[bold]Signed Report Verification[/bold]")
+    console.print("=" * 40)
+    has_failure = False
+
+    # Extract signature from HTML comment
+    sig_match = re.search(
+        r"<!-- mipiti-report-signature:([a-f0-9]+):([A-Za-z0-9+/=]+) -->\s*$",
+        content,
+    )
+    if not sig_match:
+        console.print("  [red]No signature found in report[/red]")
+        console.print("  This report was not signed by a Mipiti instance.")
+        raise SystemExit(1)
+
+    fingerprint = sig_match.group(1)
+    sig_b64 = sig_match.group(2)
+    console.print(f"  Key fingerprint: {fingerprint}")
+
+    # Strip signature to get the signed content
+    signed_content = content[:sig_match.start()]
+    content_hash = hashlib.sha256(signed_content.encode("utf-8")).digest()
+
+    # Fetch public key from JWKS endpoint
+    if not key_url:
+        key_url = "https://api.mipiti.io/.well-known/jwks"
+        console.print(f"  Using default JWKS: {key_url}")
+
+    console.print(f"\n[bold]Document Signature (ECDSA P-256)[/bold]")
+    try:
+        import httpx
+        resp = httpx.get(key_url, timeout=10)
+        resp.raise_for_status()
+        jwks = resp.json()
+
+        # Find key matching fingerprint
+        jwk = None
+        for k in jwks.get("keys", []):
+            if k.get("kid") == fingerprint:
+                jwk = k
+                break
+
+        if jwk is None:
+            console.print(f"  [red]Key {fingerprint[:16]}... not found in JWKS[/red]")
+            has_failure = True
+        else:
+            # Reconstruct EC public key from JWK
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives import hashes
+
+            x = int.from_bytes(base64.urlsafe_b64decode(jwk["x"] + "=="), "big")
+            y = int.from_bytes(base64.urlsafe_b64decode(jwk["y"] + "=="), "big")
+            pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
+            pub_key = pub_numbers.public_key()
+
+            sig = base64.b64decode(sig_b64)
+            pub_key.verify(sig, content_hash, ec.ECDSA(hashes.SHA256()))
+            console.print("  Signature:       [green]VALID[/green]")
+            console.print("  Document has not been modified since the platform generated it.")
+    except httpx.HTTPError as e:
+        console.print(f"  [red]Failed to fetch JWKS: {e}[/red]")
+        has_failure = True
+    except Exception as e:
+        console.print(f"  Signature:       [red]INVALID — {e}[/red]")
+        has_failure = True
+
+    if has_failure:
+        raise SystemExit(1)
+    console.print("\n[green bold]Report integrity verified.[/green bold]\n")
+
+
 @main.command()
 @click.argument("package_file", type=click.Path(exists=True))
-def audit(package_file: str) -> None:
-    """Verify an audit package independently.
+@click.option("--key-url", default="", help="JWKS URL for the Mipiti instance (e.g. https://api.mipiti.io/.well-known/jwks)")
+def audit(package_file: str, key_url: str) -> None:
+    """Verify an audit package or signed HTML report independently.
 
-    Checks OIDC provenance, content integrity (platform ECDSA signature),
-    and lists all assertion results with reasoning.
+    For HTML reports: verifies the ECDSA document signature, proving the
+    report has not been modified since the platform generated it.
+
+    For JSON audit packages: checks OIDC provenance, content integrity
+    (platform ECDSA signature), and lists all assertion results with reasoning.
     """
     import hashlib
     import base64
 
     with open(package_file) as f:
-        pkg = json.load(f)
+        content = f.read()
+
+    # Detect HTML report vs JSON audit package
+    if content.strip().startswith("<!DOCTYPE") or content.strip().startswith("<html"):
+        _audit_html_report(content, key_url)
+        return
+
+    pkg = json.loads(content)
 
     console.print("\n[bold]Audit Package Verification[/bold]")
     console.print("=" * 40)
