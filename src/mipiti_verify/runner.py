@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +17,33 @@ from .client import MipitiClient
 from .verifiers import get_verifier
 
 console = Console(stderr=True)
+
+
+def compute_content_hash(
+    all_assertions: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+) -> str:
+    """Compute SHA-256 hash of assertion content + verdicts.
+
+    Binds what CI verified (assertion definitions) to what it concluded
+    (pass/fail). The backend validates this hash at submission time to
+    detect modifications between CI pull and result submission.
+    """
+    verdict_map = {r["assertion_id"]: r["result"] for r in results}
+    records = []
+    for a in all_assertions:
+        aid = a.get("id", "")
+        verdict = verdict_map.get(aid, "skipped")
+        records.append({
+            "assertion_id": aid,
+            "type": a.get("type", ""),
+            "params": a.get("params", {}),
+            "description": a.get("description", ""),
+            "verdict": verdict,
+        })
+    records.sort(key=lambda x: x["assertion_id"])
+    canonical = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
 
 
 class Runner:
@@ -63,30 +92,34 @@ class Runner:
         details: list[dict[str, Any]] = []
 
         # --- Tier 1 ---
-        t1_results, t1_details = self._run_tier(model_id, tier=1)
+        t1_results, t1_details, t1_assertions = self._run_tier(model_id, tier=1)
         details.extend(t1_details)
 
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
+            content_hash = compute_content_hash(t1_assertions, t1_results)
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
                 results=t1_results,
                 oidc_token=self.oidc_token,
+                content_hash=content_hash,
             )
             t1_run_id = resp.get("run_id", "")
 
         # --- Tier 2 ---
-        t2_results, t2_details = self._run_tier(model_id, tier=2)
+        t2_results, t2_details, t2_assertions = self._run_tier(model_id, tier=2)
         details.extend(t2_details)
 
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
+            content_hash = compute_content_hash(t2_assertions, t2_results)
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
                 results=t2_results,
                 oidc_token=self.oidc_token,
+                content_hash=content_hash,
             )
             t2_run_id = resp.get("run_id", "")
 
@@ -126,8 +159,8 @@ class Runner:
 
     def _run_tier(
         self, model_id: str, tier: int
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Run verification for a single tier. Returns (api_results, detail_records)."""
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Run verification for a single tier. Returns (api_results, detail_records, all_assertions)."""
         if self.reverify:
             pending = self.client.get_all_assertions(model_id, repo=self.repo)
         else:
@@ -136,7 +169,7 @@ class Runner:
         if not controls:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
-            return [], []
+            return [], [], []
 
         # Filter to assertions referencing changed files when --changed-files is set.
         # Assertions without a file param are always included (can't be scoped).
@@ -157,7 +190,7 @@ class Runner:
                 console.print(f"  Tier {tier}: skipped {skipped} assertions (files unchanged)")
             controls = filtered
             if not controls:
-                return [], []
+                return [], [], []
 
         total = sum(len(assertions) for assertions in controls.values())
         results: list[dict[str, Any]] = []
@@ -233,7 +266,7 @@ class Runner:
                     })
                     progress.advance(task)
 
-        return results, details
+        return results, details, all_assertions
 
     def _verify_tier1(self, assertion: dict) -> dict[str, Any]:
         """Run Tier 1 mechanical verification."""

@@ -95,11 +95,13 @@ class MipitiClient:
         oidc_token: str = "",
         signature: str = "",
         signed_hash: str = "",
+        content_hash: str = "",
     ) -> dict[str, Any]:
         """POST /api/models/{id}/verification/results"""
         body: dict[str, Any] = {
             "pipeline": pipeline,
             "results": results,
+            "content_hash": content_hash,
         }
         if signature:
             body["signature"] = signature
