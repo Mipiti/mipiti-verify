@@ -49,6 +49,10 @@ inputs:
     required: false
     default: "1"
 
+outputs:
+  content-hash:
+    description: "SHA-256 content hash of verified assertions (sha256:<hex>). Use with actions/attest-build-provenance for Sigstore attestation."
+
 runs:
   using: docker
   image: Dockerfile

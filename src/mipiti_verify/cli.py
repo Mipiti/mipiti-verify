@@ -516,6 +516,14 @@ def _github_output(report: dict) -> None:
                        f"({d['type']}): {d['details']}")
         click.echo("::endgroup::")
 
+    # Write content hash to GITHUB_OUTPUT for attestation steps
+    content_hash = report.get("content_hash", "")
+    if content_hash:
+        gh_output = os.environ.get("GITHUB_OUTPUT", "")
+        if gh_output:
+            with open(gh_output, "a") as f:
+                f.write(f"content_hash={content_hash}\n")
+
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
     t2s = report.get("tier2_skip", 0)
