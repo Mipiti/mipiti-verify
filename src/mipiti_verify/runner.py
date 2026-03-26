@@ -139,6 +139,11 @@ class Runner:
         except Exception:
             pass
 
+        # Compute combined content hash across both tiers for attestation
+        all_verified = t1_assertions + t2_assertions
+        all_results = t1_results + t2_results
+        combined_content_hash = compute_content_hash(all_verified, all_results) if all_verified else ""
+
         return {
             "tier1_pass": sum(1 for r in t1_results if r["result"] == "pass"),
             "tier1_fail": sum(1 for r in t1_results if r["result"] == "fail"),
@@ -151,6 +156,7 @@ class Runner:
             "suff_skip": 0,
             "tier1_run_id": t1_run_id,
             "tier2_run_id": t2_run_id,
+            "content_hash": combined_content_hash,
             "dry_run": self.dry_run,
             "developer_key": self._developer_key,
             "details": details,
