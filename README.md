@@ -100,13 +100,26 @@ Developer keys skip result submission automatically — no `--dry-run` needed.
 ## GitHub Action
 
 ```yaml
-- uses: Mipiti/mipiti-verify@v0.17.0
+- uses: Mipiti/mipiti-verify@67a6c409e33e38b150fc770ca87e0c9d35e790e8 # v0.17.1
   with:
+    # Required
     api-key: ${{ secrets.MIPITI_API_KEY }}
-    all: true
-    tier2-provider: openai
-    tier2-model: gpt-4o-mini
+
+    # Model selection (one of these)
+    all: true                    # Verify all models in the workspace
+    # model-id: "tm-abc123"     # Or verify a specific model
+
+    # Tier 2 semantic verification (omit for Tier 1 only)
+    tier2-provider: openai       # openai, anthropic, or ollama
+    tier2-model: gpt-4o-mini     # e.g. gpt-4o, claude-sonnet-4-5-20250514
     tier2-api-key: ${{ secrets.OPENAI_API_KEY }}
+
+    # Optional
+    # reverify: true             # Re-verify all assertions, not just pending (default: true)
+    # dry-run: false             # Run without submitting results (default: false)
+    # concurrency: 1             # Max concurrent Tier 2 LLM calls (default: 1)
+    # project-root: "."          # Project root directory (default: ".")
+    # base-url: "https://api.mipiti.io"  # API base URL (default: https://api.mipiti.io)
 ```
 
 All assertions are re-verified by default. Use `reverify: false` to only check new assertions (reduces Tier 2 API costs on PRs). Omitting `tier2-provider` runs Tier 1 only — controls won't reach "verified" status without Tier 2.
@@ -115,16 +128,16 @@ All assertions are re-verified by default. Use `reverify: false` to only check n
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `api-key` | Yes | | Mipiti API key (`mv_` verifier scope) |
-| `model-id` | No | | Specific model ID (omit if using `all`) |
+| `api-key` | **Yes** | | Mipiti API key (`mv_` verifier scope) |
+| `model-id` | No | `""` | Specific model ID (omit if using `all`) |
 | `all` | No | `false` | Verify all models in the workspace |
-| `tier2-provider` | No | | AI provider: `openai`, `anthropic`, or `ollama` |
-| `tier2-model` | No | | Model name |
-| `tier2-api-key` | No | | Provider API key |
-| `project-root` | No | `.` | Project root directory |
-| `reverify` | No | `true` | Re-verify all assertions |
-| `dry-run` | No | `false` | Run without submitting results |
-| `concurrency` | No | `1` | Max concurrent Tier 2 calls |
+| `tier2-provider` | No | `""` | AI provider: `openai`, `anthropic`, or `ollama` |
+| `tier2-model` | No | `""` | Model name (e.g., `gpt-4o`, `gpt-4o-mini`, `claude-sonnet-4-5-20250514`) |
+| `tier2-api-key` | No | `""` | Provider API key (OpenAI or Anthropic) |
+| `project-root` | No | `"."` | Project root directory |
+| `reverify` | No | `true` | Re-verify all assertions, not just pending. Catches regressions. |
+| `dry-run` | No | `false` | Run verifiers but don't submit results |
+| `concurrency` | No | `1` | Max concurrent Tier 2 LLM calls |
 | `base-url` | No | `https://api.mipiti.io` | API base URL |
 
 ### Action Output
