@@ -12,7 +12,6 @@ from . import (
     VerifierResult,
     register,
     resolve_content,
-    safe_read_file,
     safe_regex_search,
     safe_resolve_path,
 )
@@ -143,11 +142,11 @@ class PatternAbsentVerifier:
 class NoPlaintextSecretVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         patterns = params.get("patterns", [])
         found = []

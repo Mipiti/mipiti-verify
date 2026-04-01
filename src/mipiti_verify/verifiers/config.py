@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, safe_read_file, safe_resolve_path
+from . import PathTraversalError, VerifierResult, register, resolve_content, safe_read_file, safe_resolve_path
 
 
 def _parse_config(project_root: Path, file_param: str) -> dict | None:
@@ -150,11 +150,11 @@ class ConfigValueMatchesVerifier:
 class EnvVarReferencedVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
         variable = params["variable"]
 
         # Look for common env var access patterns
@@ -173,7 +173,7 @@ class EnvVarReferencedVerifier:
             if re.search(pattern, content):
                 return VerifierResult(
                     passed=True,
-                    details=f"Env var '{variable}' referenced in {params['file']}",
+                    details=f"Env var '{variable}' referenced in {source}",
                 )
 
-        return VerifierResult(passed=False, details=f"Env var '{variable}' not found in {params['file']}")
+        return VerifierResult(passed=False, details=f"Env var '{variable}' not found in {source}")

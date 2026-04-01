@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, safe_read_file, safe_regex_search
+from . import PathTraversalError, VerifierResult, register, resolve_content, safe_regex_search
 
 
 @register("function_exists")
@@ -24,11 +24,11 @@ class FunctionExistsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         name = re.escape(params["name"])
 
@@ -42,7 +42,7 @@ class FunctionExistsVerifier:
                     details=f"Function '{params['name']}' found at line {line_no}",
                 )
 
-        return VerifierResult(passed=False, details=f"Function '{params['name']}' not found in {params['file']}")
+        return VerifierResult(passed=False, details=f"Function '{params['name']}' not found in {source}")
 
 
 @register("class_exists")
@@ -59,11 +59,11 @@ class ClassExistsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         name = re.escape(params["name"])
 
@@ -77,7 +77,7 @@ class ClassExistsVerifier:
                     details=f"Class '{params['name']}' found at line {line_no}",
                 )
 
-        return VerifierResult(passed=False, details=f"Class '{params['name']}' not found in {params['file']}")
+        return VerifierResult(passed=False, details=f"Class '{params['name']}' not found in {source}")
 
 
 @register("decorator_present")
@@ -86,11 +86,11 @@ class DecoratorPresentVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         decorator = re.escape(params["decorator"])
         function = re.escape(params["function"])
@@ -107,7 +107,7 @@ class DecoratorPresentVerifier:
 
         return VerifierResult(
             passed=False,
-            details=f"Decorator @{params['decorator']} not found on {params['function']} in {params['file']}",
+            details=f"Decorator @{params['decorator']} not found on {params['function']} in {source}",
         )
 
 
@@ -117,11 +117,11 @@ class FunctionCallsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         caller = params["caller"]
         callee = params["callee"]
@@ -168,11 +168,11 @@ class ImportPresentVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         module = params["module"]
 
@@ -192,7 +192,7 @@ class ImportPresentVerifier:
             if re.search(pattern, content):
                 return VerifierResult(
                     passed=True,
-                    details=f"Import of '{module}' found in {params['file']}",
+                    details=f"Import of '{module}' found in {source}",
                 )
 
-        return VerifierResult(passed=False, details=f"Import of '{module}' not found in {params['file']}")
+        return VerifierResult(passed=False, details=f"Import of '{module}' not found in {source}")

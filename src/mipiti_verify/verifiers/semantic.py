@@ -9,9 +9,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import PathTraversalError, safe_read_file
-
-from . import VerifierResult, register
+from . import PathTraversalError, VerifierResult, register, resolve_content
 
 
 @register("parameter_validated")
@@ -20,11 +18,11 @@ class ParameterValidatedVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
         function = params["function"]
         parameter = params["parameter"]
 
@@ -41,7 +39,7 @@ class ParameterValidatedVerifier:
             )
         return VerifierResult(
             passed=False,
-            details=f"Parameter '{parameter}' not referenced in {params['file']}",
+            details=f"Parameter '{parameter}' not referenced in {source}",
         )
 
 
@@ -51,11 +49,11 @@ class ErrorHandledVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
         function = params["function"]
 
         # Check function exists
@@ -96,11 +94,11 @@ class MiddlewareRegisteredVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
         middleware = params["middleware"]
 
         # Look for middleware registration patterns
@@ -116,12 +114,12 @@ class MiddlewareRegisteredVerifier:
             if re.search(pattern, content):
                 return VerifierResult(
                     passed=True,
-                    details=f"Middleware '{middleware}' found in {params['file']} (semantic verification needed)",
+                    details=f"Middleware '{middleware}' found in {source} (semantic verification needed)",
                 )
 
         return VerifierResult(
             passed=False,
-            details=f"Middleware '{middleware}' not found in {params['file']}",
+            details=f"Middleware '{middleware}' not found in {source}",
         )
 
 
@@ -131,20 +129,20 @@ class HttpHeaderSetVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
         header = params["header"]
 
         # Case-insensitive search for the header name
         if re.search(re.escape(header), content, re.IGNORECASE):
             return VerifierResult(
                 passed=True,
-                details=f"Header '{header}' referenced in {params['file']} (semantic verification needed)",
+                details=f"Header '{header}' referenced in {source} (semantic verification needed)",
             )
         return VerifierResult(
             passed=False,
-            details=f"Header '{header}' not found in {params['file']}",
+            details=f"Header '{header}' not found in {source}",
         )
