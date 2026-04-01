@@ -172,6 +172,9 @@ class Runner:
         else:
             pending = self.client.get_pending(model_id, tier=tier, repo=self.repo)
         controls = pending.get("controls", {})
+        # Merge assumption assertions into the same verification pass
+        for as_id, as_assertions in pending.get("assumptions", {}).items():
+            controls[as_id] = as_assertions
         if not controls:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
