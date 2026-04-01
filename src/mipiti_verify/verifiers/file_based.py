@@ -11,6 +11,7 @@ from . import (
     RegexTimeoutError,
     VerifierResult,
     register,
+    resolve_content,
     safe_read_file,
     safe_regex_search,
     safe_resolve_path,
@@ -82,11 +83,11 @@ class FileHashVerifier:
 class PatternMatchesVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         content = _extract_scope(content, params)
         if not content and params.get("scope_start"):
@@ -112,11 +113,11 @@ class PatternMatchesVerifier:
 class PatternAbsentVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content = safe_read_file(project_root, params["file"])
-        except PathTraversalError as e:
+            content, source = resolve_content(params, project_root)
+        except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
-            return VerifierResult(passed=False, details=f"File not found: {params['file']}")
+            return VerifierResult(passed=False, details=f"Source not found: {source}")
 
         content = _extract_scope(content, params)
         if not content and params.get("scope_start"):
