@@ -52,7 +52,7 @@ class MipitiClient:
     ) -> dict[str, Any]:
         """GET /api/models/{id}/verification/pending?tier={t}&repo={r}
 
-        Returns ``{"model_id": ..., "tier": ..., "controls": {ctrl_id: [assertions]}}``
+        Returns ``{"model_id": ..., "tier": ..., "controls": {ctrl_id: [assertions]}, "assumptions": {as_id: [assertions]}}``
         """
         params: dict[str, Any] = {"tier": tier, "stale_after": stale_after}
         if repo:
@@ -71,7 +71,7 @@ class MipitiClient:
     def get_all_assertions(self, model_id: str, repo: str = "") -> dict[str, Any]:
         """GET /api/models/{id}/verification/assertions?repo={r}
 
-        Returns ``{"model_id": ..., "controls": {ctrl_id: [assertions]}}``
+        Returns ``{"model_id": ..., "controls": {ctrl_id: [assertions]}, "assumptions": {as_id: [assertions]}}``
         """
         params: dict[str, Any] = {}
         if repo:

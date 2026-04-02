@@ -172,6 +172,9 @@ class Runner:
         else:
             pending = self.client.get_pending(model_id, tier=tier, repo=self.repo)
         controls = pending.get("controls", {})
+        # Merge assumption assertions into the same verification pass
+        for as_id, as_assertions in pending.get("assumptions", {}).items():
+            controls[as_id] = as_assertions
         if not controls:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
@@ -301,7 +304,7 @@ class Runner:
         if self.tier2_provider_name is None:
             return {"status": "skipped", "details": "No --tier2-provider specified"}
 
-        # Read source file for context
+        # Read source content for context
         params = assertion.get("params", {})
         a_type = assertion.get("type", "")
         # For file_hash, tier 2 reviews the code that pins the hash (scope_file),
@@ -311,7 +314,14 @@ class Runner:
         else:
             source_file = params.get("file", "")
         source_code = ""
-        if source_file:
+        # For target-based assertions (e.g., feature_description), use
+        # platform-injected content instead of reading from disk.
+        # No truncation — content must match what Tier 1 verified via
+        # resolve_content(). If it exceeds the provider's context window,
+        # the provider will fail naturally with an informative error.
+        if not source_file and params.get("target_content"):
+            source_code = params["target_content"]
+        elif source_file:
             from .verifiers import safe_resolve_path, PathTraversalError
             try:
                 fpath = safe_resolve_path(self.project_root, source_file)

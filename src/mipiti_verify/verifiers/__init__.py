@@ -63,6 +63,37 @@ def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024
     return resolved.read_text(encoding="utf-8", errors="replace")
 
 
+_VALID_TARGETS = frozenset({"feature_description"})
+
+
+def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
+    """Resolve assertion content from either a codebase file or a platform target.
+
+    Returns (content, source_label). content is None if the source is not found.
+    Raises PathTraversalError for file path escapes.
+    Raises ValueError for invalid target values or mutual exclusion violations.
+    """
+    target = params.get("target")
+    file_param = params.get("file")
+
+    if target and file_param:
+        raise ValueError("'target' and 'file' are mutually exclusive in assertion params")
+
+    if target:
+        if target not in _VALID_TARGETS:
+            raise ValueError(f"Invalid assertion target: {target!r}")
+        content = params.get("target_content")
+        if content is None:
+            return None, f"target:{target}"
+        return content, f"target:{target}"
+
+    if file_param:
+        content = safe_read_file(project_root, file_param)
+        return content, file_param
+
+    return None, "<no source>"
+
+
 def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, flags: int = 0) -> re.Match | None:
     """Run re.search with a timeout to prevent ReDoS.
 
