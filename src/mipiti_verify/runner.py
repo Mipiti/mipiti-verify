@@ -316,6 +316,9 @@ class Runner:
         source_code = ""
         # For target-based assertions (e.g., feature_description), use
         # platform-injected content instead of reading from disk.
+        # No truncation — content must match what Tier 1 verified via
+        # resolve_content(). If it exceeds the provider's context window,
+        # the provider will fail naturally with an informative error.
         if not source_file and params.get("target_content"):
             source_code = params["target_content"]
         elif source_file:
