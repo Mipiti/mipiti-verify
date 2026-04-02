@@ -304,7 +304,7 @@ class Runner:
         if self.tier2_provider_name is None:
             return {"status": "skipped", "details": "No --tier2-provider specified"}
 
-        # Read source file for context
+        # Read source content for context
         params = assertion.get("params", {})
         a_type = assertion.get("type", "")
         # For file_hash, tier 2 reviews the code that pins the hash (scope_file),
@@ -314,7 +314,11 @@ class Runner:
         else:
             source_file = params.get("file", "")
         source_code = ""
-        if source_file:
+        # For target-based assertions (e.g., feature_description), use
+        # platform-injected content instead of reading from disk.
+        if not source_file and params.get("target_content"):
+            source_code = params["target_content"]
+        elif source_file:
             from .verifiers import safe_resolve_path, PathTraversalError
             try:
                 fpath = safe_resolve_path(self.project_root, source_file)
