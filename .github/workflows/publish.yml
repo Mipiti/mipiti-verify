@@ -35,7 +35,7 @@ jobs:
           twine check dist/*
 
       - name: Attest build provenance (Sigstore)
-        uses: actions/attest-build-provenance@e8998f949152b04c1f7f25dcc006acbb7be2fc25  # v2.4.0
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2.4.0
         with:
           subject-path: dist/*
 
