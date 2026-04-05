@@ -171,6 +171,17 @@ pip install -e ".[dev]"
 python -m pytest -v
 ```
 
+### Updating dependencies
+
+After changing dependencies in `pyproject.toml`, regenerate the lockfiles:
+
+```bash
+pip install uv
+python lock-deps.py
+```
+
+This produces `requirements.lock` and `requirements-all.lock` with SHA-256 hashes. Commit them alongside `pyproject.toml` changes.
+
 ## License
 
 Proprietary. Copyright (c) 2026 Mipiti, LLC. All rights reserved. See [LICENSE](LICENSE) for details.
