@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-import signal
+import re2
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,39 +95,41 @@ def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
 
 
 def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, flags: int = 0) -> re.Match | None:
-    """Run re.search with a timeout to prevent ReDoS.
+    """Run regex search using RE2 with a cross-platform threading timeout.
 
-    On Unix, uses SIGALRM for accurate timeout.
-    On Windows/other, uses re2 if available, otherwise falls back to
-    basic complexity checks + standard re.search.
+    Two layers of protection:
+    - RE2 prevents ReDoS by construction (linear-time, no backtracking)
+    - Threading timeout prevents slow linear scans on large inputs
+
+    Patterns using backreferences, lookahead, or lookbehind are rejected
+    at parse time (these are the constructs that enable ReDoS).
 
     Args:
-        flags: Additional re flags (e.g., re.DOTALL | re.MULTILINE for multiline patterns).
+        timeout_seconds: Maximum wall-clock time for the search (default 2s).
+        flags: re.MULTILINE, re.DOTALL, etc.
     """
-    # Basic complexity check — reject obviously dangerous patterns
-    # (nested quantifiers like (a+)+ or (a*)*a)
-    if re.search(r'\([^)]*[+*][^)]*\)[+*]', pattern):
-        raise RegexTimeoutError(f"Pattern rejected: nested quantifiers detected in '{pattern[:50]}'")
+    import threading
 
-    try:
-        if sys.platform != "win32":
-            def _alarm_handler(signum, frame):
-                raise RegexTimeoutError(f"Regex timed out after {timeout_seconds}s: {pattern[:50]}")
+    result_box: list = []
+    error_box: list = []
 
-            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-            try:
-                return re.search(pattern, content, flags)
-            except RegexTimeoutError:
-                raise
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, old_handler)
-        else:
-            # Windows: no SIGALRM, rely on complexity check above
-            return re.search(pattern, content, flags)
-    except re.error as e:
-        raise RegexTimeoutError(f"Invalid regex pattern: {e}")
+    def _run():
+        try:
+            result_box.append(re2.search(pattern, content, flags))
+        except re2.error as e:
+            error_box.append(e)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        raise RegexTimeoutError(f"Regex timed out after {timeout_seconds}s: {pattern[:50]}")
+
+    if error_box:
+        raise RegexTimeoutError(f"Invalid regex pattern: {error_box[0]}")
+
+    return result_box[0] if result_box else None
 
 
 class Verifier(Protocol):
