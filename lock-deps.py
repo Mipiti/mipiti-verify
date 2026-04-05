@@ -13,7 +13,7 @@ ROOT = Path(__file__).parent
 
 
 def run(args: list[str]) -> None:
-    subprocess.check_call([sys.executable, "-m", "piptools", "compile", *args], cwd=ROOT)
+    subprocess.check_call([sys.executable, "-m", "uv", "pip", "compile", *args], cwd=ROOT)
 
 
 def strip_self_reference(path: Path) -> None:
@@ -39,7 +39,9 @@ def strip_self_reference(path: Path) -> None:
 
 
 def main() -> None:
-    common = ["--generate-hashes", "--strip-extras"]
+    # Target 3.12 (our minimum CI/Docker version) so transitive deps
+    # like typing_extensions are included even when running on 3.13+.
+    common = ["--generate-hashes", "--strip-extras", "--python-version=3.12"]
 
     print("Compiling requirements.lock ...")
     run([*common, "-o", "requirements.lock", "pyproject.toml"])

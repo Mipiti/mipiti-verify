@@ -176,7 +176,7 @@ python -m pytest -v
 After changing dependencies in `pyproject.toml`, regenerate the lockfiles:
 
 ```bash
-pip install pip-tools
+pip install uv
 python lock-deps.py
 ```
 
