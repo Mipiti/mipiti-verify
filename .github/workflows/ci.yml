@@ -17,8 +17,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install pinned dependencies
+        run: pip install --require-hashes -r requirements.lock
+
+      - name: Install package and dev extras
+        run: pip install --no-deps -e . && pip install pytest pytest-mock respx
 
       - name: Run tests
         run: python -m pytest -v

@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 
+COPY requirements-all.lock /tmp/requirements-all.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-all.lock
+
 COPY . /action
-RUN pip install --no-cache-dir "/action[all]"
+RUN pip install --no-cache-dir --no-deps "/action[all]"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
