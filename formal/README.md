@@ -19,7 +19,8 @@ The TLA+ specification (`VerificationPipeline.tla`) models the lifecycle of an a
 | **I3** | PASS requires Tier 1 pass | A control can only be verified if the mechanical check actually found the evidence. No shortcut to PASS. |
 | **I4** | Submitted results were evaluated | Results are never submitted to the platform without both tiers completing. No unevaluated assertions slip through. |
 | **I5** | Tier 2 only runs after Tier 1 | The semantic check never starts before mechanical verification completes. The pipeline always evaluates Tier 1 first, ensuring deterministic results are available before LLM evaluation. |
-| **I6** | Tier 1 failure skips Tier 2 | When a mechanical check fails, the final verdict is FAIL regardless of Tier 2. In the default flow, Tier 2 is skipped for failed assertions. With `--reverify`, the runner evaluates Tier 2 on all assertions including Tier 1 failures, but the platform requires both tiers to pass — Tier 2 alone can never promote a Tier 1 failure to PASS. |
+| **I6a** | Tier 1 failure skips Tier 2 (default mode) | Without `--reverify`, a mechanical check failure automatically skips Tier 2. No LLM resources wasted on already-failed assertions. |
+| **I6b** | All assertions get Tier 2 evaluated (reverify mode) | With `--reverify`, every assertion gets a fresh Tier 2 result — including Tier 1 failures. No stale data. The platform requires both tiers to pass, so Tier 2 alone can never promote a Tier 1 failure to PASS (guaranteed by I1). |
 
 ## How it works
 
@@ -32,11 +33,11 @@ The verification uses a three-layer approach:
 - **Actions**: RunTier1Pass, RunTier1Fail, RunTier2Pass, RunTier2Fail, SkipTier2, HandleError, SubmitResults
 - **Invariants**: the six properties above
 
-TLC (the TLA+ model checker, developed by Leslie Lamport) independently explores every reachable state and verifies every invariant holds. TLC is a completely independent tool — if the Python checker has a bug, TLC still catches design flaws.
+TLC (the TLA+ model checker, developed by Leslie Lamport) independently explores every reachable state and verifies every invariant holds. TLC runs on both configurations (default and reverify) using separate `.cfg` files. TLC is a completely independent tool — if the Python checker has a bug, TLC still catches design flaws.
 
 ### Layer 2: Exhaustive state exploration (Python BFS)
 
-`check_pipeline.py` implements breadth-first search over all reachable states (130 states, 193 transitions). At each state, it checks all six invariants. This is the same exhaustive approach used for the Mipiti platform's assurance engine.
+`check_pipeline.py` implements breadth-first search over all reachable states for both modes: default (130 states, 193 transitions) and reverify (306 states, 501 transitions). At each state, it checks all invariants appropriate to the mode. This is the same exhaustive approach used for the Mipiti platform's assurance engine.
 
 ### Layer 3: Implementation cross-check (real code, real files)
 
@@ -73,6 +74,7 @@ Both run automatically in CI on every commit (see `.github/workflows/ci.yml`).
 
 | File | Purpose |
 |------|---------|
-| `VerificationPipeline.tla` | TLA+ specification — the formal design |
-| `VerificationPipeline.cfg` | TLC configuration — constants and invariants for model checking |
-| `check_pipeline.py` | Python checker — BFS + cross-checks + model-based testing + AST proofs |
+| `VerificationPipeline.tla` | TLA+ specification — the formal design (both modes) |
+| `VerificationPipeline.cfg` | TLC configuration — default mode (reverify=false) |
+| `VerificationPipeline_reverify.cfg` | TLC configuration — reverify mode (reverify=true) |
+| `check_pipeline.py` | Python checker — BFS + cross-checks + model-based testing + AST proofs (runs both modes) |

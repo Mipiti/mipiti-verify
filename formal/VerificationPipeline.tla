@@ -6,15 +6,10 @@
  * and Tier 2 (semantic) verification, and verifies security-critical
  * invariants hold in every reachable state.
  *
- * State: per-assertion tier1 result, tier2 result, submitted status.
- * Actions: RunTier1, RunTier2, SubmitResults, HandleError.
- *
- * Key security invariants:
- *   - Tier 2 never overrides Tier 1 failure (non-LLM gate)
- *   - All error paths produce FAIL, never PASS (fail-closed)
- *   - Every assertion gets a Tier 1 result (completeness)
- *   - Tier 2 only runs after Tier 1 passes
- *   - Results are never submitted without evaluation
+ * The Reverify constant models the --reverify flag:
+ *   FALSE: Tier 1 failure auto-skips Tier 2 (I6a)
+ *   TRUE:  All assertions get Tier 2 evaluated for freshness (I6b)
+ * Security invariants (I1-I5) hold in both modes.
  *
  * Run via Python:
  *   python formal/check_pipeline.py
@@ -33,7 +28,10 @@ CONSTANTS
     T2Pass, T2Fail, T2Skipped, T2Pending,
 
     \* Error types
-    NoError, VerifierError, NetworkError, ParseError
+    NoError, VerifierError, NetworkError, ParseError,
+
+    \* Mode flag
+    Reverify
 
 VARIABLES
     \* tier1[a] = T1Pass | T1Fail | T1Pending
@@ -72,7 +70,7 @@ IsEvaluated(a) ==
     tier1[a] # T1Pending /\ tier2[a] # T2Pending
 
 -----------------------------------------------------------------------------
-(* Invariants *)
+(* Invariants — hold in BOTH reverify modes *)
 
 \* I1: Tier 2 never overrides Tier 1 failure (THE critical gate)
 Tier2NeverOverridesTier1 ==
@@ -101,16 +99,18 @@ Tier2AfterTier1 ==
     \A a \in Assertions :
         tier2[a] # T2Pending => tier1[a] # T1Pending
 
-\* I6: Tier 1 failure means Tier 2 is skipped
-Tier1FailSkipsTier2 ==
-    \A a \in Assertions :
+(* Mode-specific invariants *)
+
+\* I6a (Reverify=FALSE): Tier 1 failure skips Tier 2
+Tier1FailSkipsTier2_NoReverify ==
+    Reverify \/ \A a \in Assertions :
         tier1[a] = T1Fail => tier2[a] \in {T2Skipped, T2Pending}
 
-\* I7: Assertion isolation — evaluating one doesn't affect another
-\*   (structural: each assertion has independent state variables)
-
-\* I8: Determinism — same inputs produce same Tier 1 result
-\*   (structural: verifiers are pure functions)
+\* I6b (Reverify=TRUE): All evaluated assertions have Tier 2 results (no stale data)
+\*   If Tier 1 completed, Tier 2 must also complete (not left pending)
+AllTier2Evaluated_Reverify ==
+    ~Reverify \/ \A a \in Assertions :
+        submitted[a] => tier2[a] # T2Pending
 
 \* Combined invariant
 Invariant ==
@@ -119,7 +119,8 @@ Invariant ==
     /\ PassRequiresTier1
     /\ SubmittedMeansEvaluated
     /\ Tier2AfterTier1
-    /\ Tier1FailSkipsTier2
+    /\ Tier1FailSkipsTier2_NoReverify
+    /\ AllTier2Evaluated_Reverify
 
 -----------------------------------------------------------------------------
 (* Actions *)
@@ -136,30 +137,36 @@ RunTier1Fail(a) ==
     /\ tier1[a] = T1Pending
     /\ error[a] = NoError
     /\ tier1' = [tier1 EXCEPT ![a] = T1Fail]
-    \* Tier 2 is auto-skipped on Tier 1 failure
-    /\ tier2' = [tier2 EXCEPT ![a] = T2Skipped]
+    \* In non-reverify mode, auto-skip Tier 2.
+    \* In reverify mode, leave Tier 2 pending (will be evaluated).
+    /\ IF ~Reverify
+       THEN tier2' = [tier2 EXCEPT ![a] = T2Skipped]
+       ELSE UNCHANGED tier2
     /\ UNCHANGED <<error, submitted>>
 
-\* RunTier2Pass: Tier 2 (LLM) passes
+\* RunTier2Pass: Tier 2 (LLM) passes — allowed after Tier 1 pass or (reverify + Tier 1 fail)
 RunTier2Pass(a) ==
-    /\ tier1[a] = T1Pass
     /\ tier2[a] = T2Pending
     /\ error[a] = NoError
+    /\ tier1[a] # T1Pending  \* Tier 1 must have completed
+    /\ IF ~Reverify THEN tier1[a] = T1Pass ELSE TRUE
     /\ tier2' = [tier2 EXCEPT ![a] = T2Pass]
     /\ UNCHANGED <<tier1, error, submitted>>
 
 \* RunTier2Fail: Tier 2 (LLM) fails
 RunTier2Fail(a) ==
-    /\ tier1[a] = T1Pass
     /\ tier2[a] = T2Pending
     /\ error[a] = NoError
+    /\ tier1[a] # T1Pending
+    /\ IF ~Reverify THEN tier1[a] = T1Pass ELSE TRUE
     /\ tier2' = [tier2 EXCEPT ![a] = T2Fail]
     /\ UNCHANGED <<tier1, error, submitted>>
 
 \* SkipTier2: No provider configured
 SkipTier2(a) ==
-    /\ tier1[a] = T1Pass
     /\ tier2[a] = T2Pending
+    /\ tier1[a] # T1Pending
+    /\ IF ~Reverify THEN tier1[a] = T1Pass ELSE TRUE
     /\ tier2' = [tier2 EXCEPT ![a] = T2Skipped]
     /\ UNCHANGED <<tier1, error, submitted>>
 
@@ -169,7 +176,9 @@ HandleError(a, err) ==
     /\ error[a] = NoError
     /\ error' = [error EXCEPT ![a] = err]
     /\ tier1' = [tier1 EXCEPT ![a] = T1Fail]
-    /\ tier2' = [tier2 EXCEPT ![a] = T2Skipped]
+    /\ IF ~Reverify
+       THEN tier2' = [tier2 EXCEPT ![a] = T2Skipped]
+       ELSE UNCHANGED tier2
     /\ UNCHANGED submitted
 
 \* SubmitResults: Submit all evaluated assertions
@@ -179,8 +188,7 @@ SubmitResults ==
     /\ submitted' = [a \in Assertions |-> TRUE]
     /\ UNCHANGED <<tier1, tier2, error>>
 
-\* Done: system has terminated (all submitted). Allows stuttering
-\* so TLC does not report a false deadlock.
+\* Done: system has terminated (all submitted)
 Done ==
     /\ \A a \in Assertions : submitted[a]
     /\ UNCHANGED vars
