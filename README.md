@@ -162,6 +162,12 @@ All assertions are re-verified by default. Use `reverify: false` to only check n
 
 **Sufficiency** — evaluated server-side: do all assertions collectively cover every aspect of the control?
 
+## Formal Verification
+
+The verification pipeline is formally verified using TLA+ specifications with independent model checking (TLC), exhaustive state exploration, and cross-checks against the real code. Key guarantees: all error paths fail-closed (no silent PASS), and LLM semantic checks can never override mechanical verification failures.
+
+See [`formal/README.md`](formal/README.md) for the full methodology, invariants, and verification chain.
+
 ## Development
 
 ```bash
