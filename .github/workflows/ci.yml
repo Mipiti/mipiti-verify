@@ -29,11 +29,14 @@ jobs:
       - name: Formal verification (Python BFS + cross-check)
         run: python formal/check_pipeline.py
 
-      - name: Formal verification (TLC)
+      - name: Formal verification (TLC — both modes)
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
           curl -sL "$TLC_URL" -o tla2tools.jar
           echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
+          echo "--- TLC: reverify=false ---"
           java -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
+          echo "--- TLC: reverify=true ---"
+          java -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
         working-directory: formal

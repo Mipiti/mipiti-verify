@@ -99,36 +99,42 @@ def is_evaluated(state: State, ai: int) -> bool:
 # Invariants
 # ---------------------------------------------------------------------------
 
-def check_invariants(state: State) -> List[str]:
+def check_invariants(state: State, reverify: bool = False) -> List[str]:
     violations = []
     for ai in range(len(ASSERTIONS)):
         v = final_verdict(state, ai)
 
-        # I1: Tier 2 never overrides Tier 1 failure
+        # I1: Tier 2 never overrides Tier 1 failure (both modes)
         if state.tier1[ai] == T1.FAIL and v != "fail":
             violations.append(f"I1: {ASSERTIONS[ai]} T1 failed but verdict={v}")
 
-        # I2: Errors always fail
+        # I2: Errors always fail (both modes)
         if state.errors[ai] != Error.NONE and v != "fail":
             violations.append(f"I2: {ASSERTIONS[ai]} has error but verdict={v}")
 
-        # I3: PASS requires T1 pass
+        # I3: PASS requires T1 pass (both modes)
         if v == "pass" and state.tier1[ai] != T1.PASS:
             violations.append(f"I3: {ASSERTIONS[ai]} verdict=pass but T1={state.tier1[ai]}")
         if v == "pass" and state.errors[ai] != Error.NONE:
             violations.append(f"I3: {ASSERTIONS[ai]} verdict=pass but has error")
 
-        # I4: Submitted means evaluated
+        # I4: Submitted means evaluated (both modes)
         if state.submitted[ai] and not is_evaluated(state, ai):
             violations.append(f"I4: {ASSERTIONS[ai]} submitted but not evaluated")
 
-        # I5: T2 runs only after T1 completes
+        # I5: T2 runs only after T1 completes (both modes)
         if state.tier2[ai] != T2.PENDING and state.tier1[ai] == T1.PENDING:
             violations.append(f"I5: {ASSERTIONS[ai]} T2 active but T1 pending")
 
-        # I6: T1 failure skips T2
-        if state.tier1[ai] == T1.FAIL and state.tier2[ai] not in (T2.SKIPPED, T2.PENDING):
-            violations.append(f"I6: {ASSERTIONS[ai]} T1 failed but T2={state.tier2[ai]}")
+        # I6a (reverify=False): T1 failure skips T2
+        if not reverify:
+            if state.tier1[ai] == T1.FAIL and state.tier2[ai] not in (T2.SKIPPED, T2.PENDING):
+                violations.append(f"I6a: {ASSERTIONS[ai]} T1 failed but T2={state.tier2[ai]}")
+
+        # I6b (reverify=True): submitted means T2 completed (no stale data)
+        if reverify:
+            if state.submitted[ai] and state.tier2[ai] == T2.PENDING:
+                violations.append(f"I6b: {ASSERTIONS[ai]} submitted but T2 still pending")
 
     return violations
 
@@ -144,27 +150,35 @@ def act_t1_pass(state, ai):
     if state.tier1[ai] != T1.PENDING or state.errors[ai] != Error.NONE: return None
     return State(tier1=_set(state.tier1, ai, T1.PASS), tier2=state.tier2, errors=state.errors, submitted=state.submitted)
 
-def act_t1_fail(state, ai):
+def act_t1_fail(state, ai, reverify=False):
     if state.tier1[ai] != T1.PENDING or state.errors[ai] != Error.NONE: return None
-    return State(tier1=_set(state.tier1, ai, T1.FAIL), tier2=_set(state.tier2, ai, T2.SKIPPED), errors=state.errors, submitted=state.submitted)
+    new_t2 = state.tier2 if reverify else _set(state.tier2, ai, T2.SKIPPED)
+    return State(tier1=_set(state.tier1, ai, T1.FAIL), tier2=new_t2, errors=state.errors, submitted=state.submitted)
 
-def act_t2_pass(state, ai):
-    if state.tier1[ai] != T1.PASS or state.tier2[ai] != T2.PENDING or state.errors[ai] != Error.NONE: return None
+def act_t2_pass(state, ai, reverify=False):
+    if state.tier2[ai] != T2.PENDING or state.errors[ai] != Error.NONE: return None
+    if state.tier1[ai] == T1.PENDING: return None
+    if not reverify and state.tier1[ai] != T1.PASS: return None
     return State(tier1=state.tier1, tier2=_set(state.tier2, ai, T2.PASS), errors=state.errors, submitted=state.submitted)
 
-def act_t2_fail(state, ai):
-    if state.tier1[ai] != T1.PASS or state.tier2[ai] != T2.PENDING or state.errors[ai] != Error.NONE: return None
+def act_t2_fail(state, ai, reverify=False):
+    if state.tier2[ai] != T2.PENDING or state.errors[ai] != Error.NONE: return None
+    if state.tier1[ai] == T1.PENDING: return None
+    if not reverify and state.tier1[ai] != T1.PASS: return None
     return State(tier1=state.tier1, tier2=_set(state.tier2, ai, T2.FAIL), errors=state.errors, submitted=state.submitted)
 
-def act_t2_skip(state, ai):
-    if state.tier1[ai] != T1.PASS or state.tier2[ai] != T2.PENDING: return None
+def act_t2_skip(state, ai, reverify=False):
+    if state.tier2[ai] != T2.PENDING: return None
+    if state.tier1[ai] == T1.PENDING: return None
+    if not reverify and state.tier1[ai] != T1.PASS: return None
     return State(tier1=state.tier1, tier2=_set(state.tier2, ai, T2.SKIPPED), errors=state.errors, submitted=state.submitted)
 
-def act_error(state, ai, err):
+def act_error(state, ai, err, reverify=False):
     if state.tier1[ai] != T1.PENDING or state.errors[ai] != Error.NONE: return None
+    new_t2 = state.tier2 if reverify else _set(state.tier2, ai, T2.SKIPPED)
     return State(
         tier1=_set(state.tier1, ai, T1.FAIL),
-        tier2=_set(state.tier2, ai, T2.SKIPPED),
+        tier2=new_t2,
         errors=_set(state.errors, ai, err),
         submitted=state.submitted,
     )
@@ -180,7 +194,7 @@ def act_submit(state):
 # BFS
 # ---------------------------------------------------------------------------
 
-def check_model():
+def check_model(reverify: bool = False):
     n = len(ASSERTIONS)
     init = State(
         tier1=tuple(T1.PENDING for _ in range(n)),
@@ -195,7 +209,7 @@ def check_model():
     transitions_checked = 0
     violations = []
 
-    for v in check_invariants(init):
+    for v in check_invariants(init, reverify):
         violations.append(f"INIT: {v}")
 
     while queue:
@@ -204,11 +218,15 @@ def check_model():
         successors = []
 
         for ai in range(n):
-            for fn in [act_t1_pass, act_t1_fail, act_t2_pass, act_t2_fail, act_t2_skip]:
-                s = fn(current, ai)
+            s = act_t1_pass(current, ai)
+            if s: successors.append(s)
+            s = act_t1_fail(current, ai, reverify)
+            if s: successors.append(s)
+            for fn in [act_t2_pass, act_t2_fail, act_t2_skip]:
+                s = fn(current, ai, reverify)
                 if s: successors.append(s)
             for err in [Error.VERIFIER, Error.NETWORK, Error.PARSE]:
-                s = act_error(current, ai, err)
+                s = act_error(current, ai, err, reverify)
                 if s: successors.append(s)
 
         s = act_submit(current)
@@ -216,7 +234,7 @@ def check_model():
 
         for new_state in successors:
             transitions_checked += 1
-            for v in check_invariants(new_state):
+            for v in check_invariants(new_state, reverify):
                 violations.append(v)
             if new_state not in visited:
                 visited.add(new_state)
@@ -429,7 +447,7 @@ def check_real_verifiers():
 # Model-based testing: verify invariants against real code for all states
 # ---------------------------------------------------------------------------
 
-def check_invariants_against_real_code():
+def check_invariants_against_real_code(reverify: bool = False):
     """For each reachable state in the BFS, set up real files, call the real
     _verify_tier1 and _verify_tier2, and verify invariants hold on real results.
 
@@ -438,7 +456,7 @@ def check_invariants_against_real_code():
     """
     from mipiti_verify.runner import Runner
 
-    all_states = _collect_all_states()
+    all_states = _collect_all_states(reverify)
     violations = []
     checked = 0
 
@@ -528,7 +546,7 @@ def check_invariants_against_real_code():
                         )
 
             # Check invariants on the REAL results
-            for v in check_invariants(real_state):
+            for v in check_invariants(real_state, reverify):
                 violations.append(f"Real code: {v}")
 
             checked += 1
@@ -539,7 +557,7 @@ def check_invariants_against_real_code():
     return checked, violations
 
 
-def _collect_all_states():
+def _collect_all_states(reverify: bool = False):
     """Collect all reachable states via BFS."""
     n = len(ASSERTIONS)
     init = State(
@@ -554,11 +572,15 @@ def _collect_all_states():
     while queue:
         current = queue.popleft()
         for ai in range(n):
-            for fn in [act_t1_pass, act_t1_fail, act_t2_pass, act_t2_fail, act_t2_skip]:
-                s = fn(current, ai)
+            s = act_t1_pass(current, ai)
+            if s and s not in visited: visited.add(s); queue.append(s)
+            s = act_t1_fail(current, ai, reverify)
+            if s and s not in visited: visited.add(s); queue.append(s)
+            for fn in [act_t2_pass, act_t2_fail, act_t2_skip]:
+                s = fn(current, ai, reverify)
                 if s and s not in visited: visited.add(s); queue.append(s)
             for err in [Error.VERIFIER, Error.NETWORK, Error.PARSE]:
-                s = act_error(current, ai, err)
+                s = act_error(current, ai, err, reverify)
                 if s and s not in visited: visited.add(s); queue.append(s)
         s = act_submit(current)
         if s and s not in visited: visited.add(s); queue.append(s)
@@ -644,18 +666,23 @@ def main():
     print(f"Exhaustive BFS: {len(ASSERTIONS)} assertions")
     print("=" * 70)
 
-    states, transitions, reachable, violations = check_model()
-    print(f"\nReachable states:    {reachable:,}")
-    print(f"Transitions checked: {transitions:,}")
+    violations = []
+
+    # Run both modes
+    for mode_name, rev in [("default (reverify=false)", False), ("reverify=true", True)]:
+        print(f"\n--- Mode: {mode_name} ---")
+        states, transitions, reachable, mode_violations = check_model(rev)
+        print(f"Reachable states:    {reachable:,}")
+        print(f"Transitions checked: {transitions:,}")
+        violations.extend(mode_violations)
+
+        mbt_checked, mbt_violations = check_invariants_against_real_code(rev)
+        print(f"Model-based testing: {mbt_checked} states verified")
+        violations.extend(mbt_violations)
 
     cross_configs, cross_violations = check_real_verifiers()
     print(f"\nReal verifier cross-check: {cross_configs} configs")
     violations.extend(cross_violations)
-
-    print("\nModel-based testing against real code...")
-    mbt_checked, mbt_violations = check_invariants_against_real_code()
-    print(f"States verified against real code: {mbt_checked}")
-    violations.extend(mbt_violations)
 
     ast_proofs, ast_violations = check_ast_proofs()
     print(f"AST structural proofs: {ast_proofs}")
@@ -671,16 +698,16 @@ def main():
     else:
         print(f"\n{'=' * 70}")
         print("ALL VERIFICATION PIPELINE PROPERTIES HOLD")
-        print(f"  I1: Tier 2 never overrides Tier 1 failure")
-        print(f"  I2: All error paths fail-closed")
-        print(f"  I3: PASS requires Tier 1 pass")
-        print(f"  I4: Submitted results were evaluated")
-        print(f"  I5: Tier 2 only runs after Tier 1")
-        print(f"  I6: Tier 1 failure skips Tier 2")
+        print(f"  I1: Tier 2 never overrides Tier 1 failure (both modes)")
+        print(f"  I2: All error paths fail-closed (both modes)")
+        print(f"  I3: PASS requires Tier 1 pass (both modes)")
+        print(f"  I4: Submitted results were evaluated (both modes)")
+        print(f"  I5: Tier 2 only runs after Tier 1 (both modes)")
+        print(f"  I6a: Tier 1 failure skips Tier 2 (reverify=false)")
+        print(f"  I6b: All assertions get Tier 2 evaluated (reverify=true)")
         print(f"  C1-C9: Real code cross-check ({cross_configs} configs)")
-        print(f"  Model-based: invariants verified on real code ({mbt_checked} states)")
+        print(f"  Model-based: invariants verified on real code (both modes)")
         print(f"  S1-S6: AST structural proofs ({ast_proofs} proofs)")
-        print(f"  States: {reachable:,}, Transitions: {transitions:,}")
         print(f"{'=' * 70}")
         return 0
 
