@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish to PyPI + GHCR
 
 on:
   push:
@@ -6,33 +6,38 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: mipiti/mipiti-verify
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      contents: read
+      contents: write  # update action.yml with digest
+      packages: write  # push to GHCR
       id-token: write  # OIDC for PyPI trusted publishing + Sigstore attestation
       attestations: write  # GitHub artifact attestation
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
+      # --- PyPI publish ---
+
       - name: Setup Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
 
-      - name: Install build tools
-        run: pip install build
+      - name: Install build tools (hash-pinned)
+        run: pip install --require-hashes -r requirements-build.lock
 
       - name: Build package
         run: python -m build
 
       - name: Verify package
-        run: |
-          pip install twine
-          twine check dist/*
+        run: twine check dist/*
 
       - name: Attest build provenance (Sigstore)
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2.4.0
@@ -42,3 +47,44 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
 
+      # --- Docker image publish ---
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        id: docker
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198e19c3bc6fbf  # v6.18.0
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Update action.yml with digest-pinned image
+        run: |
+          DIGEST="${{ steps.docker.outputs.digest }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}@${DIGEST}"
+          sed -i "s|image: .*|image: docker://${IMAGE}|" action.yml
+          echo "Updated action.yml to: docker://${IMAGE}"
+
+      - name: Commit updated action.yml
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add action.yml
+          if git diff --cached --quiet; then
+            echo "No changes to action.yml"
+          else
+            git commit -m "chore: pin action image to ${{ steps.version.outputs.tag }}@${{ steps.docker.outputs.digest }}"
+            git push origin HEAD:main
+          fi
