@@ -102,3 +102,22 @@ jobs:
             gh release create "$TAG" --title "$TAG" --notes "$DOCKER_NOTE" --verify-tag
           fi
           echo "Updated release ${TAG} with Docker image reference"
+
+      - name: Generate dispatch token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+          owner: Mipiti
+          repositories: mipiti-verify
+
+      - name: Dispatch action.yml image update
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api repos/Mipiti/mipiti-verify/dispatches \
+            -f event_type=action-image-update \
+            -f "client_payload[tag]=${{ steps.version.outputs.tag }}" \
+            -f "client_payload[digest]=${{ steps.docker.outputs.digest }}" \
+            -f "client_payload[image]=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
