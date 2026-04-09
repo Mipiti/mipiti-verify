@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      contents: write  # update action.yml with digest
+      contents: write  # create/edit releases
       packages: write  # push to GHCR
       id-token: write  # OIDC for PyPI trusted publishing + Sigstore attestation
       attestations: write  # GitHub artifact attestation
@@ -70,21 +70,35 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Update action.yml with digest-pinned image
+      - name: Add Docker image reference to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           DIGEST="${{ steps.docker.outputs.digest }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}@${DIGEST}"
-          sed -i "s|image: .*|image: docker://${IMAGE}|" action.yml
-          echo "Updated action.yml to: docker://${IMAGE}"
+          TAG="${{ steps.version.outputs.tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}@${DIGEST}"
 
-      - name: Commit updated action.yml
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add action.yml
-          if git diff --cached --quiet; then
-            echo "No changes to action.yml"
+          DOCKER_NOTE=$(cat <<NOTES
+
+          ---
+
+          ### Docker Image
+
+          Pre-built image for faster CI (pulls cached image instead of building from source):
+
+          \`\`\`yaml
+          - uses: docker://${IMAGE}
+          \`\`\`
+
+          Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}\`
+          Digest: \`${DIGEST}\`
+          NOTES
+          )
+
+          EXISTING=$(gh release view "$TAG" --json body --jq '.body' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh release edit "$TAG" --notes "${EXISTING}${DOCKER_NOTE}"
           else
-            git commit -m "chore: pin action image to ${{ steps.version.outputs.tag }}@${{ steps.docker.outputs.digest }}"
-            git push origin HEAD:main
+            gh release create "$TAG" --title "$TAG" --notes "$DOCKER_NOTE" --verify-tag
           fi
+          echo "Updated release ${TAG} with Docker image reference"
