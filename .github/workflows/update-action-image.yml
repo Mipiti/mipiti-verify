@@ -1,0 +1,81 @@
+name: Update Action Image
+
+on:
+  repository_dispatch:
+    types: [action-image-update]
+
+jobs:
+  update-action:
+    runs-on: ubuntu-latest
+    environment: automation
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update action.yml with digest-pinned image
+        id: update
+        run: |
+          TAG="${{ github.event.client_payload.tag }}"
+          DIGEST="${{ github.event.client_payload.digest }}"
+          IMAGE="${{ github.event.client_payload.image }}"
+          FULL_REF="docker://${IMAGE}:${TAG}@${DIGEST}"
+
+          sed -i "s|image: .*|image: ${FULL_REF}|" action.yml
+          echo "Updated action.yml image to: ${FULL_REF}"
+
+          if git diff --quiet action.yml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "action.yml already up to date"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TAG="${{ steps.update.outputs.tag }}"
+          BRANCH="chore/pin-action-image-${TAG}"
+
+          HEAD=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          CONTENT=$(base64 -w 0 action.yml)
+          BASE_TREE=$(gh api "repos/${{ github.repository }}/git/commits/${HEAD}" --jq '.tree.sha')
+
+          BLOB_SHA=$(gh api "repos/${{ github.repository }}/git/blobs" \
+            -f "content=${CONTENT}" -f "encoding=base64" --jq '.sha')
+
+          TREE=$(gh api "repos/${{ github.repository }}/git/trees" \
+            -f "base_tree=${BASE_TREE}" \
+            -f "tree[][path]=action.yml" \
+            -f "tree[][mode]=100644" \
+            -f "tree[][type]=blob" \
+            -f "tree[][sha]=${BLOB_SHA}" \
+            --jq '.sha')
+
+          COMMIT_SHA=$(gh api "repos/${{ github.repository }}/git/commits" \
+            -f "message=chore: pin action image to ${TAG}" \
+            -f "tree=${TREE}" \
+            -f "parents[]=${HEAD}" \
+            --jq '.sha')
+
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f "ref=refs/heads/${BRANCH}" -f "sha=${COMMIT_SHA}"
+
+          PR_URL=$(gh pr create \
+            --head "${BRANCH}" \
+            --title "chore: pin action image to ${TAG}" \
+            --body "Automated: pins action.yml Docker image to the digest-verified image built from ${TAG}." \
+            --base main)
+
+          gh pr merge "$PR_URL" --squash --auto --delete-branch || echo "Auto-merge skipped"
