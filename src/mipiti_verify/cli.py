@@ -681,6 +681,7 @@ def audit(package_file: str, key_url: str) -> None:
                 console.print(f"  Branch:      {claims.get('ref', 'unknown')}")
                 console.print(f"  Commit:      {claims.get('sha', 'unknown')}")
                 console.print(f"  Environment: {claims.get('environment', 'unknown')}")
+                console.print(f"  Runner:      {claims.get('runner_environment', 'unknown')}")
                 console.print(f"  Actor:       {claims.get('actor', 'unknown')}")
                 console.print(f"  Run:         {claims.get('run_id', 'unknown')}")
                 console.print("  Signature:   [green]VALID[/green]")
