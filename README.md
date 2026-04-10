@@ -89,6 +89,7 @@ Developer keys skip result submission automatically — no `--dry-run` needed.
 |------|---------|-------------|
 | `--reverify / --no-reverify` | `--reverify` | Re-verify all assertions, not just pending. Catches regressions. |
 | `--changed-files FILE` | none | Only verify assertions referencing listed files. Use `git diff --name-only HEAD~1 > changed.txt`. |
+| `--component ID` | none | Only verify assertions for controls scoped to this component. Use when a model spans multiple repos. |
 | `--concurrency N` | 1 | Max concurrent Tier 2 LLM calls. |
 | `--dry-run` | off | Run verifiers but don't submit results. |
 | `--output` | `text` | Output format: `text`, `json`, or `github` (GitHub Actions annotations). |

@@ -140,12 +140,14 @@ class MipitiClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_controls(self, model_id: str) -> list[dict[str, Any]]:
-        """GET /api/models/{id}/controls — returns list of controls."""
-        resp = self._client.get(f"/api/models/{model_id}/controls")
+    def get_controls(self, model_id: str, component_id: str = "") -> dict[str, Any]:
+        """GET /api/models/{id}/controls — returns controls response dict."""
+        params: dict[str, str] = {}
+        if component_id:
+            params["component_id"] = component_id
+        resp = self._client.get(f"/api/models/{model_id}/controls", params=params)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("controls", [])
+        return resp.json()
 
     def get_verification_report(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id}/verification/report"""

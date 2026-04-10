@@ -55,6 +55,7 @@ def main() -> None:
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 @click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
 @click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
+@click.option("--component", "component_id", default=None, help="Component ID to scope verification (only verify assertions for controls in this component). Auto-detect from git remote if not specified.")
 def run(
     model_id: str | None,
     run_all: bool,
@@ -73,6 +74,7 @@ def run(
     repo: str,
     changed_files_path: str | None,
     concurrency: int,
+    component_id: str | None,
 ) -> None:
     """Run verification against pending assertions for MODEL_ID.
 
@@ -132,6 +134,7 @@ def run(
         repo=repo,
         changed_files=changed_files,
         concurrency=concurrency,
+        component_id=component_id,
     )
 
     has_failures = False

@@ -64,10 +64,12 @@ class Runner:
         repo: str = "",
         changed_files: set[str] | None = None,
         concurrency: int = 1,
+        component_id: str | None = None,
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
         self.repo = repo or _auto_detect_repo(self.project_root)
+        self.component_id = component_id
         self.tier2_provider_name = tier2_provider
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
@@ -179,6 +181,26 @@ class Runner:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
             return [], [], []
+
+        # Filter by component — only verify assertions for controls in this component
+        if self.component_id:
+            # Fetch controls to determine which belong to this component
+            try:
+                ctrl_data = self.client.get_controls(model_id, component_id=self.component_id)
+                component_ctrl_ids = {c["id"] for c in ctrl_data.get("controls", [])}
+                filtered_by_cmp: dict[str, list] = {}
+                for ctrl_id, assertions in controls.items():
+                    if ctrl_id in component_ctrl_ids:
+                        filtered_by_cmp[ctrl_id] = assertions
+                if self.verbose:
+                    skipped_cmp = len(controls) - len(filtered_by_cmp)
+                    if skipped_cmp:
+                        console.print(f"  Tier {tier}: skipped {skipped_cmp} control(s) (different component)")
+                controls = filtered_by_cmp
+                if not controls:
+                    return [], [], []
+            except Exception as e:
+                console.print(f"  [yellow]Warning: component filter failed ({e}), verifying all[/yellow]")
 
         # Filter to assertions referencing changed files when --changed-files is set.
         # Assertions without a file param are always included (can't be scoped).
