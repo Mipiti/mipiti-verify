@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import re2
 import sys
 from dataclasses import dataclass
@@ -94,7 +93,7 @@ def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
     return None, "<no source>"
 
 
-def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, flags: int = 0) -> re.Match | None:
+def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) -> object | None:
     """Run regex search using RE2 with a cross-platform threading timeout.
 
     Two layers of protection:
@@ -104,9 +103,15 @@ def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, 
     Patterns using backreferences, lookahead, or lookbehind are rejected
     at parse time (these are the constructs that enable ReDoS).
 
+    Returns the google-re2 match object on success (truthy), or None.
+    Callers may use truthiness or call ``.group(N)`` for capture groups.
+
+    To pass flags, embed them as inline modifiers in the pattern itself
+    using google-re2's ``(?ims)`` syntax (e.g. ``(?m)^foo`` for multiline).
+    google-re2 does not accept Python ``re`` flag integers.
+
     Args:
         timeout_seconds: Maximum wall-clock time for the search (default 2s).
-        flags: re.MULTILINE, re.DOTALL, etc.
     """
     import threading
 
@@ -115,7 +120,7 @@ def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0, 
 
     def _run():
         try:
-            result_box.append(re2.search(pattern, content, flags))
+            result_box.append(re2.search(pattern, content))
         except re2.error as e:
             error_box.append(e)
 

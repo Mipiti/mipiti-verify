@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
 from . import (
@@ -21,24 +20,56 @@ def _extract_scope(content: str, params: dict) -> str:
     """Extract the section of content between scope_start and scope_end patterns.
 
     Returns the full content if no scope params are provided.
+
+    Both ``scope_start`` and ``scope_end`` come from user-supplied assertion
+    JSON, so they go through the same ReDoS-protected helper as the main
+    pattern (RE2 linear-time guarantee + threading timeout). The
+    ``(?m)`` inline modifier is prepended so anchors like ``^`` and ``$``
+    match line boundaries inside the content, matching the behaviour the
+    helper had when it used ``re.MULTILINE``.
+
+    Raises ``RegexTimeoutError`` if either scope regex exceeds the time
+    limit. Callers should catch this and return a fail-closed
+    ``VerifierResult`` — a scope that can't be evaluated must not silently
+    extend to the wrong region (which would let an attacker craft a
+    ReDoS-inducing scope_end to evade pattern_present or pattern_absent
+    checks by widening / narrowing the search region).
     """
     scope_start = params.get("scope_start")
     if not scope_start:
         return content
 
-    start_match = re.search(scope_start, content, re.MULTILINE)
+    start_match = safe_regex_search(f"(?m){scope_start}", content)
     if not start_match:
         return ""  # scope_start not found — nothing to search
 
     start_pos = start_match.start()
     scope_end = params.get("scope_end")
     if scope_end:
-        end_match = re.search(scope_end, content[start_match.end():], re.MULTILINE)
+        end_match = safe_regex_search(f"(?m){scope_end}", content[start_match.end():])
         end_pos = start_match.end() + end_match.start() if end_match else len(content)
     else:
         end_pos = len(content)
 
     return content[start_pos:end_pos]
+
+
+def _apply_inline_regex_flags(pattern: str, params: dict) -> str:
+    """Prepend RE2 inline flag modifiers to ``pattern`` based on assertion params.
+
+    google-re2 does not accept Python ``re`` flag integers; flags must be
+    embedded in the pattern itself using the ``(?ims)`` syntax. We accept
+    boolean-ish strings ("true"/"1") for ``multiline`` and ``dotall`` from
+    assertion JSON and translate them to ``(?m)``/``(?s)`` modifiers.
+    """
+    inline = ""
+    if str(params.get("multiline", "")).lower() in ("true", "1"):
+        inline += "m"
+    if str(params.get("dotall", "")).lower() in ("true", "1"):
+        inline += "s"
+    if inline:
+        return f"(?{inline}){pattern}"
+    return pattern
 
 
 @register("file_exists")
@@ -88,18 +119,12 @@ class PatternMatchesVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        content = _extract_scope(content, params)
-        if not content and params.get("scope_start"):
-            return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
-
-        pattern = params["pattern"]
-        flags = 0
-        if str(params.get("multiline", "")).lower() in ("true", "1"):
-            flags |= re.MULTILINE
-        if str(params.get("dotall", "")).lower() in ("true", "1"):
-            flags |= re.DOTALL
         try:
-            match = safe_regex_search(pattern, content, flags=flags)
+            content = _extract_scope(content, params)
+            if not content and params.get("scope_start"):
+                return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
+            pattern = _apply_inline_regex_flags(params["pattern"], params)
+            match = safe_regex_search(pattern, content)
         except RegexTimeoutError as e:
             return VerifierResult(passed=False, details=str(e))
 
@@ -118,18 +143,12 @@ class PatternAbsentVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        content = _extract_scope(content, params)
-        if not content and params.get("scope_start"):
-            return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
-
-        pattern = params["pattern"]
-        flags = 0
-        if str(params.get("multiline", "")).lower() in ("true", "1"):
-            flags |= re.MULTILINE
-        if str(params.get("dotall", "")).lower() in ("true", "1"):
-            flags |= re.DOTALL
         try:
-            match = safe_regex_search(pattern, content, flags=flags)
+            content = _extract_scope(content, params)
+            if not content and params.get("scope_start"):
+                return VerifierResult(passed=False, details=f"Scope pattern not found: {params['scope_start']}")
+            pattern = _apply_inline_regex_flags(params["pattern"], params)
+            match = safe_regex_search(pattern, content)
         except RegexTimeoutError as e:
             return VerifierResult(passed=False, details=str(e))
 
