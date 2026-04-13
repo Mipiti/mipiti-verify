@@ -101,7 +101,7 @@ Developer keys skip result submission automatically — no `--dry-run` needed.
 ## GitHub Action
 
 ```yaml
-- uses: Mipiti/mipiti-verify@67a6c409e33e38b150fc770ca87e0c9d35e790e8 # v0.17.1
+- uses: Mipiti/mipiti-verify@13a6404293d342a3aed11d265ddc753512b13284 # v0.26.1
   with:
     # Required
     api-key: ${{ secrets.MIPITI_API_KEY }}
