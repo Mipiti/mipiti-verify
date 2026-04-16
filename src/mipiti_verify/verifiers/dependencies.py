@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import re
+import re2
 from pathlib import Path
 
 from . import PathTraversalError, VerifierResult, register, safe_resolve_path
@@ -42,7 +42,7 @@ def _parse_requirements_txt(content: str) -> dict[str, str]:
         if not line or line.startswith("#") or line.startswith("-"):
             continue
         # Handle: package==1.0, package>=1.0, package~=1.0, package
-        match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([<>=!~]+.+)?", line)
+        match = re2.match(r"^([a-zA-Z0-9_.-]+)\s*([<>=!~]+.+)?", line)
         if match:
             pkg = match.group(1).lower().replace("-", "_")
             ver = (match.group(2) or "").strip()
@@ -66,7 +66,7 @@ def _parse_cargo_toml(content: str) -> dict[str, str]:
     in_deps = False
     for line in content.splitlines():
         stripped = line.strip()
-        if re.match(r"\[.*dependencies.*\]", stripped, re.IGNORECASE):
+        if re2.match(r"(?i)\[.*dependencies.*\]", stripped):
             in_deps = True
             continue
         if stripped.startswith("[") and in_deps:
@@ -77,7 +77,7 @@ def _parse_cargo_toml(content: str) -> dict[str, str]:
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             # Handle inline tables: { version = "1.0" }
-            ver_match = re.search(r'version\s*=\s*"([^"]*)"', value)
+            ver_match = re2.search(r'version\s*=\s*"([^"]*)"', value)
             if ver_match:
                 deps[key] = ver_match.group(1)
             elif not value.startswith("{"):
@@ -118,7 +118,7 @@ def _parse_pyproject_toml(content: str) -> dict[str, str]:
         data = tomllib.loads(content)
         deps: dict[str, str] = {}
         for dep_str in data.get("project", {}).get("dependencies", []):
-            match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([<>=!~]+.+)?", dep_str)
+            match = re2.match(r"^([a-zA-Z0-9_.-]+)\s*([<>=!~]+.+)?", dep_str)
             if match:
                 pkg = match.group(1).lower().replace("-", "_")
                 ver = (match.group(2) or "").strip()
@@ -132,7 +132,7 @@ def _parse_pom_xml(content: str) -> dict[str, str]:
     """Parse pom.xml dependencies (simple regex)."""
     deps: dict[str, str] = {}
     # Find <dependency> blocks
-    for m in re.finditer(
+    for m in re2.finditer(
         r"<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>"
         r"(?:\s*<version>([^<]+)</version>)?",
         content,
@@ -204,7 +204,7 @@ class DependencyVersionVerifier:
             # The version_spec from manifest is the actual installed version
             spec = SpecifierSet(constraint)
             # Extract a clean version from version_spec
-            ver_match = re.search(r"[\d]+(?:\.[\d]+)*", version_spec)
+            ver_match = re2.search(r"[\d]+(?:\.[\d]+)*", version_spec)
             if ver_match:
                 ver = Version(ver_match.group())
                 if ver in spec:

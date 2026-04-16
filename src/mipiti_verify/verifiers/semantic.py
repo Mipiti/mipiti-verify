@@ -6,7 +6,7 @@ Tier 1 just confirms structural presence (regex).
 
 from __future__ import annotations
 
-import re
+import re2
 from pathlib import Path
 
 from . import PathTraversalError, VerifierResult, register, resolve_content
@@ -27,12 +27,12 @@ class ParameterValidatedVerifier:
         parameter = params["parameter"]
 
         # Check function exists
-        func_pattern = rf"(?:def|function|fn|func)\s+{re.escape(function)}\s*\("
-        if not re.search(func_pattern, content):
+        func_pattern = rf"(?:def|function|fn|func)\s+{re2.escape(function)}\s*\("
+        if not re2.search(func_pattern, content):
             return VerifierResult(passed=False, details=f"Function '{function}' not found")
 
         # Check parameter is referenced (loose check)
-        if re.search(re.escape(parameter), content):
+        if re2.search(re2.escape(parameter), content):
             return VerifierResult(
                 passed=True,
                 details=f"Function '{function}' references parameter '{parameter}' (semantic verification needed)",
@@ -57,8 +57,8 @@ class ErrorHandledVerifier:
         function = params["function"]
 
         # Check function exists
-        func_pattern = rf"(?:def|function|fn|func)\s+{re.escape(function)}\s*\("
-        func_match = re.search(func_pattern, content)
+        func_pattern = rf"(?:def|function|fn|func)\s+{re2.escape(function)}\s*\("
+        func_match = re2.search(func_pattern, content)
         if not func_match:
             return VerifierResult(passed=False, details=f"Function '{function}' not found")
 
@@ -76,7 +76,7 @@ class ErrorHandledVerifier:
         ]
 
         for pattern in error_patterns:
-            if re.search(pattern, rest[:5000]):  # Check first ~5K chars of body
+            if re2.search(pattern, rest[:5000]):  # Check first ~5K chars of body
                 return VerifierResult(
                     passed=True,
                     details=f"Function '{function}' has error handling (semantic verification needed)",
@@ -103,15 +103,15 @@ class MiddlewareRegisteredVerifier:
 
         # Look for middleware registration patterns
         patterns = [
-            rf"\.use\s*\(\s*{re.escape(middleware)}",      # Express.js app.use()
-            rf"\.add_middleware\s*\(\s*{re.escape(middleware)}",  # FastAPI
-            rf"middleware\s*=\s*\[.*{re.escape(middleware)}",     # Django/list-based
-            rf"@{re.escape(middleware)}",                   # Decorator-based
-            rf"{re.escape(middleware)}",                    # Plain reference
+            rf"\.use\s*\(\s*{re2.escape(middleware)}",      # Express.js app.use()
+            rf"\.add_middleware\s*\(\s*{re2.escape(middleware)}",  # FastAPI
+            rf"middleware\s*=\s*\[.*{re2.escape(middleware)}",     # Django/list-based
+            rf"@{re2.escape(middleware)}",                   # Decorator-based
+            rf"{re2.escape(middleware)}",                    # Plain reference
         ]
 
         for pattern in patterns:
-            if re.search(pattern, content):
+            if re2.search(pattern, content):
                 return VerifierResult(
                     passed=True,
                     details=f"Middleware '{middleware}' found in {source} (semantic verification needed)",
@@ -137,7 +137,7 @@ class HttpHeaderSetVerifier:
         header = params["header"]
 
         # Case-insensitive search for the header name
-        if re.search(re.escape(header), content, re.IGNORECASE):
+        if re2.search("(?i)" + re2.escape(header), content):
             return VerifierResult(
                 passed=True,
                 details=f"Header '{header}' referenced in {source} (semantic verification needed)",

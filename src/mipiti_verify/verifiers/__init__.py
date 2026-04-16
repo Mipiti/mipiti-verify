@@ -25,6 +25,17 @@ class RegexTimeoutError(Exception):
     """Raised when a regex operation exceeds the time limit."""
 
 
+# Shared RE2 compile options — silence google-re2's C++ ABSL logger so that
+# patterns containing RE2-rejected constructs (lookahead, lookbehind,
+# backreferences) do not emit a red ``E0000 ... re2.cc:... Error parsing ...
+# invalid perl operator: (?!`` line to stderr before our Python exception
+# handler sees the re2.error. The parse error still propagates normally and
+# is surfaced via RegexTimeoutError with a clean details string; log_errors
+# only controls the noisy ABSL pre-exception log.
+_RE2_OPTS = re2.Options()
+_RE2_OPTS.log_errors = False
+
+
 def safe_resolve_path(project_root: Path, file_param: str) -> Path:
     """Resolve a file path safely within the project root.
 
@@ -120,7 +131,7 @@ def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) 
 
     def _run():
         try:
-            result_box.append(re2.search(pattern, content))
+            result_box.append(re2.search(pattern, content, options=_RE2_OPTS))
         except re2.error as e:
             error_box.append(e)
 

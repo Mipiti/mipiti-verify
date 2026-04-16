@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
+import re2
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, resolve_content, safe_read_file, safe_resolve_path
+from . import PathTraversalError, RegexTimeoutError, VerifierResult, register, resolve_content, safe_read_file, safe_regex_search, safe_resolve_path
 
 
 def _parse_config(project_root: Path, file_param: str) -> dict | None:
@@ -141,7 +141,11 @@ class ConfigValueMatchesVerifier:
         if value is None:
             return VerifierResult(passed=False, details=f"Config key '{key}' not found")
 
-        if re.search(pattern, str(value)):
+        try:
+            match = safe_regex_search(pattern, str(value))
+        except RegexTimeoutError as e:
+            return VerifierResult(passed=False, details=str(e))
+        if match:
             return VerifierResult(passed=True, details=f"Config '{key}' matches pattern '{pattern}'")
         return VerifierResult(passed=False, details=f"Config '{key}' = '{value}' does not match pattern '{pattern}'")
 
@@ -159,18 +163,18 @@ class EnvVarReferencedVerifier:
 
         # Look for common env var access patterns
         patterns = [
-            rf'os\.environ\b[^)]*["\']{ re.escape(variable)}["\']',
-            rf'os\.getenv\s*\(\s*["\']{ re.escape(variable)}["\']',
-            rf'process\.env\.{re.escape(variable)}\b',
-            rf'process\.env\[[\'"]{re.escape(variable)}[\'"]\]',
-            rf'env\s*\(\s*["\']{ re.escape(variable)}["\']',
-            rf'ENV\[[\'"]{re.escape(variable)}[\'"]\]',
-            rf'\$\{{{re.escape(variable)}\}}',
-            rf'\${re.escape(variable)}\b',
+            rf'os\.environ\b[^)]*["\']{ re2.escape(variable)}["\']',
+            rf'os\.getenv\s*\(\s*["\']{ re2.escape(variable)}["\']',
+            rf'process\.env\.{re2.escape(variable)}\b',
+            rf'process\.env\[[\'"]{re2.escape(variable)}[\'"]\]',
+            rf'env\s*\(\s*["\']{ re2.escape(variable)}["\']',
+            rf'ENV\[[\'"]{re2.escape(variable)}[\'"]\]',
+            rf'\$\{{{re2.escape(variable)}\}}',
+            rf'\${re2.escape(variable)}\b',
         ]
 
         for pattern in patterns:
-            if re.search(pattern, content):
+            if re2.search(pattern, content):
                 return VerifierResult(
                     passed=True,
                     details=f"Env var '{variable}' referenced in {source}",

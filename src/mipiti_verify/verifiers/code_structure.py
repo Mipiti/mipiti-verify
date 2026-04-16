@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import re2
 from pathlib import Path
 
 from . import PathTraversalError, VerifierResult, register, resolve_content, safe_regex_search
@@ -30,11 +30,11 @@ class FunctionExistsVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        name = re.escape(params["name"])
+        name = re2.escape(params["name"])
 
         for pattern_template in self._PATTERNS:
             pattern = pattern_template.format(name=name)
-            match = re.search(pattern, content)
+            match = re2.search(pattern, content)
             if match:
                 line_no = content[:match.start()].count("\n") + 1
                 return VerifierResult(
@@ -65,11 +65,11 @@ class ClassExistsVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        name = re.escape(params["name"])
+        name = re2.escape(params["name"])
 
         for pattern_template in self._PATTERNS:
             pattern = pattern_template.format(name=name)
-            match = re.search(pattern, content)
+            match = re2.search(pattern, content)
             if match:
                 line_no = content[:match.start()].count("\n") + 1
                 return VerifierResult(
@@ -92,12 +92,12 @@ class DecoratorPresentVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        decorator = re.escape(params["decorator"])
-        function = re.escape(params["function"])
+        decorator = re2.escape(params["decorator"])
+        function = re2.escape(params["function"])
 
         # Look for @decorator ... def function pattern
         pattern = rf"@{decorator}[^\n]*\n(?:\s*@[^\n]*\n)*\s*(?:async\s+)?def\s+{function}\s*\("
-        match = re.search(pattern, content)
+        match = re2.search(pattern, content)
         if match:
             line_no = content[:match.start()].count("\n") + 1
             return VerifierResult(
@@ -127,8 +127,8 @@ class FunctionCallsVerifier:
         callee = params["callee"]
 
         # Find the caller function body
-        caller_pattern = rf"(?:def|function|fn|func)\s+{re.escape(caller)}\s*\("
-        caller_match = re.search(caller_pattern, content)
+        caller_pattern = rf"(?:def|function|fn|func)\s+{re2.escape(caller)}\s*\("
+        caller_match = re2.search(caller_pattern, content)
         if not caller_match:
             return VerifierResult(passed=False, details=f"Caller function '{caller}' not found")
 
@@ -152,8 +152,8 @@ class FunctionCallsVerifier:
             body_lines.append(line)
 
         body = "\n".join(body_lines)
-        callee_pattern = rf"\b{re.escape(callee)}\s*\("
-        if re.search(callee_pattern, body):
+        callee_pattern = rf"\b{re2.escape(callee)}\s*\("
+        if re2.search(callee_pattern, body):
             return VerifierResult(
                 passed=True,
                 details=f"Function '{caller}' calls '{callee}'",
@@ -181,15 +181,15 @@ class ImportPresentVerifier:
         # Go: "X"
         # Rust: use X
         patterns = [
-            rf"\bimport\s+{re.escape(module)}\b",
-            rf"\bfrom\s+{re.escape(module)}\b",
-            rf"\brequire\s*\(\s*['\"]{ re.escape(module)}['\"]\s*\)",
-            rf"\bfrom\s+['\"]{ re.escape(module)}['\"]",
-            rf'\buse\s+{re.escape(module)}\b',
+            rf"\bimport\s+{re2.escape(module)}\b",
+            rf"\bfrom\s+{re2.escape(module)}\b",
+            rf"\brequire\s*\(\s*['\"]{ re2.escape(module)}['\"]\s*\)",
+            rf"\bfrom\s+['\"]{ re2.escape(module)}['\"]",
+            rf'\buse\s+{re2.escape(module)}\b',
         ]
 
         for pattern in patterns:
-            if re.search(pattern, content):
+            if re2.search(pattern, content):
                 return VerifierResult(
                     passed=True,
                     details=f"Import of '{module}' found in {source}",

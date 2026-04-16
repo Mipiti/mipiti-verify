@@ -98,6 +98,33 @@ class TestPatternMatches:
         r = v.verify({"file": "missing.py", "pattern": r"def validate_\w+"}, project_root)
         assert r.passed is False
 
+    def test_lookahead_pattern_returns_clean_failure(self, project_root, capfd):
+        """Agent-submitted patterns using lookahead (unsupported by RE2) must
+        fail with a clean details string, and must not emit the google-re2
+        ABSL ``E0000 ... re2.cc:... Error parsing ... invalid perl operator``
+        noise to stderr. google-re2 1.1.x lets us silence that via
+        ``re2.Options(log_errors=False)``.
+        """
+        f = project_root / "code.py"
+        f.write_text("def verification(db = Depends(get_db)):\n    return True\n")
+
+        v = PatternMatchesVerifier()
+        # Pattern lifted from the CI incident: (?m)def.*verification.*(?!.*Depends).*:$
+        r = v.verify(
+            {"file": "code.py", "pattern": r"(?m)def.*verification.*(?!.*Depends).*:$"},
+            project_root,
+        )
+
+        # The assertion should fail gracefully, not raise.
+        assert r.passed is False
+        assert "Invalid regex pattern" in r.details
+
+        # And the C++ ABSL logger should have been silenced — no red E0000 lines
+        # leaking out to CI logs.
+        captured = capfd.readouterr()
+        assert "invalid perl operator" not in captured.err
+        assert "re2.cc" not in captured.err
+
 
 class TestApplyInlineRegexFlags:
     """Unit tests for the helper that translates assertion flags → RE2 inline modifiers."""
