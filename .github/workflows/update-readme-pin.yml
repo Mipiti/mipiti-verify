@@ -41,6 +41,9 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           # Need full history so git log can read the pin commit's subject.
           fetch-depth: 0
+          # No step below does `git push` — all mutations flow through
+          # `gh api`. Drop the app token from .git/config afterwards.
+          persist-credentials: false
 
       - name: Parse tag from pin commit
         id: parse

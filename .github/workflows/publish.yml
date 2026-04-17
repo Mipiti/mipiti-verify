@@ -37,6 +37,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # No step in this workflow does `git push` / `git commit` — all
+          # mutations flow through `gh api` with explicitly-scoped tokens.
+          # Dropping the checkout token from .git/config eliminates the
+          # belt-and-suspenders path where a later step could accidentally
+          # reuse it.
+          persist-credentials: false
 
       # --- PyPI publish ---
 
