@@ -22,7 +22,9 @@ AST structural proofs:
   S1: _verify_tier1 catches all exceptions → fail (never raises)
   S2: _verify_tier2 returns skipped when no provider
   S3: safe_resolve_path rejects path traversal
-  S4: safe_regex_search uses RE2 (import re2)
+  S4: pattern-matching safety — RE2-only, no Python `re` bypass, no
+      fallback that would disable linear-time guarantees (AST analysis
+      over every file in verifiers/)
 
 Usage:
     python formal/check_pipeline.py
@@ -636,11 +638,120 @@ def check_ast_proofs():
         violations.append("S3: verifiers missing path confinement check")
     proofs += 1
 
-    # S4: safe_regex_search uses RE2
-    if "import re2" not in verifiers_src and "from re2" not in verifiers_src:
-        violations.append("S4: verifiers do not import re2")
-    if "re2.search" not in verifiers_src:
-        violations.append("S4: verifiers do not use re2.search")
+    # S4: pattern-matching safety (real AST analysis).
+    #
+    # Previously S4 was a substring grep for ``re2.search`` — a tripwire,
+    # not a structural proof (a comment mentioning the string would satisfy
+    # it). Upgraded here to real AST checks over every .py file in
+    # ``src/mipiti_verify/verifiers/``:
+    #
+    #   A. No ``import re`` / ``from re import …`` anywhere in verifiers/
+    #      (Python's ``re`` is ReDoS-unsafe — the whole point of routing
+    #      through RE2 is its linear-time guarantee. No bypass allowed.)
+    #
+    #   B. No attribute call ``re.{search|match|compile|fullmatch|finditer|
+    #      findall|sub}``. Belt-and-braces: even if A somehow permitted a
+    #      stray import, B catches the call.
+    #
+    #   C. ``safe_regex_search`` body contains ≥1 ``re2.{search|compile|
+    #      match|fullmatch}`` call. Guarantees the helper itself still
+    #      routes through RE2; prevents a future refactor from gutting
+    #      the helper while leaving the name in place.
+    #
+    #   D. No ``re2.set_fallback_notification(FALLBACK_ALLOW|FALLBACK_WARN)``.
+    #      google-re2's fallback mechanism can silently fall through to
+    #      Python ``re`` when RE2 rejects a pattern; only FALLBACK_EXCEPTION
+    #      preserves the safety invariant.
+    #
+    # This doesn't cover taint flow (proving that user-supplied patterns
+    # always reach safe_regex_search before being used). That would require
+    # data-flow analysis — out of scope here. A+B+C+D rules out the
+    # reasonable ways someone could reintroduce ReDoS exposure.
+
+    _PY_RE_CALLS = {"search", "match", "compile", "fullmatch", "finditer", "findall", "sub"}
+    _RE2_CALLS = {"search", "compile", "match", "fullmatch"}
+    _UNSAFE_FALLBACKS = {"FALLBACK_ALLOW", "FALLBACK_WARN"}
+
+    verifiers_dir = os.path.join(_VERIFY_SRC, "mipiti_verify", "verifiers")
+    s4_files = sorted(f for f in os.listdir(verifiers_dir) if f.endswith(".py"))
+
+    safe_search_fn_found = False
+    safe_search_re2_call_count = 0
+
+    for fname in s4_files:
+        fpath = os.path.join(verifiers_dir, fname)
+        with open(fpath) as f:
+            src = f.read()
+        tree = ast.parse(src)
+
+        for node in ast.walk(tree):
+            # A. Reject `import re` (any form) and `from re import ...`
+            # (unless the file is on the allowlist for hardcoded-only patterns)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "re" or alias.name.startswith("re."):
+                        violations.append(
+                            f"S4.A: {fname} imports Python `re` — use re2 (linear-time)"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == "re":
+                    violations.append(
+                        f"S4.A: {fname} has `from re import …` — use re2 (linear-time)"
+                    )
+
+            # B. Reject `re.<call>(…)` for any regex method
+            elif isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "re"
+                    and node.func.attr in _PY_RE_CALLS
+                ):
+                    violations.append(
+                        f"S4.B: {fname} calls re.{node.func.attr}() — use re2 (linear-time)"
+                    )
+
+                # D. Reject unsafe fallback notifications (detect via either
+                # `re2.set_fallback_notification(...)` or the call form after
+                # `from re2 import set_fallback_notification`).
+                fn = node.func
+                is_set_fallback = (
+                    isinstance(fn, ast.Attribute) and fn.attr == "set_fallback_notification"
+                ) or (isinstance(fn, ast.Name) and fn.id == "set_fallback_notification")
+                if is_set_fallback and node.args:
+                    arg = node.args[0]
+                    arg_id = (
+                        arg.attr if isinstance(arg, ast.Attribute)
+                        else arg.id if isinstance(arg, ast.Name)
+                        else None
+                    )
+                    if arg_id in _UNSAFE_FALLBACKS:
+                        violations.append(
+                            f"S4.D: {fname} set_fallback_notification({arg_id}) — "
+                            f"disables linear-time guarantee"
+                        )
+
+        # C. Inside safe_regex_search, count re2.{search|…} calls
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "safe_regex_search":
+                safe_search_fn_found = True
+                for child in ast.walk(node):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and isinstance(child.func.value, ast.Name)
+                        and child.func.value.id == "re2"
+                        and child.func.attr in _RE2_CALLS
+                    ):
+                        safe_search_re2_call_count += 1
+
+    if not safe_search_fn_found:
+        violations.append("S4.C: safe_regex_search function not found in verifiers/")
+    elif safe_search_re2_call_count == 0:
+        violations.append(
+            "S4.C: safe_regex_search body contains no "
+            "re2.{search,compile,match,fullmatch} call"
+        )
     proofs += 1
 
     # S5: Symlink rejection
