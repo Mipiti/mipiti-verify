@@ -1,10 +1,22 @@
 name: Publish to PyPI + GHCR
 
+# Triggers on merge of a `chore: release vX.Y.Z` PR to main (or manual
+# workflow_dispatch with a version input for re-runs).
+#
+# Ordering rationale: we publish PyPI + Docker FIRST, then dispatch the
+# action-image pin. The git tag is *not* created here — it's created
+# later by update-readme-pin.yml after the pin PR auto-merges, pointing
+# at the pin commit so `git checkout vX.Y.Z` always lands on the
+# digest-pinned action.yml state.
+
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.26.5). Only needed for manual re-runs."
+        required: true
 
 env:
   REGISTRY: ghcr.io
@@ -12,10 +24,13 @@ env:
 
 jobs:
   build-and-publish:
+    # Fire only when the push's head-commit subject is a release-PR merge,
+    # or on an explicit manual dispatch with a version input.
+    if: "github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore: release v')"
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      contents: write  # create/edit releases
+      contents: read   # no longer creates releases — that's moved to update-readme-pin.yml
       packages: write  # push to GHCR
       id-token: write  # OIDC for PyPI trusted publishing + Sigstore attestation
       attestations: write  # GitHub artifact attestation
@@ -56,9 +71,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Extract version
         id: version
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+        # `${{ ... }}` values are placed into env before bash runs (GitHub's
+        # recommended injection-safe pattern); the script then references
+        # them as plain shell variables which go through quoting rules
+        # rather than string substitution.
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          # Prefer workflow_dispatch input; fall back to parsing the release
+          # commit subject on push triggers (e.g. "chore: release v0.26.5").
+          if [ -n "$VERSION_INPUT" ]; then
+            # Strict validation: exactly vN.N.N, no shell metacharacters.
+            # workflow_dispatch requires repo-write access, but defense in
+            # depth: any bad value (compromised credentials, typo'd input)
+            # fails the workflow here before it reaches PyPI / Docker push.
+            if ! printf '%s' "$VERSION_INPUT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Invalid version input: $VERSION_INPUT" >&2
+              exit 1
+            fi
+            TAG="$VERSION_INPUT"
+          else
+            SUBJECT=$(git log -1 --format=%s HEAD)
+            TAG=$(printf '%s' "$SUBJECT" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Could not determine release version" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG"
 
       - name: Build and push Docker image
         id: docker
@@ -70,38 +113,11 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Add Docker image reference to release notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          DIGEST="${{ steps.docker.outputs.digest }}"
-          TAG="${{ steps.version.outputs.tag }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}@${DIGEST}"
-
-          DOCKER_NOTE=$(cat <<NOTES
-
-          ---
-
-          ### Docker Image
-
-          Pre-built image for faster CI (pulls cached image instead of building from source):
-
-          \`\`\`yaml
-          - uses: docker://${IMAGE}
-          \`\`\`
-
-          Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}\`
-          Digest: \`${DIGEST}\`
-          NOTES
-          )
-
-          EXISTING=$(gh release view "$TAG" --json body --jq '.body' 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ]; then
-            gh release edit "$TAG" --notes "${EXISTING}${DOCKER_NOTE}"
-          else
-            gh release create "$TAG" --title "$TAG" --notes "$DOCKER_NOTE" --verify-tag
-          fi
-          echo "Updated release ${TAG} with Docker image reference"
+      # Release creation moved to update-readme-pin.yml so that the tag is
+      # created at the pin commit (digest-pinned action.yml) rather than at
+      # the release commit (pre-pin). The rich "Docker Image" note is built
+      # there by reading action.yml, which by then contains the digest-pinned
+      # `image: docker://...@sha256:...` reference.
 
       - name: Generate dispatch token
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859  # v3.0.0
@@ -115,9 +131,12 @@ jobs:
       - name: Dispatch action.yml image update
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DIGEST: ${{ steps.docker.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
           gh api repos/Mipiti/mipiti-verify/dispatches \
             -f event_type=action-image-update \
-            -f "client_payload[tag]=${{ steps.version.outputs.tag }}" \
-            -f "client_payload[digest]=${{ steps.docker.outputs.digest }}" \
-            -f "client_payload[image]=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+            -f "client_payload[tag]=$TAG" \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[image]=$IMAGE"

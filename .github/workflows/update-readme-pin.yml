@@ -1,12 +1,18 @@
 name: Update README Pin
 
-# Keeps the README's copy-paste `uses:` snippet pointed at the latest
-# digest-pinned release commit, and moves the release tag forward to the
-# same commit so `git checkout vX.Y.Z` actually gets the verified image
-# instead of the pre-pin state.
+# Runs after the `update-action-image.yml` PR auto-merges. Three
+# responsibilities, all tied to the "action.yml is now digest-pinned" state:
 #
-# Fires after `update-action-image.yml` has merged its "chore: pin action
-# image to vX.Y.Z" PR — we match on the head commit message on main.
+#   1. Create (or move) the vX.Y.Z tag at the pin commit, so
+#      `git checkout vX.Y.Z` lands on the verified image reference.
+#   2. Create (or update) the GitHub Release at that tag, with a
+#      digest-pinned Docker Image reference lifted from action.yml.
+#      (Moved from publish.yml so the release links to the pin commit,
+#      not the pre-pin release commit.)
+#   3. Rewrite the README's copy-paste `uses:` snippet to the new
+#      pin SHA + version.
+#
+# Fires on push to main when the head commit is a pin-PR merge.
 
 on:
   push:
@@ -52,34 +58,88 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Parsed $TAG → $SHA"
 
-      - name: Move tag forward to pin commit
+      - name: Create (or move) tag at pin commit
         if: steps.parse.outputs.tag != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # All expression values pass through env (never inline into the
+          # run: script body) — GitHub's injection-safe pattern. TAG is
+          # already regex-filtered (v\d+\.\d+\.\d+) in the parse step, and
+          # SHA is `git rev-parse HEAD` (40 hex); still, env-ing shields
+          # future refactors from accidentally loosening those guards.
+          TAG: ${{ steps.parse.outputs.tag }}
+          SHA: ${{ steps.parse.outputs.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ steps.parse.outputs.tag }}"
-          SHA="${{ steps.parse.outputs.sha }}"
           # Idempotent: delete any existing tag ref, then create at the
-          # pin commit. For a brand-new release, the retag closes a
-          # minutes-long window where v<TAG> pointed at the pre-pin
-          # release commit (which has an unpinned action.yml image ref).
-          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TAG}" \
-            2>/dev/null || echo "tag ${TAG} did not exist on remote; creating fresh"
-          gh api "repos/${{ github.repository }}/git/refs" \
-            -f "ref=refs/tags/${TAG}" \
-            -f "sha=${SHA}"
-          echo "Retagged ${TAG} → ${SHA}"
+          # pin commit. In the new flow the tag does not exist yet
+          # (publish.yml no longer cuts it); in legacy scenarios a tag
+          # may already exist and this moves it forward.
+          gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" \
+            2>/dev/null || echo "tag $TAG did not exist on remote; creating fresh"
+          gh api "repos/$REPO/git/refs" \
+            -f "ref=refs/tags/$TAG" \
+            -f "sha=$SHA"
+          echo "Tag $TAG → $SHA"
 
-      - name: Update README.md uses: snippet
+      - name: Create (or update) GitHub Release
+        if: steps.parse.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.parse.outputs.tag }}
+        run: |
+          # Extract the digest-pinned Docker image reference that the pin
+          # commit just wrote into action.yml. Matches lines like:
+          #   image: docker://ghcr.io/mipiti/mipiti-verify:v0.26.4@sha256:abc...
+          IMAGE_REF=$(grep -oE 'docker://[^ ]+@sha256:[a-f0-9]+' action.yml | head -1)
+          if [ -z "$IMAGE_REF" ]; then
+            echo "Could not extract digest-pinned image from action.yml; skipping release creation" >&2
+            exit 0
+          fi
+          IMAGE_NAME="${IMAGE_REF#docker://}"
+          IMAGE_NAME="${IMAGE_NAME%@*}"
+          DIGEST="${IMAGE_REF#*@}"
+
+          NOTES=$(cat <<NOTES
+          ### Docker Image
+
+          Pre-built image for faster CI (pulls cached image instead of building from source):
+
+          \`\`\`yaml
+          - uses: ${IMAGE_REF}
+          \`\`\`
+
+          Image: \`${IMAGE_NAME}\`
+          Digest: \`${DIGEST}\`
+          NOTES
+          )
+
+          if gh release view "$TAG" --json body >/dev/null 2>&1; then
+            echo "Release $TAG already exists; appending Docker note if not present"
+            EXISTING=$(gh release view "$TAG" --json body --jq '.body')
+            if ! printf '%s' "$EXISTING" | grep -q "$DIGEST"; then
+              gh release edit "$TAG" --notes "${EXISTING}
+
+          ---
+
+          ${NOTES}"
+            fi
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+            echo "Created release $TAG at pin commit"
+          fi
+
+      - name: "Update README.md uses: snippet"
         id: update
         if: steps.parse.outputs.tag != ''
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
+          SHA: ${{ steps.parse.outputs.sha }}
         run: |
-          TAG="${{ steps.parse.outputs.tag }}"
-          SHA="${{ steps.parse.outputs.sha }}"
           # Match `uses: Mipiti/mipiti-verify@<40-hex> # v<semver>` and
           # rewrite both the SHA and the version comment in one pass.
           sed -i -E \
-            "s|(uses: Mipiti/mipiti-verify@)[a-f0-9]{40}( # v[0-9]+\.[0-9]+\.[0-9]+)|\\1${SHA} # ${TAG}|" \
+            "s|(uses: Mipiti/mipiti-verify@)[a-f0-9]{40}( # v[0-9]+\.[0-9]+\.[0-9]+)|\\1$SHA # $TAG|" \
             README.md
           if git diff --quiet README.md; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -92,38 +152,39 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.parse.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ steps.parse.outputs.tag }}"
-          BRANCH="chore/update-readme-pin-${TAG}"
+          BRANCH="chore/update-readme-pin-$TAG"
 
-          HEAD=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          HEAD=$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha')
           CONTENT=$(base64 -w 0 README.md)
-          BASE_TREE=$(gh api "repos/${{ github.repository }}/git/commits/${HEAD}" --jq '.tree.sha')
+          BASE_TREE=$(gh api "repos/$REPO/git/commits/$HEAD" --jq '.tree.sha')
 
-          BLOB_SHA=$(gh api "repos/${{ github.repository }}/git/blobs" \
-            -f "content=${CONTENT}" -f "encoding=base64" --jq '.sha')
+          BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
+            -f "content=$CONTENT" -f "encoding=base64" --jq '.sha')
 
-          TREE=$(gh api "repos/${{ github.repository }}/git/trees" \
-            -f "base_tree=${BASE_TREE}" \
+          TREE=$(gh api "repos/$REPO/git/trees" \
+            -f "base_tree=$BASE_TREE" \
             -f "tree[][path]=README.md" \
             -f "tree[][mode]=100644" \
             -f "tree[][type]=blob" \
-            -f "tree[][sha]=${BLOB_SHA}" \
+            -f "tree[][sha]=$BLOB_SHA" \
             --jq '.sha')
 
-          COMMIT_SHA=$(gh api "repos/${{ github.repository }}/git/commits" \
-            -f "message=chore: update README uses: snippet to ${TAG}" \
-            -f "tree=${TREE}" \
-            -f "parents[]=${HEAD}" \
+          COMMIT_SHA=$(gh api "repos/$REPO/git/commits" \
+            -f "message=chore: update README uses: snippet to $TAG" \
+            -f "tree=$TREE" \
+            -f "parents[]=$HEAD" \
             --jq '.sha')
 
-          gh api "repos/${{ github.repository }}/git/refs" \
-            -f "ref=refs/heads/${BRANCH}" -f "sha=${COMMIT_SHA}"
+          gh api "repos/$REPO/git/refs" \
+            -f "ref=refs/heads/$BRANCH" -f "sha=$COMMIT_SHA"
 
           PR_URL=$(gh pr create \
-            --head "${BRANCH}" \
-            --title "chore: update README uses: snippet to ${TAG}" \
-            --body "Automated: updates the README.md GitHub Action \`uses:\` snippet to the digest-pinned commit for ${TAG}. Also retagged ${TAG} to point at this commit so consumers doing \`git checkout ${TAG}\` land on the verified image." \
+            --head "$BRANCH" \
+            --title "chore: update README uses: snippet to $TAG" \
+            --body "Automated: updates the README.md GitHub Action \`uses:\` snippet to the digest-pinned commit for $TAG. Also (re)tags $TAG to point at this commit so consumers doing \`git checkout $TAG\` land on the verified image." \
             --base main)
 
           gh pr merge "$PR_URL" --squash --auto --delete-branch || echo "Auto-merge skipped"
