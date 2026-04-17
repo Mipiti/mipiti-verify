@@ -61,7 +61,7 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Parsed $TAG → $SHA"
 
-      - name: Create (or move) tag at pin commit
+      - name: Create annotated tag at pin commit
         if: steps.parse.outputs.tag != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -74,16 +74,39 @@ jobs:
           SHA: ${{ steps.parse.outputs.sha }}
           REPO: ${{ github.repository }}
         run: |
-          # Idempotent: delete any existing tag ref, then create at the
-          # pin commit. In the new flow the tag does not exist yet
-          # (publish.yml no longer cuts it); in legacy scenarios a tag
-          # may already exist and this moves it forward.
-          gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" \
-            2>/dev/null || echo "tag $TAG did not exist on remote; creating fresh"
+          # Annotated tag creation: create a tag OBJECT via /git/tags,
+          # then the ref pointing at that object via /git/refs. This is
+          # deliberately NOT a lightweight tag (direct /git/refs POST at
+          # a commit SHA).
+          #
+          # Why: the "Protect release tags" ruleset on this repo has
+          # `Restrict creations` enabled. The Mipiti Automation app is in
+          # the bypass list with mode=always AND has contents:write — yet
+          # lightweight tag creations via /git/refs alone get rejected
+          # with HTTP 422 "Reference update failed" (observed for v0.26.5
+          # and v0.26.6). The /git/tags path (annotated) is accepted by
+          # the same app with the same bypass — confirmed empirically
+          # because release-pipeline.yml uses this pattern and has always
+          # worked. The difference appears to be how GitHub's ruleset
+          # engine evaluates tag creation: annotated tags carry a proper
+          # tag object and its bypass path differs from the direct-ref
+          # path.
+          #
+          # No DELETE step: in the Option 3 flow the tag does not exist
+          # when this runs (release-pipeline no longer cuts it). If the
+          # tag DOES exist (manual retry, legacy migration), this step
+          # fails visibly on /git/refs and an operator investigates —
+          # cleaner than silently swallowing a ruleset error.
+          TAG_OBJ_SHA=$(gh api "repos/$REPO/git/tags" \
+            -f "tag=$TAG" \
+            -f "message=Release $TAG" \
+            -f "object=$SHA" \
+            -f "type=commit" \
+            --jq '.sha')
           gh api "repos/$REPO/git/refs" \
             -f "ref=refs/tags/$TAG" \
-            -f "sha=$SHA"
-          echo "Tag $TAG → $SHA"
+            -f "sha=$TAG_OBJ_SHA"
+          echo "Tag $TAG → $SHA (annotated, object $TAG_OBJ_SHA)"
 
       - name: Create (or update) GitHub Release
         if: steps.parse.outputs.tag != ''
