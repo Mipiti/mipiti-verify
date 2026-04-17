@@ -1,10 +1,23 @@
 name: CI
 
+# Runs on PRs only. Every merge to main comes via a PR that had to pass
+# this same CI (required status check + required-up-to-date-branch), so
+# re-running on main after squash-merge tests an identical tree — pure
+# duplication. Dropping the push:main trigger saves ~5 min × N
+# bot-auto-merged PRs per release.
+#
+# Markdown-only / CHANGELOG-only PRs skip CI too: tests have no README
+# dependency, so running the full suite for a docs tweak is a waste.
+# Human-authored PRs that DO need CI will change something outside
+# *.md; bot-authored README-update PRs (post-release) only touch
+# README.md and don't need CI at all.
+
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'CHANGELOG.md'
 
 jobs:
   test:

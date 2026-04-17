@@ -1,8 +1,19 @@
 name: Dispatch Pointer Update
 
+# Fires only when a release tag lands on this repo. One pointer-update
+# PR per release, instead of three (one each for release-commit,
+# pin-commit, README-update-commit).
+#
+# Rationale: parent repo should track verify's latest *released* version
+# (what users consume via `pip install` or `uses: @vX.Y.Z`), not every
+# intermediate commit in a mid-release state. With Option 3
+# (update-readme-pin.yml creates the tag at the pin commit), this
+# trigger fires *after* all release-process commits have landed, so the
+# pointer always points at the final digest-pinned state.
+
 on:
   push:
-    branches: [main]
+    tags: ['v*']
 
 jobs:
   dispatch-submodule-update:
