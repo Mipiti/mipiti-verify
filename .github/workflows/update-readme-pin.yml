@@ -18,7 +18,7 @@ jobs:
     # (PR title becomes the squash-merge subject). Matches any of:
     #   "chore: pin action image to v0.26.4"
     #   "chore: pin action image to v0.26.4 (#114)"
-    if: startsWith(github.event.head_commit.message, 'chore: pin action image to v')
+    if: "startsWith(github.event.head_commit.message, 'chore: pin action image to v')"
     runs-on: ubuntu-latest
     environment: automation
     permissions:
