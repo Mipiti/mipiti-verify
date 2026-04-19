@@ -1,0 +1,25 @@
+name: CI
+
+# Twin of ci.yml for docs-only PRs.
+#
+# ci.yml skips markdown-only changes via paths-ignore to save CI minutes. The
+# `main` branch ruleset requires a status check named `test`. Without this
+# twin, docs-only PRs never produce that check and are permanently blocked
+# from merge. This workflow fires on the inverse path filter and posts a
+# trivial passing `test` job so the required check is satisfied.
+#
+# Both files use workflow name "CI" and job name "test" so they report the
+# same check context; exactly one of them runs per PR.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'CHANGELOG.md'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Docs-only PR, skipping tests"
