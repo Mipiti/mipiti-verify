@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .client import MipitiClient
+from .sigstore_signer import sign_content_hash
 from .verifiers import get_verifier
 
 console = Console(stderr=True)
@@ -58,6 +59,8 @@ class Runner:
         tier2_api_key: str | None = None,
         ollama_url: str = "http://localhost:11434",
         oidc_token: str | None = None,
+        sigstore_tuf_url: str | None = None,
+        sigstore_trust_config_path: str | None = None,
         dry_run: bool = False,
         reverify: bool = True,
         verbose: bool = False,
@@ -81,13 +84,43 @@ class Runner:
             _aud = _config.get("attestation_audience", "")
         except Exception:
             pass  # backend may not support this endpoint yet
+        # The raw OIDC token is used only locally to mint a Sigstore bundle
+        # (see _sign_with_sigstore); it is never transmitted to Mipiti.
         self.oidc_token = oidc_token or _auto_detect_oidc(_aud)
+        self.sigstore_tuf_url = sigstore_tuf_url or os.environ.get(
+            "MIPITI_SIGSTORE_TUF_URL", ""
+        ) or None
+        self.sigstore_trust_config_path = sigstore_trust_config_path or os.environ.get(
+            "MIPITI_SIGSTORE_TRUST_CONFIG", ""
+        ) or None
         self.dry_run = dry_run
         self._developer_key = client.key_scope == "developer"
         self.reverify = reverify
         self.verbose = verbose
         self.changed_files = changed_files
         self.concurrency = max(1, concurrency)
+
+    def _sign_with_sigstore(self, content_hash: str) -> str:
+        """Convert the OIDC token into a Sigstore bundle (keyless signing).
+
+        Returns the bundle as a JSON string, or "" when no OIDC token is
+        available (self-hosted / non-OIDC CI). Failures are logged and also
+        return "" — the run still submits; it just lacks attestation.
+        """
+        if not self.oidc_token:
+            return ""
+        try:
+            return sign_content_hash(
+                self.oidc_token,
+                content_hash,
+                tuf_url=self.sigstore_tuf_url,
+                trust_config_path=self.sigstore_trust_config_path,
+            )
+        except Exception as e:
+            console.print(
+                f"  [yellow]Sigstore signing failed: {e} — submitting without attestation[/yellow]"
+            )
+            return ""
 
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
@@ -100,11 +133,12 @@ class Runner:
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t1_assertions, t1_results)
+            bundle = self._sign_with_sigstore(content_hash)
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
                 results=t1_results,
-                oidc_token=self.oidc_token,
+                bundle=bundle,
                 content_hash=content_hash,
             )
             t1_run_id = resp.get("run_id", "")
@@ -116,11 +150,12 @@ class Runner:
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t2_assertions, t2_results)
+            bundle = self._sign_with_sigstore(content_hash)
             resp = self.client.submit_results(
                 model_id,
                 pipeline=_pipeline_metadata(),
                 results=t2_results,
-                oidc_token=self.oidc_token,
+                bundle=bundle,
                 content_hash=content_hash,
             )
             t2_run_id = resp.get("run_id", "")
