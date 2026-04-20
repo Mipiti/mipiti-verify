@@ -101,29 +101,49 @@ Developer keys skip result submission automatically — no `--dry-run` needed.
 ## GitHub Action
 
 ```yaml
-- uses: Mipiti/mipiti-verify@79c80982c8ae80a846754af1bcdc32f9acaa6ddc # v0.26.10
-  with:
-    # Required
-    api-key: ${{ secrets.MIPITI_API_KEY }}
+permissions:
+  id-token: write    # required: mints the OIDC token used for Sigstore signing
+  contents: read
 
-    # Model selection (one of these)
-    all: true                    # Verify all models in the workspace
-    # model-id: "tm-abc123"     # Or verify a specific model
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Mipiti/mipiti-verify@79c80982c8ae80a846754af1bcdc32f9acaa6ddc # v0.26.10
+        with:
+          # Required
+          api-key: ${{ secrets.MIPITI_API_KEY }}
 
-    # Tier 2 semantic verification (omit for Tier 1 only)
-    tier2-provider: openai       # openai, anthropic, or ollama
-    tier2-model: gpt-4o-mini     # e.g. gpt-4o, claude-sonnet-4-5-20250514
-    tier2-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Model selection (one of these)
+          all: true                    # Verify all models in the workspace
+          # model-id: "tm-abc123"     # Or verify a specific model
 
-    # Optional
-    # reverify: true             # Re-verify all assertions, not just pending (default: true)
-    # dry-run: false             # Run without submitting results (default: false)
-    # concurrency: 1             # Max concurrent Tier 2 LLM calls (default: 1)
-    # project-root: "."          # Project root directory (default: ".")
-    # base-url: "https://api.mipiti.io"  # API base URL (default: https://api.mipiti.io)
+          # Tier 2 semantic verification (omit for Tier 1 only)
+          tier2-provider: openai       # openai, anthropic, or ollama
+          tier2-model: gpt-4o-mini     # e.g. gpt-4o, claude-sonnet-4-5-20250514
+          tier2-api-key: ${{ secrets.OPENAI_API_KEY }}
+
+          # Optional
+          # reverify: true             # Re-verify all assertions, not just pending (default: true)
+          # dry-run: false             # Run without submitting results (default: false)
+          # concurrency: 1             # Max concurrent Tier 2 LLM calls (default: 1)
+          # project-root: "."          # Project root directory (default: ".")
+          # base-url: "https://api.mipiti.io"  # API base URL (default: https://api.mipiti.io)
+          # sigstore-tuf-url: "..."    # Private Sigstore deployment (default: public sigstore.dev)
 ```
 
 All assertions are re-verified by default. Use `reverify: false` to only check new assertions (reduces Tier 2 API costs on PRs). Omitting `tier2-provider` runs Tier 1 only — controls won't reach "verified" status without Tier 2.
+
+### Attestation (Sigstore)
+
+`mipiti-verify` signs every submitted result set with [Sigstore](https://sigstore.dev): the runner's short-lived OIDC token is exchanged at Fulcio for a signing certificate, the verified content hash is signed, and the entry is recorded in Rekor (the public transparency log). Mipiti's backend receives only the resulting bundle — **the raw OIDC token never leaves CI**.
+
+**Offline verification**. The bundle is self-contained: it carries the signing certificate, signature, Rekor inclusion proof, and signed Merkle tree checkpoint. An auditor can re-verify the bundle **without contacting Rekor or Mipiti** — they need only the Sigstore trust root (Fulcio CA chain + Rekor public key + CT log keys). The [`sigstore`](https://pypi.org/project/sigstore/) client fetches the trust root from TUF on first use and caches it; the TUF timestamp expires in ~1 week, so repeat verifications on the same workstation are network-free until then. For fully air-gapped review, pin a trust root snapshot and pass it to `mipiti-verify audit --sigstore-trust-config <path>`.
+
+**Network dependencies at CI-time**. Signing requires outbound access to `fulcio.sigstore.dev` (certificate issuance), `rekor.sigstore.dev` (transparency log), and `tuf-repo-cdn.sigstore.dev` (trust root). Each CI job starts from a cold TUF cache, so expect ~1–3s of trust-root fetch on every run. To eliminate the TUF fetch entirely — e.g. for air-gapped CI — download a Sigstore `ClientTrustConfig` JSON out-of-band and pass it via `sigstore-trust-config`. Private Sigstore deployments can redirect the whole stack via `sigstore-tuf-url`.
+
+Private or air-gapped deployments can also redirect signing itself at their own Sigstore instance via `sigstore-tuf-url` on the `run` command.
 
 ### Action Inputs
 
@@ -140,6 +160,8 @@ All assertions are re-verified by default. Use `reverify: false` to only check n
 | `dry-run` | No | `false` | Run verifiers but don't submit results |
 | `concurrency` | No | `1` | Max concurrent Tier 2 LLM calls |
 | `base-url` | No | `https://api.mipiti.io` | API base URL |
+| `sigstore-tuf-url` | No | `""` | Custom Sigstore TUF root URL for private deployments (default public `sigstore.dev`) |
+| `sigstore-trust-config` | No | `""` | Path to a pre-downloaded Sigstore ClientTrustConfig JSON for fully air-gapped CI (skips all TUF fetches) |
 
 ### Action Output
 

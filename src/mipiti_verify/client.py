@@ -92,30 +92,36 @@ class MipitiClient:
         model_id: str,
         pipeline: dict[str, Any],
         results: list[dict[str, Any]],
-        oidc_token: str = "",
+        bundle: str = "",
         signature: str = "",
         signed_hash: str = "",
         content_hash: str = "",
     ) -> dict[str, Any]:
-        """POST /api/models/{id}/verification/results"""
+        """POST /api/models/{id}/verification/results
+
+        CI-side attestation is carried by `bundle` — a Sigstore bundle (JSON-
+        serialised, bundle_v0.3) minted locally from the runner's OIDC token.
+        The raw token never leaves the runner; the backend verifies the bundle
+        against the Sigstore transparency log.
+
+        Self-hosted deployments without OIDC supply `signature` + `signed_hash`
+        produced with a workspace ECDSA key instead.
+        """
         body: dict[str, Any] = {
             "pipeline": pipeline,
             "results": results,
             "content_hash": content_hash,
         }
+        if bundle:
+            body["bundle"] = bundle
         if signature:
             body["signature"] = signature
         if signed_hash:
             body["signed_hash"] = signed_hash
 
-        headers: dict[str, str] = {}
-        if oidc_token:
-            headers["X-CI-Attestation"] = oidc_token
-
         resp = self._client.post(
             f"/api/models/{model_id}/verification/results",
             json=body,
-            headers=headers,
         )
         resp.raise_for_status()
         return resp.json()

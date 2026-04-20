@@ -48,6 +48,14 @@ inputs:
     description: Max concurrent Tier 2 LLM calls
     required: false
     default: "1"
+  sigstore-tuf-url:
+    description: Custom Sigstore TUF root URL for private deployments (default public sigstore.dev)
+    required: false
+    default: ""
+  sigstore-trust-config:
+    description: Path to a pre-downloaded Sigstore ClientTrustConfig JSON (out-of-band snapshot, skips all TUF network fetches)
+    required: false
+    default: ""
 
 outputs:
   content-hash:
@@ -69,3 +77,5 @@ runs:
     INPUT_REVERIFY: ${{ inputs.reverify }}
     INPUT_DRY_RUN: ${{ inputs.dry-run }}
     INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+    INPUT_SIGSTORE_TUF_URL: ${{ inputs.sigstore-tuf-url }}
+    INPUT_SIGSTORE_TRUST_CONFIG: ${{ inputs.sigstore-trust-config }}

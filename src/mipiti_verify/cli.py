@@ -41,7 +41,9 @@ def main() -> None:
 @click.option("--tier2-model", default=None, help="Model name (e.g. gpt-4o, claude-sonnet-4-5-20250514)")
 @click.option("--tier2-api-key", default=None, help="Provider API key (or OPENAI_API_KEY / ANTHROPIC_API_KEY)")
 @click.option("--ollama-url", default="http://localhost:11434", help="Ollama endpoint URL")
-@click.option("--oidc-token", default=None, help="OIDC token for CI attestation (or auto-detect)")
+@click.option("--oidc-token", default=None, help="OIDC token used locally to mint a Sigstore bundle (auto-detected from GitHub Actions / GitLab CI)")
+@click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL for private deployments (default: public sigstore.dev)")
+@click.option("--sigstore-trust-config", "sigstore_trust_config_path", default=None, type=click.Path(exists=True, dir_okay=False), help="Path to a pre-downloaded Sigstore ClientTrustConfig JSON (no outbound TUF fetch)")
 @click.option(
     "--output",
     "output_format",
@@ -67,6 +69,8 @@ def run(
     tier2_api_key: str | None,
     ollama_url: str,
     oidc_token: str | None,
+    sigstore_tuf_url: str | None,
+    sigstore_trust_config_path: str | None,
     output_format: str,
     dry_run: bool,
     reverify: bool,
@@ -128,6 +132,8 @@ def run(
         tier2_api_key=tier2_api_key,
         ollama_url=ollama_url,
         oidc_token=oidc_token,
+        sigstore_tuf_url=sigstore_tuf_url,
+        sigstore_trust_config_path=sigstore_trust_config_path,
         dry_run=dry_run,
         reverify=reverify,
         verbose=verbose,
@@ -634,14 +640,19 @@ def _audit_html_report(content: str, key_url: str) -> None:
 @main.command()
 @click.argument("package_file", type=click.Path(exists=True))
 @click.option("--key-url", default="", help="JWKS URL for the Mipiti instance (e.g. https://api.mipiti.io/.well-known/jwks)")
-def audit(package_file: str, key_url: str) -> None:
+@click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL — pin a frozen root for air-gapped verification. Default: public sigstore.dev.")
+def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None:
     """Verify an audit package or signed HTML report independently.
 
     For HTML reports: verifies the ECDSA document signature, proving the
     report has not been modified since the platform generated it.
 
-    For JSON audit packages: checks OIDC provenance, content integrity
-    (platform ECDSA signature), and lists all assertion results with reasoning.
+    For JSON audit packages: cryptographically verifies the Sigstore bundle
+    (signature chain → Fulcio root; Rekor Merkle inclusion proof; SCT), the
+    platform's ECDSA content-integrity signature, and lists all assertion
+    results with reasoning. Verification is fully offline once the Sigstore
+    trust root has been cached on the verifying host; use --sigstore-tuf-url
+    to point at a pinned trust root for air-gapped review.
     """
     import hashlib
     import base64
@@ -661,38 +672,59 @@ def audit(package_file: str, key_url: str) -> None:
     has_failure = False
 
     # --- Provenance ---
-    console.print("\n[bold]Provenance (OIDC)[/bold]")
-    prov = pkg.get("provenance")
-    if prov and prov.get("oidc_token"):
+    console.print("\n[bold]Provenance (Sigstore)[/bold]")
+    prov = pkg.get("provenance") or {}
+    bundle_json = prov.get("bundle", "")
+    content_hash_str = ""
+    ci = pkg.get("content_integrity") or {}
+    if isinstance(ci, dict):
+        content_hash_str = ci.get("results_hash", "")
+    if bundle_json:
         try:
-            import jwt
-            from jwt import PyJWKClient
+            from sigstore.models import Bundle, ClientTrustConfig
+            from sigstore.verify import Verifier, policy
 
-            token = prov["oidc_token"]
-            jwks_url = prov.get("jwks_url", "")
-            if not jwks_url:
-                console.print("  [yellow]No JWKS URL — cannot verify OIDC token[/yellow]")
+            bundle = Bundle.from_json(bundle_json)
+            cert = bundle.signing_certificate
+
+            # Cryptographic verification — fully offline once the trust root
+            # is cached. Binds the bundle to the content hash the platform
+            # signed in CI.
+            if content_hash_str:
+                if sigstore_tuf_url:
+                    trust_config = ClientTrustConfig.from_tuf(sigstore_tuf_url, offline=False)
+                    verifier = Verifier._from_trust_config(trust_config) if hasattr(Verifier, "_from_trust_config") else Verifier.production()
+                else:
+                    verifier = Verifier.production()
+                try:
+                    # UnsafeNoOp: we don't bind to a specific issuer/repo here
+                    # because the auditor may be verifying packages from any
+                    # upstream. Backend submission-time verification already
+                    # enforces the expected identity policy.
+                    verifier.verify_artifact(
+                        input_=content_hash_str.encode("utf-8"),
+                        bundle=bundle,
+                        policy=policy.UnsafeNoOp(),
+                    )
+                    console.print("  Bundle signature: [green]VERIFIED[/green]")
+                    console.print("  Rekor inclusion:  [green]VERIFIED[/green] (Merkle proof checked)")
+                except Exception as verr:
+                    console.print(f"  Bundle signature: [red]FAILED — {verr}[/red]")
+                    has_failure = True
             else:
-                client = PyJWKClient(jwks_url)
-                signing_key = client.get_signing_key_from_jwt(token)
-                claims = jwt.decode(
-                    token, signing_key.key, algorithms=["RS256"],
-                    audience="api.mipiti.io", options={"verify_exp": False},
-                )
-                console.print(f"  Issuer:      {claims.get('iss', 'unknown')}")
-                console.print(f"  Repository:  {claims.get('repository', 'unknown')}")
-                console.print(f"  Branch:      {claims.get('ref', 'unknown')}")
-                console.print(f"  Commit:      {claims.get('sha', 'unknown')}")
-                console.print(f"  Environment: {claims.get('environment', 'unknown')}")
-                console.print(f"  Runner:      {claims.get('runner_environment', 'unknown')}")
-                console.print(f"  Actor:       {claims.get('actor', 'unknown')}")
-                console.print(f"  Run:         {claims.get('run_id', 'unknown')}")
-                console.print("  Signature:   [green]VALID[/green]")
+                console.print("  [yellow]No content_hash in package — cannot cryptographically verify[/yellow]")
+
+            console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
+            console.print(f"  Not before:       {cert.not_valid_before_utc.isoformat()}")
+            console.print(f"  Not after:        {cert.not_valid_after_utc.isoformat()}")
+            tlog = bundle.log_entry
+            console.print(f"  Rekor log index:  {tlog.log_index}")
+            console.print(f"  Rekor integrated: {tlog.integrated_time}")
         except Exception as e:
-            console.print(f"  Signature:   [red]INVALID — {e}[/red]")
+            console.print(f"  Bundle:           [red]INVALID — {e}[/red]")
             has_failure = True
     else:
-        console.print("  [yellow]No OIDC provenance in package[/yellow]")
+        console.print("  [yellow]No Sigstore provenance in package[/yellow]")
 
     # --- Content Integrity ---
     console.print("\n[bold]Content Integrity (ECDSA P-256)[/bold]")

@@ -35,4 +35,12 @@ if [ -n "$INPUT_CONCURRENCY" ] && [ "$INPUT_CONCURRENCY" != "1" ]; then
   ARGS="$ARGS --concurrency $INPUT_CONCURRENCY"
 fi
 
+if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+  ARGS="$ARGS --sigstore-tuf-url $INPUT_SIGSTORE_TUF_URL"
+fi
+
+if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+  ARGS="$ARGS --sigstore-trust-config $INPUT_SIGSTORE_TRUST_CONFIG"
+fi
+
 exec mipiti-verify $ARGS

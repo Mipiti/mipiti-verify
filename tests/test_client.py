@@ -70,7 +70,7 @@ class TestMipitiClient:
         client.close()
 
     @respx.mock
-    def test_submit_results_with_oidc(self):
+    def test_submit_results_with_bundle(self):
         route = respx.post("https://test.example.com/api/models/m1/verification/results").mock(
             return_value=httpx.Response(200, json={"run_id": "run_456", "results_count": 1})
         )
@@ -79,9 +79,13 @@ class TestMipitiClient:
             "m1",
             pipeline={"provider": "github_actions"},
             results=[],
-            oidc_token="eyJhbGciOiJSUzI1NiJ9...",
+            bundle='{"mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3", "verificationMaterial": {}}',
         )
-        assert route.calls[0].request.headers.get("X-CI-Attestation") == "eyJhbGciOiJSUzI1NiJ9..."
+        body = json.loads(route.calls[0].request.content)
+        assert body["bundle"].startswith("{"), "bundle should be in the body, not a header"
+        assert route.calls[0].request.headers.get("X-CI-Attestation") is None, (
+            "legacy raw-token header must not be sent"
+        )
         client.close()
 
     @respx.mock
