@@ -657,7 +657,11 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
     import hashlib
     import base64
 
-    with open(package_file) as f:
+    # Force UTF-8 — HTML reports and JSON audit packages are UTF-8 by
+    # construction; relying on the platform default (cp1252 on Windows)
+    # crashes on any non-ASCII byte in a report (e.g. a curly quote or
+    # em-dash) with UnicodeDecodeError.
+    with open(package_file, encoding="utf-8") as f:
         content = f.read()
 
     # Detect HTML report vs JSON audit package
