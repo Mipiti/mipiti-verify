@@ -109,7 +109,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: Mipiti/mipiti-verify@79c80982c8ae80a846754af1bcdc32f9acaa6ddc # v0.26.10
         with:
           # Required
