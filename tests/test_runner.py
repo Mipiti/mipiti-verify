@@ -8,11 +8,12 @@ from mipiti_verify.runner import Runner, _pipeline_metadata
 
 
 class TestSignWithSigstore:
-    """Runner's local OIDC-token → Sigstore-bundle hook.
+    """Runner's local OIDC-token → Sigstore-DSSE-bundle hook.
 
     The raw OIDC token never leaves the runner; `_sign_with_sigstore`
-    converts it into a transparency-log-backed bundle that submit_results
-    forwards in the request body.
+    converts it into a DSSE-based Sigstore bundle whose envelope carries
+    the full verification payload (assertions + verdicts + pipeline), so
+    the bundle is self-contained for offline auditor verification.
     """
 
     def _runner(self, oidc_token: str | None, **kwargs) -> Runner:
@@ -20,44 +21,59 @@ class TestSignWithSigstore:
         client.key_scope = "verifier"
         return Runner(client=client, oidc_token=oidc_token, **kwargs)
 
-    def test_no_token_returns_empty_bundle(self) -> None:
-        runner = self._runner(oidc_token=None)
-        assert runner._sign_with_sigstore("sha256:deadbeef") == ""
-
-    @patch("mipiti_verify.runner.sign_content_hash")
-    def test_success_returns_bundle_json(self, mock_sign: MagicMock) -> None:
-        mock_sign.return_value = '{"mediaType":"sigstore-bundle"}'
-        runner = self._runner(oidc_token="eyJ.token")
-        got = runner._sign_with_sigstore("sha256:abc")
-        assert got == '{"mediaType":"sigstore-bundle"}'
-        mock_sign.assert_called_once_with(
-            "eyJ.token", "sha256:abc", tuf_url=None, trust_config_path=None
+    def _call_kwargs(self):
+        return dict(
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:abc",
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
         )
 
-    @patch("mipiti_verify.runner.sign_content_hash")
+    def test_no_token_returns_empty_bundle(self) -> None:
+        runner = self._runner(oidc_token=None)
+        assert runner._sign_with_sigstore(**self._call_kwargs()) == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_success_returns_bundle_json(self, mock_sign: MagicMock) -> None:
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle","dsseEnvelope":{}}'
+        runner = self._runner(oidc_token="eyJ.token")
+        got = runner._sign_with_sigstore(**self._call_kwargs())
+        assert got == '{"mediaType":"sigstore-bundle","dsseEnvelope":{}}'
+        mock_sign.assert_called_once_with(
+            "eyJ.token",
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:abc",
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
+            tuf_url=None,
+            trust_config_path=None,
+        )
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
     def test_failure_is_swallowed_so_run_continues(self, mock_sign: MagicMock) -> None:
         mock_sign.side_effect = RuntimeError("Fulcio unreachable")
         runner = self._runner(oidc_token="eyJ.token")
         # Must not raise — an attestation failure should not kill the run;
         # the assertion verdicts themselves still submit (just unsigned).
-        assert runner._sign_with_sigstore("sha256:abc") == ""
+        assert runner._sign_with_sigstore(**self._call_kwargs()) == ""
 
-    @patch("mipiti_verify.runner.sign_content_hash")
+    @patch("mipiti_verify.runner.sign_verification_statement")
     def test_private_tuf_url_forwarded(self, mock_sign: MagicMock) -> None:
         mock_sign.return_value = "{}"
         runner = self._runner(
             oidc_token="eyJ.token",
             sigstore_tuf_url="https://sigstore.internal/tuf",
         )
-        runner._sign_with_sigstore("sha256:abc")
-        mock_sign.assert_called_once_with(
-            "eyJ.token",
-            "sha256:abc",
-            tuf_url="https://sigstore.internal/tuf",
-            trust_config_path=None,
-        )
+        runner._sign_with_sigstore(**self._call_kwargs())
+        kwargs = mock_sign.call_args.kwargs
+        assert kwargs["tuf_url"] == "https://sigstore.internal/tuf"
+        assert kwargs["trust_config_path"] is None
 
-    @patch("mipiti_verify.runner.sign_content_hash")
+    @patch("mipiti_verify.runner.sign_verification_statement")
     def test_trust_config_path_forwarded(self, mock_sign: MagicMock, tmp_path) -> None:
         mock_sign.return_value = "{}"
         cfg = tmp_path / "trust-config.json"
@@ -66,13 +82,10 @@ class TestSignWithSigstore:
             oidc_token="eyJ.token",
             sigstore_trust_config_path=str(cfg),
         )
-        runner._sign_with_sigstore("sha256:abc")
-        mock_sign.assert_called_once_with(
-            "eyJ.token",
-            "sha256:abc",
-            tuf_url=None,
-            trust_config_path=str(cfg),
-        )
+        runner._sign_with_sigstore(**self._call_kwargs())
+        kwargs = mock_sign.call_args.kwargs
+        assert kwargs["tuf_url"] is None
+        assert kwargs["trust_config_path"] == str(cfg)
 
 
 class TestRunner:
