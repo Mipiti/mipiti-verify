@@ -161,9 +161,4 @@ class MipitiClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_verification_config(self) -> dict[str, Any]:
-        """GET /api/verification/config — fetch attestation audience etc."""
-        resp = self._client.get("/api/verification/config")
-        resp.raise_for_status()
-        return resp.json()
 

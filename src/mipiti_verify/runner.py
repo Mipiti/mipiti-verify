@@ -77,16 +77,11 @@ class Runner:
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
         self.ollama_url = ollama_url
-        # Fetch attestation audience from backend
-        _aud = ""
-        try:
-            _config = client.get_verification_config()
-            _aud = _config.get("attestation_audience", "")
-        except Exception:
-            pass  # backend may not support this endpoint yet
         # The raw OIDC token is used only locally to mint a Sigstore bundle
-        # (see _sign_with_sigstore); it is never transmitted to Mipiti.
-        self.oidc_token = oidc_token or _auto_detect_oidc(_aud)
+        # (see _sign_with_sigstore); it is never transmitted to Mipiti. For
+        # Sigstore signing, the token MUST have `aud=sigstore` — Fulcio
+        # and sigstore-python's IdentityToken validator both require it.
+        self.oidc_token = oidc_token or _auto_detect_oidc("sigstore")
         self.sigstore_tuf_url = sigstore_tuf_url or os.environ.get(
             "MIPITI_SIGSTORE_TUF_URL", ""
         ) or None
