@@ -1,26 +1,38 @@
 """Sigstore keyless signing for mipiti-verify.
 
 Converts a short-lived OIDC identity token into a long-lived, auditor-verifiable
-Sigstore bundle:
+Sigstore bundle carrying a DSSE (Dead Simple Signing Envelope) attestation:
 
 1. Present the OIDC token to Fulcio -> short-lived X.509 signing certificate
-2. Generate an ephemeral keypair; sign the content hash; discard the private key
-3. Submit the signed entry to Rekor (transparency log) -> inclusion proof
-4. Package the certificate, signature, and inclusion proof as a Sigstore bundle
+2. Build an in-toto Statement with the full verification context as predicate
+3. Sign the Statement (via DSSE) with an ephemeral keypair; discard the key
+4. Submit the signed entry to Rekor (transparency log) -> inclusion proof
+5. Package the certificate, signature, envelope, and inclusion proof as a
+   Sigstore bundle
 
-The bundle is a non-secret artefact: auditors verify it against the public Rekor
-log and Sigstore trust root, without needing access to Mipiti or the original
-token. The raw OIDC token never leaves the CI runner.
+The bundle is self-contained: the envelope carries the assertion + verdict
+payload directly, so an auditor can extract the attestation and verify both
+its signature and its semantic content from the bundle alone — no need to
+co-locate the verdict data in a separate artefact. The raw OIDC token never
+leaves the CI runner.
 """
 
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
+from sigstore.dsse import StatementBuilder, Subject
 from sigstore.models import ClientTrustConfig
 from sigstore.oidc import IdentityToken
 from sigstore.sign import SigningContext
+
+
+# In-toto predicate type for a Mipiti verification run. Versioned; changes
+# to the predicate schema MUST bump the version so verifiers can distinguish
+# shapes safely.
+PREDICATE_TYPE = "https://mipiti.io/attestations/v1/verification-run"
 
 
 def _content_hash_to_bytes(content_hash: str) -> bytes:
@@ -55,30 +67,51 @@ def _load_trust_config(
     return ClientTrustConfig.production()
 
 
-def sign_content_hash(
+def sign_verification_statement(
     identity_token: str,
-    content_hash: str,
     *,
+    model_id: str,
+    tier: int,
+    content_hash: str,
+    pipeline: dict[str, Any],
+    assertions: list[dict[str, Any]],
+    results: list[dict[str, Any]],
     tuf_url: str | None = None,
     trust_config_path: str | None = None,
 ) -> str:
-    """Sign a content hash with Sigstore and return the bundle as JSON.
+    """Sign a Mipiti verification run as an in-toto DSSE attestation.
+
+    Produces a Sigstore bundle whose DSSE envelope carries the full
+    attestation payload (assertions + verdicts + pipeline metadata),
+    not just a commitment to the content hash. Auditors can extract
+    and verify the payload directly from the bundle.
 
     Args:
-        identity_token: Raw OIDC JWT from the CI runner (e.g. GitHub Actions
+        identity_token: Raw OIDC JWT from the CI runner (GitHub Actions
             `ACTIONS_ID_TOKEN_REQUEST_URL` or GitLab `CI_JOB_JWT_V2`).
-        content_hash: `sha256:<hex>` digest of the verified content.
+        model_id: ID of the Mipiti threat model under verification.
+        tier: 1 (mechanical) or 2 (semantic / adversarial LLM).
+        content_hash: `sha256:<hex>` digest of the canonical assertions +
+            verdicts JSON. Becomes the Subject digest on the Statement.
+        pipeline: CI pipeline metadata (provider, commit_sha, ref, run_id,
+            run_url) — carried in the predicate for auditor context.
+        assertions: Full assertion definitions that were verified (id,
+            type, params, description, control/assumption ids).
+        results: Per-assertion tier verdicts (assertion_id, tier, result,
+            details, reasoning, reviewer).
         tuf_url: Optional custom TUF root URL (private Sigstore instance).
         trust_config_path: Optional path to a pre-downloaded Sigstore
-            ClientTrustConfig JSON file; used in preference to `tuf_url` for
-            fully air-gapped CI (no outbound to any TUF host).
+            ClientTrustConfig JSON file; used in preference to `tuf_url`
+            for fully air-gapped CI (no outbound to any TUF host).
 
     Returns:
-        JSON-serialised Sigstore bundle (bundle_v0.3, Sigstore specification).
+        JSON-serialised Sigstore bundle (bundle_v0.3). The DSSE envelope
+        inside the bundle carries an in-toto Statement whose predicate is
+        the full verification payload, not just an opaque hash.
 
     Raises:
-        ValueError if `identity_token` is empty or `content_hash` is not a
-            parseable sha256 digest.
+        ValueError if `identity_token` is empty, `tier` is not 1 or 2, or
+            `content_hash` is not a parseable sha256 digest.
 
     Network:
         Contacts Fulcio (cert issuance) and Rekor (transparency log entry).
@@ -86,6 +119,8 @@ def sign_content_hash(
     """
     if not identity_token:
         raise ValueError("identity_token is required")
+    if tier not in (1, 2):
+        raise ValueError(f"tier must be 1 or 2, got {tier!r}")
 
     digest_bytes = _content_hash_to_bytes(content_hash)
     if len(digest_bytes) != hashlib.sha256().digest_size:
@@ -93,17 +128,37 @@ def sign_content_hash(
             f"content_hash is not a sha256 digest: got {len(digest_bytes)} bytes"
         )
 
+    hex_digest = digest_bytes.hex()
+
+    statement = (
+        StatementBuilder()
+        .subjects(
+            [
+                Subject(
+                    name=f"mipiti:verification:tier{tier}:{model_id}",
+                    digest={"sha256": hex_digest},
+                )
+            ]
+        )
+        .predicate_type(PREDICATE_TYPE)
+        .predicate(
+            {
+                "model_id": model_id,
+                "tier": tier,
+                "content_hash": content_hash,
+                "pipeline": pipeline,
+                "assertions": assertions,
+                "results": results,
+            }
+        )
+        .build()
+    )
+
     trust_config = _load_trust_config(tuf_url, trust_config_path)
     signing_context = SigningContext.from_trust_config(trust_config)
     identity = IdentityToken(identity_token)
 
-    # sign_artifact accepts raw bytes; it recomputes the hash internally, so
-    # we pass the canonical bytes that produced the digest. For integrity we
-    # sign the content_hash string itself, ensuring the bundle binds the
-    # exact digest Mipiti will verify.
-    payload = content_hash.encode("utf-8")
-
     with signing_context.signer(identity) as signer:
-        bundle = signer.sign_artifact(payload)
+        bundle = signer.sign_dsse(statement)
 
     return bundle.to_json()

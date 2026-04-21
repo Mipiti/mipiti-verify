@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .client import MipitiClient
-from .sigstore_signer import sign_content_hash
+from .sigstore_signer import sign_verification_statement
 from .verifiers import get_verifier
 
 console = Console(stderr=True)
@@ -100,19 +100,36 @@ class Runner:
         self.changed_files = changed_files
         self.concurrency = max(1, concurrency)
 
-    def _sign_with_sigstore(self, content_hash: str) -> str:
-        """Convert the OIDC token into a Sigstore bundle (keyless signing).
+    def _sign_with_sigstore(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> str:
+        """Build a DSSE attestation for this tier's run and wrap it in a
+        Sigstore bundle.
 
         Returns the bundle as a JSON string, or "" when no OIDC token is
         available (self-hosted / non-OIDC CI). Failures are logged and also
-        return "" — the run still submits; it just lacks attestation.
+        return "" — the run still submits; it just lacks attestation. The
+        bundle's DSSE envelope carries the assertion + verdict payload
+        directly, making it self-contained for offline auditor verification.
         """
         if not self.oidc_token:
             return ""
         try:
-            return sign_content_hash(
+            return sign_verification_statement(
                 self.oidc_token,
-                content_hash,
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
                 tuf_url=self.sigstore_tuf_url,
                 trust_config_path=self.sigstore_trust_config_path,
             )
@@ -130,13 +147,22 @@ class Runner:
         t1_results, t1_details, t1_assertions = self._run_tier(model_id, tier=1)
         details.extend(t1_details)
 
+        pipeline = _pipeline_metadata()
+
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t1_assertions, t1_results)
-            bundle = self._sign_with_sigstore(content_hash)
+            bundle = self._sign_with_sigstore(
+                model_id=model_id,
+                tier=1,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=t1_assertions,
+                results=t1_results,
+            )
             resp = self.client.submit_results(
                 model_id,
-                pipeline=_pipeline_metadata(),
+                pipeline=pipeline,
                 results=t1_results,
                 bundle=bundle,
                 content_hash=content_hash,
@@ -150,10 +176,17 @@ class Runner:
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t2_assertions, t2_results)
-            bundle = self._sign_with_sigstore(content_hash)
+            bundle = self._sign_with_sigstore(
+                model_id=model_id,
+                tier=2,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=t2_assertions,
+                results=t2_results,
+            )
             resp = self.client.submit_results(
                 model_id,
-                pipeline=_pipeline_metadata(),
+                pipeline=pipeline,
                 results=t2_results,
                 bundle=bundle,
                 content_hash=content_hash,
