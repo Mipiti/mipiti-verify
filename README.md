@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: Mipiti/mipiti-verify@e26340a7e0ee7b69ba47d82bf61a44be6d163eca # v0.30.4
+      - uses: Mipiti/mipiti-verify@bbbd156391d15656dc915bd5b04df9d31ea39e6c # v0.30.6
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}
