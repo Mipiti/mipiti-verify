@@ -9,6 +9,40 @@ import httpx
 
 DEFAULT_BASE_URL = "https://api.mipiti.io"
 
+# How much of the response body to surface in the diagnostic message on
+# HTTP errors. Trimmed because some endpoints return verbose validation
+# detail (e.g. FastAPI's 422 with per-field errors) and we don't want to
+# spam CI logs, but enough to identify the root cause.
+_ERROR_BODY_PREVIEW_CHARS = 2000
+
+
+def _raise_for_status_with_body(resp: httpx.Response) -> None:
+    """Drop-in replacement for ``resp.raise_for_status()`` that surfaces
+    the response body in the raised exception.
+
+    Stock httpx prints only the status line + URL on error, which makes
+    diagnosing 4xx/5xx from the API painful — a 422 from FastAPI carries
+    the failing field path and message in the body, but the default error
+    swallows it. This helper preserves the same exception type
+    (``httpx.HTTPStatusError``) so callers that catch it still work, but
+    enriches the message with up to ``_ERROR_BODY_PREVIEW_CHARS`` of
+    response content.
+    """
+    if not resp.is_error:
+        return
+    try:
+        body = resp.text or "(empty body)"
+    except Exception as e:
+        body = f"(could not read body: {e})"
+    if len(body) > _ERROR_BODY_PREVIEW_CHARS:
+        body = body[:_ERROR_BODY_PREVIEW_CHARS] + " …(truncated)"
+    raise httpx.HTTPStatusError(
+        f"HTTP {resp.status_code} {resp.reason_phrase} for {resp.request.url}\n"
+        f"Response body: {body}",
+        request=resp.request,
+        response=resp,
+    )
+
 
 class MipitiClient:
     """Sync httpx client for pulling pending assertions and submitting results."""
@@ -61,7 +95,7 @@ class MipitiClient:
             f"/api/models/{model_id}/verification/pending",
             params=params,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -80,7 +114,7 @@ class MipitiClient:
             f"/api/models/{model_id}/verification/assertions",
             params=params,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -123,7 +157,7 @@ class MipitiClient:
             f"/api/models/{model_id}/verification/results",
             json=body,
         )
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -133,7 +167,7 @@ class MipitiClient:
     def list_models(self) -> list[dict[str, Any]]:
         """GET /api/models — list models accessible by this API key's workspace."""
         resp = self._client.get("/api/models")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -143,7 +177,7 @@ class MipitiClient:
     def get_model(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id} — full model with controls."""
         resp = self._client.get(f"/api/models/{model_id}")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     def get_controls(self, model_id: str, component_id: str = "") -> dict[str, Any]:
@@ -152,13 +186,13 @@ class MipitiClient:
         if component_id:
             params["component_id"] = component_id
         resp = self._client.get(f"/api/models/{model_id}/controls", params=params)
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
     def get_verification_report(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id}/verification/report"""
         resp = self._client.get(f"/api/models/{model_id}/verification/report")
-        resp.raise_for_status()
+        _raise_for_status_with_body(resp)
         return resp.json()
 
 
