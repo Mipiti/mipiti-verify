@@ -113,3 +113,84 @@ class TestMipitiClient:
     def test_context_manager(self):
         with MipitiClient(api_key="test-key", base_url="https://test.example.com") as client:
             assert client.api_key == "test-key"
+
+
+class TestErrorBodyEcho:
+    """Stock httpx ``raise_for_status()`` swallows the response body, so a
+    422 from the API surfaces as ``Client error '422 Unprocessable Entity'
+    for url ...`` with no diagnostic detail. These tests pin the
+    enrichment: the same exception type is raised, but the message now
+    carries the response body up to a 2KB preview.
+    """
+
+    @respx.mock
+    def test_submit_results_422_includes_body(self):
+        body = (
+            '{"detail":[{"loc":["body","bundle"],"msg":"String should have at most '
+            '65536 characters","type":"string_too_long"}]}'
+        )
+        respx.post("https://test.example.com/api/models/m1/verification/results").mock(
+            return_value=httpx.Response(422, text=body, headers={"content-type": "application/json"}),
+        )
+        client = MipitiClient(api_key="test-key", base_url="https://test.example.com")
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                client.submit_results("m1", pipeline={"provider": "github_actions"}, results=[], content_hash="sha256:abc")
+        finally:
+            client.close()
+        # Caller still sees an HTTPStatusError so existing handlers work.
+        msg = str(excinfo.value)
+        assert "422" in msg
+        # Diagnostic body MUST be present — that's the whole point of this fix.
+        assert "string_too_long" in msg
+        assert "bundle" in msg
+        # Response object preserved for callers that inspect it.
+        assert excinfo.value.response.status_code == 422
+
+    @respx.mock
+    def test_get_pending_500_includes_body(self):
+        respx.get("https://test.example.com/api/models/m1/verification/pending").mock(
+            return_value=httpx.Response(500, text="upstream timeout"),
+        )
+        client = MipitiClient(api_key="test-key", base_url="https://test.example.com")
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                client.get_pending("m1", tier=1)
+        finally:
+            client.close()
+        assert "500" in str(excinfo.value)
+        assert "upstream timeout" in str(excinfo.value)
+
+    @respx.mock
+    def test_long_body_truncated(self):
+        """Verbose validation responses (e.g. nested per-field errors on
+        large submissions) get trimmed to keep CI logs readable."""
+        long_body = "x" * 5000
+        respx.get("https://test.example.com/api/models/m1/verification/pending").mock(
+            return_value=httpx.Response(400, text=long_body),
+        )
+        client = MipitiClient(api_key="test-key", base_url="https://test.example.com")
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                client.get_pending("m1", tier=1)
+        finally:
+            client.close()
+        msg = str(excinfo.value)
+        assert "truncated" in msg
+        # Truncation kicks in at 2000 chars; should be far below the 5000 input.
+        assert len(msg) < 3000
+
+    @respx.mock
+    def test_empty_body_does_not_crash(self):
+        """A 4xx with no body still raises with a sensible message."""
+        respx.get("https://test.example.com/api/models/m1/verification/pending").mock(
+            return_value=httpx.Response(403, text=""),
+        )
+        client = MipitiClient(api_key="test-key", base_url="https://test.example.com")
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                client.get_pending("m1", tier=1)
+        finally:
+            client.close()
+        assert "403" in str(excinfo.value)
+        assert "empty body" in str(excinfo.value)
