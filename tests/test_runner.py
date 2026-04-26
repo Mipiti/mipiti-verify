@@ -452,3 +452,115 @@ class TestPipelineMetadata:
         meta = _pipeline_metadata()
         assert meta["provider"] == "gitlab_ci"
         assert meta["run_id"] == "67890"
+
+
+class TestResolveComponentPath:
+    """`--component` triggers a model fetch to resolve the component's
+    declared `path` and prepend it to `--project-root`. The behavior
+    mirrors how monorepo CI workflows expect to invoke the CLI from
+    the repo root and have assertion paths resolve to the component
+    sub-directory.
+    """
+
+    def _runner(self, **overrides):
+        client = MagicMock()
+        client.key_scope = "verifier"
+        kwargs = dict(client=client, project_root=".", verbose=True)
+        kwargs.update(overrides)
+        return Runner(**kwargs)
+
+    def test_no_component_set_is_noop(self, tmp_path):
+        runner = self._runner(project_root=str(tmp_path))
+        runner.client.get_model = MagicMock()
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+        runner.client.get_model.assert_not_called()
+
+    def test_auto_component_path_disabled_is_noop(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+            auto_component_path=False,
+        )
+        runner.client.get_model = MagicMock()
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+        runner.client.get_model.assert_not_called()
+
+    def test_component_path_joined_to_project_root(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [
+                {"id": "CMP0", "path": "ignore"},
+                {"id": "CMP1", "path": "services/auth"},
+            ],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == sub.resolve()
+
+    def test_component_with_no_path_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": ""}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_component_not_found_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP-MISSING",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "services/auth"}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_model_fetch_failure_keeps_project_root(self, tmp_path):
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(side_effect=RuntimeError("offline"))
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == tmp_path.resolve()
+
+    def test_resolve_is_idempotent(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "services/auth"}],
+        })
+        runner._resolve_component_path("m-1")
+        runner._resolve_component_path("m-1")
+        runner._resolve_component_path("m-1")
+        # Mock called once, not three times — idempotency guards against
+        # re-applying the path-prefix on every tier-N invocation.
+        assert runner.client.get_model.call_count == 1
+        assert runner.project_root == sub.resolve()
+
+    def test_path_with_leading_or_trailing_slash_is_normalized(self, tmp_path):
+        sub = tmp_path / "services" / "auth"
+        sub.mkdir(parents=True)
+        runner = self._runner(
+            project_root=str(tmp_path),
+            component_id="CMP1",
+        )
+        runner.client.get_model = MagicMock(return_value={
+            "components": [{"id": "CMP1", "path": "/services/auth/"}],
+        })
+        runner._resolve_component_path("m-1")
+        assert runner.project_root == sub.resolve()

@@ -68,11 +68,14 @@ class Runner:
         changed_files: set[str] | None = None,
         concurrency: int = 1,
         component_id: str | None = None,
+        auto_component_path: bool = True,
     ) -> None:
         self.client = client
         self.project_root = Path(project_root).resolve()
         self.repo = repo or _auto_detect_repo(self.project_root)
         self.component_id = component_id
+        self.auto_component_path = auto_component_path
+        self._component_path_resolved = False
         self.tier2_provider_name = tier2_provider
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
@@ -134,8 +137,62 @@ class Runner:
             )
             return ""
 
+    def _resolve_component_path(self, model_id: str) -> None:
+        """When ``--component CMP`` is set and the component declares a
+        ``path`` (e.g., ``services/auth`` for a monorepo sub-component),
+        join that path onto ``project_root`` so assertion paths resolve
+        relative to the component's directory.
+
+        Idempotent — safe to call multiple times. No-ops when:
+          - ``--component`` is not set (CLI verifies the whole repo).
+          - ``--no-component-path`` was passed (operator opted out, e.g.
+            because they're already invoking the CLI from the component
+            sub-directory).
+          - the component has no declared ``path`` (component lives at
+            repo root).
+          - the model fetch fails (network error, auth error, etc.) —
+            we log a warning and fall back to the unmodified
+            ``project_root`` rather than abort.
+        """
+        if self._component_path_resolved:
+            return
+        self._component_path_resolved = True
+        if not self.component_id or not self.auto_component_path:
+            return
+        try:
+            model = self.client.get_model(model_id)
+        except Exception as e:
+            if self.verbose:
+                console.print(
+                    f"  [yellow]Could not fetch model to resolve component path: {e}[/yellow]"
+                )
+            return
+        components = model.get("components") or []
+        target = next(
+            (c for c in components if c.get("id") == self.component_id),
+            None,
+        )
+        if target is None:
+            if self.verbose:
+                console.print(
+                    f"  [yellow]Component {self.component_id!r} not found on model;"
+                    " using --project-root as-is[/yellow]"
+                )
+            return
+        comp_path = (target.get("path") or "").strip().strip("/")
+        if not comp_path:
+            return
+        new_root = (self.project_root / comp_path).resolve()
+        if self.verbose:
+            console.print(
+                f"  [dim]Component {self.component_id!r} declares path "
+                f"{comp_path!r} → resolving assertion paths under {new_root}[/dim]"
+            )
+        self.project_root = new_root
+
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
+        self._resolve_component_path(model_id)
         details: list[dict[str, Any]] = []
 
         # --- Tier 1 ---
