@@ -171,7 +171,7 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 
 ## Two-Tier Verification
 
-**Tier 1 (Mechanical)** — deterministic code analysis, no external API calls:
+**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->21<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls:
 - `function_exists`, `class_exists`, `decorator_present`, `function_calls`
 - `pattern_matches`, `pattern_absent`, `import_present`
 - `file_exists`, `file_hash`

@@ -1,0 +1,19 @@
+name: Doc count gate
+
+# Validates that <!--KEY-->VALUE<!--/KEY--> markers in .md files match
+# canonical-counts.sh. Runs on every PR including markdown-only
+# changes — doc drift is exactly the .md case.
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  doc-counts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Run gate
+        run: bash scripts/check-doc-counts.sh
