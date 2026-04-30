@@ -45,6 +45,31 @@ def main() -> None:
 @click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL for private deployments (default: public sigstore.dev)")
 @click.option("--sigstore-trust-config", "sigstore_trust_config_path", default=None, type=click.Path(exists=True, dir_okay=False), help="Path to a pre-downloaded Sigstore ClientTrustConfig JSON (no outbound TUF fetch)")
 @click.option(
+    "--workspace-signing-key",
+    "workspace_signing_key_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    envvar="MIPITI_WORKSPACE_SIGNING_KEY",
+    help=(
+        "PEM ECDSA P-256 private key for workspace-attested submission. "
+        "Used when no OIDC token is available (Jenkins, Buildkite, "
+        "self-managed GitLab without ID tokens), or when "
+        "--signing-prefer=workspace. The matching public key must be "
+        "registered on the Mipiti workspace."
+    ),
+)
+@click.option(
+    "--signing-prefer",
+    default="sigstore",
+    type=click.Choice(["sigstore", "workspace"], case_sensitive=False),
+    help=(
+        "When both an OIDC token and a workspace key are available, prefer "
+        "this signer. Default: sigstore (publicly verifiable transparency "
+        "log). Use 'workspace' to force the ECDSA path (e.g. for policy "
+        "or testing)."
+    ),
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json", "github"], case_sensitive=False),
@@ -83,6 +108,8 @@ def run(
     oidc_token: str | None,
     sigstore_tuf_url: str | None,
     sigstore_trust_config_path: str | None,
+    workspace_signing_key_path: str | None,
+    signing_prefer: str,
     output_format: str,
     dry_run: bool,
     reverify: bool,
@@ -137,25 +164,32 @@ def run(
         if verbose:
             console.print(f"Changed files filter: {len(changed_files)} file(s)")
 
-    runner = Runner(
-        client=client,
-        project_root=project_root,
-        tier2_provider=tier2_provider,
-        tier2_model=tier2_model,
-        tier2_api_key=tier2_api_key,
-        ollama_url=ollama_url,
-        oidc_token=oidc_token,
-        sigstore_tuf_url=sigstore_tuf_url,
-        sigstore_trust_config_path=sigstore_trust_config_path,
-        dry_run=dry_run,
-        reverify=reverify,
-        verbose=verbose,
-        repo=repo,
-        changed_files=changed_files,
-        concurrency=concurrency,
-        component_id=component_id,
-        auto_component_path=auto_component_path,
-    )
+    try:
+        runner = Runner(
+            client=client,
+            project_root=project_root,
+            tier2_provider=tier2_provider,
+            tier2_model=tier2_model,
+            tier2_api_key=tier2_api_key,
+            ollama_url=ollama_url,
+            oidc_token=oidc_token,
+            sigstore_tuf_url=sigstore_tuf_url,
+            sigstore_trust_config_path=sigstore_trust_config_path,
+            workspace_signing_key_path=workspace_signing_key_path,
+            signing_prefer=signing_prefer,
+            dry_run=dry_run,
+            reverify=reverify,
+            verbose=verbose,
+            repo=repo,
+            changed_files=changed_files,
+            concurrency=concurrency,
+            component_id=component_id,
+            auto_component_path=auto_component_path,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        client.close()
+        sys.exit(1)
 
     has_failures = False
     all_reports: list[dict] = []

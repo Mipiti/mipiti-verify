@@ -16,6 +16,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from .client import MipitiClient
 from .sigstore_signer import sign_verification_statement
 from .verifiers import get_verifier
+from .workspace_key_signer import WorkspaceKeySigner
 
 console = Console(stderr=True)
 
@@ -61,6 +62,8 @@ class Runner:
         oidc_token: str | None = None,
         sigstore_tuf_url: str | None = None,
         sigstore_trust_config_path: str | None = None,
+        workspace_signing_key_path: str | None = None,
+        signing_prefer: str = "sigstore",
         dry_run: bool = False,
         reverify: bool = True,
         verbose: bool = False,
@@ -91,12 +94,106 @@ class Runner:
         self.sigstore_trust_config_path = sigstore_trust_config_path or os.environ.get(
             "MIPITI_SIGSTORE_TRUST_CONFIG", ""
         ) or None
+
+        # Workspace-ECDSA fallback signer. Used when:
+        #   (a) no OIDC token is available (Jenkins / Buildkite / self-managed
+        #       GitLab without ID tokens), OR
+        #   (b) the operator explicitly picks workspace-key over sigstore via
+        #       ``signing_prefer="workspace"`` (e.g. policy / testing).
+        # Auto-detected from MIPITI_WORKSPACE_SIGNING_KEY env var when the
+        # CLI flag is omitted, mirroring the `oidc_token` auto-detect pattern.
+        key_path = workspace_signing_key_path or os.environ.get(
+            "MIPITI_WORKSPACE_SIGNING_KEY", ""
+        ) or None
+        self.workspace_signer: WorkspaceKeySigner | None = None
+        if key_path:
+            try:
+                self.workspace_signer = WorkspaceKeySigner(key_path)
+            except ValueError as e:
+                # Bad key file is a hard error — surfacing it as silent fall-
+                # through to "submit unsigned" would defeat the operator's
+                # explicit signing intent.
+                raise ValueError(f"--workspace-signing-key load failed: {e}") from e
+
+        prefer = (signing_prefer or "sigstore").lower()
+        if prefer not in ("sigstore", "workspace"):
+            raise ValueError(
+                f"--signing-prefer must be 'sigstore' or 'workspace' "
+                f"(got {signing_prefer!r})"
+            )
+        self.signing_prefer = prefer
+
         self.dry_run = dry_run
         self._developer_key = client.key_scope == "developer"
         self.reverify = reverify
         self.verbose = verbose
         self.changed_files = changed_files
         self.concurrency = max(1, concurrency)
+
+    def _sign_with_workspace_key(self, content_hash: str) -> tuple[str, str]:
+        """Sign ``content_hash`` with the workspace ECDSA key.
+
+        Returns ``(signature_b64, signed_hex)`` accepted by the backend's
+        ``signature`` + ``signed_hash`` body fields, or ``("", "")`` if no
+        workspace key is configured. Failures are logged and also return
+        empty strings — the run still submits unsigned, mirroring the
+        Sigstore fallback path.
+        """
+        if self.workspace_signer is None:
+            return "", ""
+        try:
+            return self.workspace_signer.sign(content_hash)
+        except Exception as e:
+            console.print(
+                f"  [yellow]Workspace-key signing failed: {e} — submitting without attestation[/yellow]"
+            )
+            return "", ""
+
+    def _choose_attestation(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> tuple[str, str, str]:
+        """Pick the attestation path per ``signing_prefer`` precedence.
+
+        Returns ``(bundle, signature, signed_hash)`` — exactly one of
+        ``bundle`` or (``signature`` + ``signed_hash``) is populated when
+        signing succeeds; all empty when no signer is available or both
+        signers fail. Sigstore wins by default; ``signing_prefer="workspace"``
+        forces the workspace-ECDSA path even when an OIDC token is present.
+        """
+        bundle, signature, signed_hash = "", "", ""
+
+        if self.oidc_token and self.signing_prefer != "workspace":
+            bundle = self._sign_with_sigstore(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+            )
+            if bundle:
+                if self.verbose:
+                    console.print(f"  [dim]Tier {tier} attestation: sigstore[/dim]")
+                return bundle, "", ""
+            # Sigstore failed — fall through to workspace key if available.
+
+        if self.workspace_signer is not None:
+            signature, signed_hash = self._sign_with_workspace_key(content_hash)
+            if signature:
+                if self.verbose:
+                    console.print(f"  [dim]Tier {tier} attestation: workspace-ecdsa[/dim]")
+                return "", signature, signed_hash
+
+        if self.verbose:
+            console.print(f"  [dim]Tier {tier} attestation: none (submitting unsigned)[/dim]")
+        return "", "", ""
 
     def _sign_with_sigstore(
         self,
@@ -204,7 +301,7 @@ class Runner:
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t1_assertions, t1_results)
-            bundle = self._sign_with_sigstore(
+            bundle, signature, signed_hash = self._choose_attestation(
                 model_id=model_id,
                 tier=1,
                 content_hash=content_hash,
@@ -217,6 +314,8 @@ class Runner:
                 pipeline=pipeline,
                 results=t1_results,
                 bundle=bundle,
+                signature=signature,
+                signed_hash=signed_hash,
                 content_hash=content_hash,
             )
             t1_run_id = resp.get("run_id", "")
@@ -228,7 +327,7 @@ class Runner:
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t2_assertions, t2_results)
-            bundle = self._sign_with_sigstore(
+            bundle, signature, signed_hash = self._choose_attestation(
                 model_id=model_id,
                 tier=2,
                 content_hash=content_hash,
@@ -241,6 +340,8 @@ class Runner:
                 pipeline=pipeline,
                 results=t2_results,
                 bundle=bundle,
+                signature=signature,
+                signed_hash=signed_hash,
                 content_hash=content_hash,
             )
             t2_run_id = resp.get("run_id", "")

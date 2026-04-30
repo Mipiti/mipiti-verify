@@ -56,6 +56,14 @@ inputs:
     description: Path to a pre-downloaded Sigstore ClientTrustConfig JSON (out-of-band snapshot, skips all TUF network fetches)
     required: false
     default: ""
+  workspace-signing-key:
+    description: "Path to a PEM ECDSA P-256 private key for workspace-attested submission. Used when no OIDC token is available (e.g. self-hosted runners without id-token: write), or when signing-prefer=workspace. The matching public key must be registered on the Mipiti workspace."
+    required: false
+    default: ""
+  signing-prefer:
+    description: "When both an OIDC token and a workspace key are available, prefer this signer ('sigstore' or 'workspace'). Default: sigstore."
+    required: false
+    default: "sigstore"
 
 outputs:
   content-hash:
@@ -79,3 +87,5 @@ runs:
     INPUT_CONCURRENCY: ${{ inputs.concurrency }}
     INPUT_SIGSTORE_TUF_URL: ${{ inputs.sigstore-tuf-url }}
     INPUT_SIGSTORE_TRUST_CONFIG: ${{ inputs.sigstore-trust-config }}
+    INPUT_WORKSPACE_SIGNING_KEY: ${{ inputs.workspace-signing-key }}
+    INPUT_SIGNING_PREFER: ${{ inputs.signing-prefer }}

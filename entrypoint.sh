@@ -43,4 +43,12 @@ if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
   ARGS="$ARGS --sigstore-trust-config $INPUT_SIGSTORE_TRUST_CONFIG"
 fi
 
+if [ -n "$INPUT_WORKSPACE_SIGNING_KEY" ]; then
+  ARGS="$ARGS --workspace-signing-key $INPUT_WORKSPACE_SIGNING_KEY"
+fi
+
+if [ -n "$INPUT_SIGNING_PREFER" ] && [ "$INPUT_SIGNING_PREFER" != "sigstore" ]; then
+  ARGS="$ARGS --signing-prefer $INPUT_SIGNING_PREFER"
+fi
+
 exec mipiti-verify $ARGS

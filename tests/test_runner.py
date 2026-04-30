@@ -1,10 +1,25 @@
 """Tests for the verification runner."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from mipiti_verify.runner import Runner, _pipeline_metadata
+
+
+def _write_p256_pem(tmp_path: Path) -> Path:
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    p = tmp_path / "ws.pem"
+    p.write_bytes(pem)
+    return p
 
 
 class TestSignWithSigstore:
@@ -564,3 +579,114 @@ class TestResolveComponentPath:
         })
         runner._resolve_component_path("m-1")
         assert runner.project_root == sub.resolve()
+
+
+class TestChooseAttestation:
+    """Precedence dispatch: sigstore vs. workspace-key vs. unsigned.
+
+    Default: OIDC + Sigstore wins; workspace key is the fallback for
+    non-OIDC CIs (Jenkins, Buildkite, self-managed GitLab without ID
+    tokens). ``signing_prefer="workspace"`` forces the ECDSA path even
+    when an OIDC token is available.
+    """
+
+    def _runner(self, **kwargs) -> Runner:
+        client = MagicMock()
+        client.key_scope = "verifier"
+        return Runner(client=client, **kwargs)
+
+    def _call_kwargs(self):
+        return dict(
+            model_id="m-abc",
+            tier=1,
+            content_hash="sha256:" + "ab" * 32,
+            pipeline={"provider": "github_actions"},
+            assertions=[{"id": "asrt_001", "type": "function_exists"}],
+            results=[{"assertion_id": "asrt_001", "tier": 1, "result": "pass"}],
+        )
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_sigstore_wins_by_default(self, mock_sign: MagicMock, tmp_path: Path) -> None:
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle"}'
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == '{"mediaType":"sigstore-bundle"}'
+        assert signature == ""
+        assert signed_hash == ""
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_workspace_picked_when_no_oidc(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        runner = self._runner(
+            oidc_token=None,
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        mock_sign.assert_not_called()
+        assert bundle == ""
+        assert signature  # base64 DER
+        assert signed_hash == "ab" * 32
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_signing_prefer_workspace_skips_sigstore(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+            signing_prefer="workspace",
+        )
+        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        mock_sign.assert_not_called()
+        assert bundle == ""
+        assert signature
+        assert signed_hash == "ab" * 32
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_sigstore_failure_falls_through_to_workspace(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        # Sigstore signing fails (Fulcio unreachable, etc.) — the workspace
+        # key fallback should still produce an attestation rather than
+        # silently submit unsigned, since the operator did configure a key.
+        mock_sign.side_effect = RuntimeError("Fulcio unreachable")
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == ""
+        assert signature
+        assert signed_hash == "ab" * 32
+
+    def test_no_signer_returns_all_empty(self) -> None:
+        runner = self._runner(oidc_token=None)
+        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        assert bundle == ""
+        assert signature == ""
+        assert signed_hash == ""
+
+    def test_invalid_signing_prefer_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="signing-prefer must be"):
+            self._runner(
+                workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+                signing_prefer="bogus",
+            )
+
+    def test_bad_workspace_key_path_raises(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.pem"
+        bad.write_bytes(b"not a PEM")
+        with pytest.raises(ValueError, match="--workspace-signing-key load failed"):
+            self._runner(workspace_signing_key_path=str(bad))
+
+    def test_env_var_picks_up_workspace_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _write_p256_pem(tmp_path)
+        monkeypatch.setenv("MIPITI_WORKSPACE_SIGNING_KEY", str(path))
+        runner = self._runner(oidc_token=None)
+        assert runner.workspace_signer is not None
