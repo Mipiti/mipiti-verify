@@ -1263,22 +1263,22 @@ def audit(
             else:
                 console.print("  [yellow]No content_hash in package — cannot cryptographically verify[/yellow]")
                 # Bundle is present but there is nothing for it to bind
-                # to (no results_hash). Without verifying the bundle
-                # against the actual content hash, neither the identity
-                # policy nor the predicate-field pins (model_id,
-                # commit_sha) execute — so any bundle-binding pin is
-                # silently skipped. Treat as a failure when the auditor
-                # pinned any property whose enforcement requires the
-                # bundle to actually verify.
-                if expected_ci_identity or expected_model_id or expected_commit_sha:
-                    console.print(
-                        "  [red]A bundle-binding pin (--expected-ci-identity / "
-                        "--expected-model-id / --expected-commit-sha) was set "
-                        "but the package has no results_hash for the bundle to "
-                        "bind to. The bundle cannot be cryptographically "
-                        "verified, and pin enforcement is impossible.[/red]"
-                    )
-                    has_failure = True
+                # to (no results_hash). The platform produces bundles
+                # together with content_integrity.results_hash; a
+                # bundle without the corresponding hash is a malformed
+                # / tampered package shape. Fail unconditionally
+                # (regardless of pins) — accepting the package as
+                # VERIFIED via a workspace-ECDSA fallback would emit
+                # "VERIFIED — content intact" while a Sigstore bundle
+                # the auditor sees in the package was effectively
+                # ignored, which is misleading.
+                console.print(
+                    "  [red]The package contains a Sigstore bundle but no "
+                    "content_integrity.results_hash for it to bind to. "
+                    "Refusing to accept a structurally malformed package "
+                    "where the bundle is present but cannot be verified.[/red]"
+                )
+                has_failure = True
 
             console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
             console.print(f"  Not before:       {cert.not_valid_before_utc.isoformat()}")

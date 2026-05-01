@@ -343,16 +343,14 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     ):
         return "FAILED"
 
-    # Bundle present + no results_hash + bundle-binding pin = FAILED.
-    if (
-        bundle is not ABSENT
-        and pkg["results_hash"] is None
-        and (
-            pins["san"] is not None
-            or pins.get("model_id") is not None
-            or pins.get("commit_sha") is not None
-        )
-    ):
+    # Bundle present + no results_hash = FAILED unconditionally.
+    # Stricter rule: a bundle in the package implies the platform
+    # produced a results_hash to go with it; absence is a malformed
+    # / tampered shape. Failing regardless of pin (and regardless of
+    # whether ws_sig provides fallback verification) prevents the
+    # auditor from seeing "VERIFIED — content intact" while a
+    # Sigstore bundle in the package was effectively ignored.
+    if bundle is not ABSENT and pkg["results_hash"] is None:
         return "FAILED"
 
     # Bundle present + model_id pin + predicate.model_id mismatch.

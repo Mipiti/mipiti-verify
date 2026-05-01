@@ -169,12 +169,14 @@ Audit(k, q) ==
          /\ k.bundle.bound_hash # k.results_hash
     THEN "FAILED"
 
-    \* Bundle present but no results_hash to bind to (and a bundle-
-    \* binding pin is set). Without verify_artifact's binding check
-    \* running, neither the SAN/issuer policy nor the predicate-field
-    \* pins (model_id, commit_sha) can be enforced.
+    \* Bundle present but no results_hash to bind to. The platform
+    \* produces bundles together with content_integrity.results_hash;
+    \* a bundle without the corresponding hash is a malformed /
+    \* tampered package shape. Fail unconditionally — a workspace-
+    \* ECDSA fallback path that would otherwise yield VERIFIED is
+    \* not allowed when a Sigstore bundle is also in the package
+    \* but cannot be verified.
     ELSE IF k.bundle # ABSENT /\ k.results_hash = NONE
-         /\ (q.san # NONE \/ q.model_id # NONE \/ q.commit_sha # NONE)
     THEN "FAILED"
 
     \* Bundle present + model_id pin + bundle predicate doesn't match.
@@ -245,15 +247,23 @@ Spec == Init /\ [][Next]_vars
 \* bypass the pin by omitting the bundle. All three pins reduce to
 \* the same property: the bundle's signed material is what's pinned
 \* against, so omitting the bundle defeats the pin.
+\*
+\* The conclusion allows USAGE_ERROR alongside FAILED because I7
+\* (predicate-pin-without-SAN, issuer-without-SAN) returns
+\* USAGE_ERROR before I1's FAILED branch fires. Both verdicts are
+\* non-positive — the safety property is preserved either way.
 I1_SanPinIsBinding ==
     ((pins.san # NONE \/ pins.model_id # NONE \/ pins.commit_sha # NONE)
      /\ pkg.bundle = ABSENT)
-    => Audit(pkg, pins) = "FAILED"
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* I2 — workspace pin requires content_integrity evidence.
+\* Same I7-co-occurrence allowance as I1: when the auditor also has
+\* a co-pin without SAN, USAGE_ERROR fires before the workspace
+\* check; conclusion widens to admit it.
 I2_WorkspacePinIsBinding ==
     (pins.workspace_fp # NONE /\ pkg.ws_sig = ABSENT)
-    => Audit(pkg, pins) = "FAILED"
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* I3 — issuer is never sourced from the bundle's own claim. When a
 \* bundle is present and the auditor's expected issuer (resolved from
@@ -270,11 +280,13 @@ I3_IssuerNeverSelfAttested ==
 \* I4 — workspace fingerprint must equal the canonical fingerprint of
 \* the public key actually used for verification (signing_key_fp), not
 \* the package's claim. Forged-key attacks must FAIL.
+\* Allows USAGE_ERROR for the same reason as I1/I2 (I7 fires first
+\* when a co-pin is set without SAN).
 I4_WorkspaceFpBound ==
     (pins.workspace_fp # NONE
      /\ pkg.ws_sig # ABSENT
      /\ pkg.ws_sig.signing_key_fp # pins.workspace_fp)
-    => Audit(pkg, pins) = "FAILED"
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* I5 — VERIFIED implies actual cryptographic verification ran. A
 \* package with no signatures cannot earn the green VERIFIED verdict.
@@ -301,12 +313,13 @@ I7_SanRequiredForCoPins ==
          \/ pins.commit_sha # NONE))
     => Audit(pkg, pins) = "USAGE_ERROR"
 
-\* I8 — bundle bound_hash matches the package's claimed results_hash
-\* on any positive verdict. Defense-in-depth on top of Sigstore's
-\* verify_artifact (which raises when the bundle's Subject digest
-\* doesn't equal sha256(input_)) — explicitly stating this as an
-\* invariant catches future flow changes that bypass verify_artifact
-\* or pass the wrong artifact bytes to it.
+\* I8 — bundle present + positive verdict ⇒ bundle's bound_hash
+\* equals the package's claimed results_hash. Defense-in-depth on
+\* top of Sigstore's verify_artifact, which raises when the bundle's
+\* Subject digest doesn't equal sha256(input_). With the malformed-
+\* bundle (no results_hash) case now an unconditional FAILED in the
+\* Audit operator, this invariant holds without an ws_sig=ABSENT
+\* exception.
 I8_BundleBoundToResultsHash ==
     (Audit(pkg, pins) \in {"VERIFIED", "PARTIALLY_VERIFIED"}
      /\ pkg.bundle # ABSENT)
@@ -324,15 +337,18 @@ I9_AllPresentSignaturesValid ==
        /\ (pkg.ws_sig = ABSENT \/ pkg.ws_sig.valid)
 
 \* I10 — a bundle present without a results_hash to bind to cannot
-\* yield VERIFIED. The bundle is structurally unverifiable in this
-\* shape (Sigstore's verify_artifact has no artifact bytes to check
-\* against), so the verdict must be either UNVERIFIED (no pin set)
-\* or FAILED (pin set — see step #9 of Audit). The contrapositive:
-\* VERIFIED with a bundle implies the bundle was actually checked
-\* against a hash.
+\* yield a positive verdict. With the strict malformed-bundle rule,
+\* the Audit operator returns FAILED unconditionally for this case
+\* — even when ws_sig is present and would otherwise verify. A
+\* bundle in the package without its corresponding results_hash is
+\* a malformed / tampered shape; refusing it ensures the auditor
+\* doesn't see a "VERIFIED — content intact" verdict on a package
+\* whose bundle was effectively ignored. USAGE_ERROR can still
+\* preempt FAILED when an issuer-alone or predicate-pin-without-SAN
+\* configuration is set.
 I10_UnboundBundleNotVerified ==
     (pkg.bundle # ABSENT /\ pkg.results_hash = NONE)
-    => Audit(pkg, pins) \in {"FAILED", "UNVERIFIED"}
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* I11 — VERIFIED with bundle present and SAN pin set implies the
 \* bundle's SAN equals the pin. Symmetric counterpart of I3 for SAN:
