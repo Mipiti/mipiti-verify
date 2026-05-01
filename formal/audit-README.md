@@ -145,6 +145,13 @@ or by reading the bundle's predicate out-of-band.
   API, the audit fails loudly with a clear error rather than
   silently using the public Sigstore (which would replace the
   auditor's chosen security guarantee).
+- *Strict malformed-bundle rule*. A package containing a Sigstore
+  bundle but no `content_integrity.results_hash` for it to bind to
+  fails the audit unconditionally — regardless of pins or
+  workspace-ECDSA fallback. Without this, the audit could otherwise
+  return "VERIFIED — content intact" via the workspace path while a
+  Sigstore bundle visible in the package was effectively ignored,
+  which would mislead the auditor about what was actually verified.
 
 **Naturally mitigated**:
 - *Malicious customer presenting a forged audit to a third party*. The
