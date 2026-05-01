@@ -1280,12 +1280,64 @@ def audit(
                 )
                 has_failure = True
 
-            console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
-            console.print(f"  Not before:       {cert.not_valid_before_utc.isoformat()}")
-            console.print(f"  Not after:        {cert.not_valid_after_utc.isoformat()}")
-            tlog = bundle.log_entry
-            console.print(f"  Rekor log index:  {tlog.log_index}")
-            console.print(f"  Rekor integrated: {tlog.integrated_time}")
+            # Informational output only — the bundle has already
+            # been cryptographically verified above (verify_dsse +
+            # Subject digest binding + identity / predicate pins).
+            # Each access is wrapped so a sigstore-python attribute
+            # rename doesn't fail the audit verdict on what is
+            # purely human-readable.
+            try:
+                console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
+            except Exception:
+                pass
+            for label, attr in (
+                ("Not before:      ", "not_valid_before_utc"),
+                ("Not after:       ", "not_valid_after_utc"),
+            ):
+                try:
+                    val = getattr(cert, attr).isoformat()
+                    console.print(f"  {label}{val}")
+                except Exception:
+                    pass
+
+            # Rekor entry UUID — derived from the bundle JSON
+            # directly so we don't depend on sigstore-python's
+            # introspection accessors (which were public protobuf
+            # fields in 3.x but are hidden behind a private `_inner`
+            # in 4.x). The bundle JSON path
+            # `verificationMaterial.tlogEntries[0].canonicalizedBody`
+            # is part of the documented sigstore-bundle/v0.3 spec.
+            #
+            # UUID derivation: SHA-256(0x00 || canonicalized_body)
+            # per RFC 6962 leaf hashing — Rekor's Merkle-tree leaf
+            # hash, which is the canonical retrieval key for the
+            # public Rekor API (`rekor-cli get --uuid <UUID>` or
+            # `GET https://rekor.sigstore.dev/api/v1/log/entries/<UUID>`).
+            # log_index is a non-canonical secondary identifier;
+            # UUID is what API consumers should pin against.
+            #
+            # The bundle's inclusion proof is already self-contained
+            # (Merkle path + Rekor-signed checkpoint) and was
+            # verified by verify_dsse — printing the UUID is for
+            # auditors who want an out-of-band cross-check against
+            # the public Rekor log without going through this tool.
+            try:
+                bundle_dict = json.loads(bundle_json)
+                tlog_entries = (
+                    bundle_dict.get("verificationMaterial", {})
+                    .get("tlogEntries", [])
+                )
+                if tlog_entries:
+                    canonical_b64 = tlog_entries[0].get("canonicalizedBody", "")
+                    if canonical_b64:
+                        body_bytes = base64.b64decode(canonical_b64)
+                        leaf_hash = hashlib.sha256(b"\x00" + body_bytes).hexdigest()
+                        console.print(f"  Rekor entry UUID: {leaf_hash}")
+                        console.print(
+                            f"  Independent lookup: rekor-cli get --uuid {leaf_hash}"
+                        )
+            except Exception:
+                pass
         except Exception as e:
             console.print(f"  Bundle:           [red]INVALID — {e}[/red]")
             has_failure = True
