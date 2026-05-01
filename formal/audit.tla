@@ -98,6 +98,16 @@ Verdict == {"VERIFIED", "PARTIALLY_VERIFIED", "UNVERIFIED",
 (* The bundle's own claim about its issuer is NEVER consulted to derive    *)
 (* the expected issuer; doing so would let a forged bundle self-attest.    *)
 (***************************************************************************)
+\* Concrete instantiation of SAN_PREFIX_REGISTRY for TLC. The
+\* CONSTANT declaration above keeps the spec parameterised, but
+\* TLC's .cfg parser rejects inline function/record literals in
+\* CONSTANT assignments — so the .cfg uses the `<-` operator-bind
+\* syntax to replace SAN_PREFIX_REGISTRY with this default at
+\* model-check time. Encodes the same SAN-prefix → issuer mapping
+\* the Python implementation hard-codes (github.com / gitlab.com).
+SAN_PREFIX_REGISTRY_DEFAULT ==
+    [s \in {"san_gh_a", "san_gh_b"} |-> "iss_gh"]
+
 ResolveIssuer(p) ==
     IF p.issuer_explicit # NONE
     THEN p.issuer_explicit
