@@ -22,6 +22,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # NO `id-token: write` here — many runner tests (e.g.
+    # TestChooseAttestation) assume OIDC env vars are absent, and the
+    # runner constructor auto-detects ACTIONS_ID_TOKEN_REQUEST_*
+    # whenever they're present. Granting id-token to this job would
+    # make the auto-detect path fire in tests that explicitly pass
+    # `oidc_token=None`, breaking ~15 assume-no-OIDC tests. The BFS
+    # spec test that needs real Fulcio bundles runs in a separate
+    # job (test-spec-invariants) below.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -41,8 +49,8 @@ jobs:
       - name: Install package and dev extras
         run: pip install --no-deps -e . && pip install pytest pytest-mock respx
 
-      - name: Run tests
-        run: python -m pytest -v
+      - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
+        run: python -m pytest -v --ignore=tests/test_spec_invariants.py
 
       - name: Formal verification (Python BFS + cross-check)
         run: python formal/check_pipeline.py
@@ -53,8 +61,42 @@ jobs:
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
           curl -sL "$TLC_URL" -o tla2tools.jar
           echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
-          echo "--- TLC: reverify=false ---"
+          echo "--- TLC: VerificationPipeline reverify=false ---"
           java -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
-          echo "--- TLC: reverify=true ---"
+          echo "--- TLC: VerificationPipeline reverify=true ---"
           java -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
+          echo "--- TLC: audit (compromised-platform invariants I1-I7) ---"
+          java -jar tla2tools.jar -config audit.cfg -workers auto audit.tla
         working-directory: formal
+
+  test-spec-invariants:
+    # Dedicated job for the audit-spec BFS implementation check
+    # (tests/test_spec_invariants.py). Bundle-present rows mint real
+    # Sigstore bundles via Fulcio using the workflow's own OIDC
+    # token, so this job needs `id-token: write`. Isolated from the
+    # main `test` job so OIDC env vars don't leak into runner tests
+    # that assume their absence. Forks don't get OIDC tokens (GitHub
+    # security model), so fork-PR runs of this job detect the
+    # absence at runtime and skip the bundle rows rather than fail.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned dependencies
+        run: pip install --require-hashes -r requirements.lock
+
+      - name: Install package and dev extras
+        run: pip install --no-deps -e . && pip install pytest pytest-mock respx
+
+      - name: Run audit-spec BFS implementation check
+        run: python -m pytest -v tests/test_spec_invariants.py

@@ -1,6 +1,17 @@
 # Formal Verification
 
-mipiti-verify's verification pipeline is formally verified using TLA+ specifications with independent model checking, exhaustive state exploration, and cross-checks against the real code.
+This directory contains two formal-verification artefacts, each anchored
+on its own TLA+ spec + Python BFS implementation check:
+
+| Artefact | Specifies | Detailed README |
+|---|---|---|
+| **Assertion verification pipeline** (`VerificationPipeline.tla`) | The lifecycle of an assertion through Tier 1 (mechanical) and Tier 2 (semantic/LLM) checks, plus reverify-mode semantics. | This README. |
+| **Audit verifier** (`audit.tla`) | The compromised-platform threat model for `mipiti-verify audit`: identity pinning, predicate pinning, fail-closed validations, and 13 invariants over the verifier's verdict function. | [`audit-README.md`](./audit-README.md) |
+
+The rest of this README covers the assertion-verification-pipeline
+artefact. mipiti-verify's verification pipeline is formally verified
+using TLA+ specifications with independent model checking, exhaustive
+state exploration, and cross-checks against the real code.
 
 ## Why formal verification?
 
@@ -78,3 +89,6 @@ Both run automatically in CI on every commit (see `.github/workflows/ci.yml`).
 | `VerificationPipeline.cfg` | TLC configuration — default mode (reverify=false) |
 | `VerificationPipeline_reverify.cfg` | TLC configuration — reverify mode (reverify=true) |
 | `check_pipeline.py` | Python checker — BFS + cross-checks + model-based testing + AST proofs (runs both modes) |
+| `audit.tla` | TLA+ specification — audit verifier's compromised-platform defense (13 invariants I1–I13) |
+| `audit.cfg` | TLC configuration for `audit.tla` |
+| `audit-README.md` | Detailed README for the audit-verifier formal artefact (threat model, invariant catalogue, pin-layering table, BFS coverage in CI with real Fulcio) |
