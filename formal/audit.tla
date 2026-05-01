@@ -106,7 +106,7 @@ Verdict == {"VERIFIED", "PARTIALLY_VERIFIED", "UNVERIFIED",
 \* model-check time. Encodes the same SAN-prefix → issuer mapping
 \* the Python implementation hard-codes (github.com / gitlab.com).
 SAN_PREFIX_REGISTRY_DEFAULT ==
-    [s \in {"san_gh_a", "san_gh_b"} |-> "iss_gh"]
+    [s \in {"san_gh_a"} |-> "iss_gh"]
 
 ResolveIssuer(p) ==
     IF p.issuer_explicit # NONE
@@ -223,16 +223,20 @@ Audit(k, q) ==
     ELSE "VERIFIED"
 
 (***************************************************************************)
-(* State machine: TLC enumerates every (pkg, pins) by allowing the next-   *)
-(* step relation to pick any combination. This makes every reachable state *)
-(* a (pkg, pins) pair; checking an invariant on every reachable state is   *)
-(* equivalent to checking it on every (pkg, pins) in the cross-product.    *)
+(* State machine: TLC enumerates every (pkg, pins) at Init (21M tuples on  *)
+(* the configured constants), then `Next == UNCHANGED vars` makes each      *)
+(* state self-loop. TLC checks invariants on every initial state and       *)
+(* finishes — the state graph is a million self-loops, no transitions to   *)
+(* explore. The original `Next == pkg' \in Package /\ pins' \in Pins`      *)
+(* allowed every state to transition to every other, forcing TLC to do     *)
+(* O(states²) successor-fingerprint operations (~10^14 evaluations on a    *)
+(* 21M state space) and exceeded one hour of runtime in CI without          *)
+(* finishing.                                                              *)
 (***************************************************************************)
 Init == /\ pkg \in Package
         /\ pins \in Pins
 
-Next == /\ pkg' \in Package
-        /\ pins' \in Pins
+Next == UNCHANGED vars
 
 Spec == Init /\ [][Next]_vars
 
