@@ -17,6 +17,70 @@ from .runner import Runner
 # Python buffers stdout/stderr when not connected to a TTY (CI, pipes, subprocesses).
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+
+# SAN-prefix → OIDC-issuer registry. Maps the auditor-pinned SAN to
+# the issuer the auditor implicitly trusts when they pin that SAN
+# (e.g. pinning `https://github.com/Customer/...` means the auditor
+# trusts only GitHub Actions OIDC for that workflow). Defense-in-depth
+# on top of Fulcio's own issuer↔SAN-prefix policy: if Fulcio policy
+# ever drifts to accept a non-GitHub OIDC token for a github.com SAN,
+# this registry catches the divergence at the auditor.
+#
+# We deliberately do NOT read the bundle's own OIDC-issuer cert
+# extension to derive the expected issuer. The bundle's own claim
+# about its issuer is exactly what `policy.Identity()` is supposed
+# to verify — using it as the expected value would let a forged
+# bundle declare any issuer it likes and pass the pin trivially.
+#
+# Self-hosted issuers (GitHub Enterprise Server, self-managed GitLab)
+# don't appear here — auditors using those must pass --expected-issuer
+# explicitly, the same way they pass an explicit --expected-ci-identity
+# for those environments.
+_KNOWN_ISSUER_BY_SAN_PREFIX = {
+    "https://github.com/": "https://token.actions.githubusercontent.com",
+    "https://gitlab.com/": "https://gitlab.com",
+}
+
+
+def _infer_issuer(expected_ci_identity: str | None) -> str | None:
+    """Infer the OIDC issuer from the auditor-pinned SAN.
+
+    Returns the issuer URL when the SAN matches a known prefix
+    (github.com, gitlab.com), None otherwise. Auditors with
+    self-hosted issuers must pass --expected-issuer explicitly.
+    """
+    if not expected_ci_identity:
+        return None
+    for prefix, issuer in _KNOWN_ISSUER_BY_SAN_PREFIX.items():
+        if expected_ci_identity.startswith(prefix):
+            return issuer
+    return None
+
+
+def _derive_ci_identity_from_env() -> str | None:
+    """Derive a Fulcio SAN from CI env vars when running inside a known
+    CI provider. Returns None if no recognized env present.
+
+    GitHub Actions:
+        SAN = ${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}
+        e.g. https://github.com/owner/repo/.github/workflows/verify.yml@refs/heads/main
+        (GITHUB_WORKFLOW_REF format already includes the repo + path + @ref)
+
+    GitLab CI:
+        SAN = ${CI_PROJECT_URL}//${CI_CONFIG_PATH}@${CI_COMMIT_REF_NAME}
+        e.g. https://gitlab.com/group/project//.gitlab-ci.yml@main
+    """
+    gh_server = os.environ.get("GITHUB_SERVER_URL", "")
+    gh_workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    if gh_server and gh_workflow_ref:
+        return f"{gh_server}/{gh_workflow_ref}"
+    gl_url = os.environ.get("CI_PROJECT_URL", "")
+    gl_path = os.environ.get("CI_CONFIG_PATH", "")
+    gl_ref = os.environ.get("CI_COMMIT_REF_NAME", "")
+    if gl_url and gl_path and gl_ref:
+        return f"{gl_url}//{gl_path}@{gl_ref}"
+    return None
+
 console = Console()
 
 
@@ -688,8 +752,142 @@ def _audit_html_report(content: str, key_url: str) -> None:
 @main.command()
 @click.argument("package_file", type=click.Path(exists=True))
 @click.option("--key-url", default="", help="JWKS URL for the Mipiti instance (e.g. https://api.mipiti.io/.well-known/jwks)")
-@click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL — pin a frozen root for air-gapped verification. Default: public sigstore.dev.")
-def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None:
+@click.option(
+    "--sigstore-tuf-url",
+    default=None,
+    help=(
+        "Custom Sigstore TUF root URL — fetches trust metadata from this URL "
+        "instead of the public Sigstore production at audit time. ONLINE: the "
+        "audit reaches out to the URL on every invocation. For fully offline "
+        "/ air-gapped verification, use --sigstore-trust-config with a "
+        "pre-downloaded ClientTrustConfig JSON file. Mutually exclusive with "
+        "--sigstore-trust-config (if both are supplied, --sigstore-trust-config "
+        "wins). If your sigstore-python build doesn't expose the trust-config "
+        "API, this flag fails loudly rather than silently falling back to "
+        "public Sigstore."
+    ),
+)
+@click.option(
+    "--sigstore-trust-config",
+    "sigstore_trust_config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Path to a pre-downloaded Sigstore ClientTrustConfig JSON file. Use "
+        "this for fully offline / air-gapped verification — no outbound "
+        "request to any Sigstore TUF host at audit time. Obtain the file "
+        "out-of-band (e.g., snapshot the public TUF state into a file via the "
+        "sigstore CLI), commit it to the audit-running repository, and pin it "
+        "with this flag."
+    ),
+)
+@click.option(
+    "--expected-model-id",
+    "expected_model_id",
+    default=None,
+    help=(
+        "Pin the expected Mipiti model ID on the bundle's in-toto DSSE "
+        "predicate. Defends against cross-model substitution: a real, "
+        "cryptographically-valid audit package for a different model cannot "
+        "be passed off as the auditor's intended model. The model ID is "
+        "extracted from the bundle's signed predicate, not from the "
+        "package's outer metadata (which is unsigned)."
+    ),
+)
+@click.option(
+    "--expected-commit-sha",
+    "expected_commit_sha",
+    default=None,
+    help=(
+        "Pin the expected source-code commit SHA on the bundle's in-toto "
+        "DSSE predicate's pipeline.commit_sha. Defends against replay: a "
+        "real, cryptographically-valid audit package from an older "
+        "verification run (different commit) cannot be passed off as an "
+        "audit of the release the auditor is certifying. The commit SHA "
+        "lives in the bundle's signed predicate, so attackers cannot forge "
+        "it without the customer's CI OIDC."
+    ),
+)
+@click.option(
+    "--expected-ci-identity",
+    "expected_ci_identity",
+    default=None,
+    envvar="MIPITI_VERIFY_CI_IDENTITY",
+    help=(
+        "Pin the expected Fulcio Subject Alternative Name on every embedded "
+        "Sigstore bundle in the audit package. Defends against the 'compromised "
+        "Mipiti' scenario: a fabricated report containing a Sigstore bundle bound "
+        "to an attacker-controlled Fulcio identity will fail verification because "
+        "its SAN will not match the customer's known CI identity. Example: "
+        "'https://github.com/Customer/repo/.github/workflows/verify.yml@refs/heads/main'. "
+        "Reads MIPITI_VERIFY_CI_IDENTITY env var when omitted — convenient for "
+        "audit-running CI workflows that pin to a different generator workflow. "
+        "See --ci-identity-from-env for auto-derivation in single-workflow setups."
+    ),
+)
+@click.option(
+    "--ci-identity-from-env",
+    "ci_identity_from_env",
+    is_flag=True,
+    default=False,
+    help=(
+        "Auto-derive --expected-ci-identity from CI env vars when running in a "
+        "known CI provider (GitHub Actions, GitLab CI). Use when the workflow "
+        "running 'mipiti-verify audit' IS the same workflow that produced the "
+        "report being audited (single-workflow defense check). For audit "
+        "running in a different workflow than generation, set MIPITI_VERIFY_CI_IDENTITY "
+        "explicitly to the generator workflow's SAN instead. Reusable workflow "
+        "caveat: GITHUB_WORKFLOW_REF refers to the *caller's* workflow, while "
+        "Fulcio binds the SAN to the workflow that actually executed — when "
+        "auditing inside a reusable workflow stack, pin --expected-ci-identity "
+        "explicitly to the SAN Fulcio actually issued for."
+    ),
+)
+@click.option(
+    "--expected-issuer",
+    "expected_issuer",
+    default=None,
+    help=(
+        "Pin the expected OIDC issuer on every embedded Sigstore bundle. "
+        "Optional for github.com / gitlab.com SANs — derived from the "
+        "auditor-pinned SAN prefix. Required for self-hosted issuers "
+        "(GitHub Enterprise Server, self-managed GitLab) where the SAN "
+        "prefix doesn't unambiguously identify the issuer. The issuer "
+        "is NOT read from the bundle's own cert claim — that would let "
+        "a forged bundle declare any issuer it likes. Examples: "
+        "'https://token.actions.githubusercontent.com' for GitHub Actions, "
+        "'https://gitlab.com' for GitLab.com, "
+        "'https://gitlab.example.com' for self-managed GitLab."
+    ),
+)
+@click.option(
+    "--expected-workspace-key",
+    "expected_workspace_key_fingerprint",
+    default=None,
+    help=(
+        "Pin the expected workspace ECDSA public-key fingerprint on every "
+        "embedded workspace-signed submission. Defends against the 'compromised "
+        "Mipiti' scenario: a fabricated report containing a workspace signature "
+        "from an attacker-held key will fail verification because the "
+        "recomputed fingerprint of the public key actually used for "
+        "verification will not match the customer's known workspace key. "
+        "The fingerprint is the SHA-256 hex of the DER SubjectPublicKeyInfo "
+        "encoding of the workspace's registered public key (visible in the "
+        "workspace settings UI)."
+    ),
+)
+def audit(
+    package_file: str,
+    key_url: str,
+    sigstore_tuf_url: str | None,
+    sigstore_trust_config_path: str | None,
+    expected_model_id: str | None,
+    expected_commit_sha: str | None,
+    expected_ci_identity: str | None,
+    ci_identity_from_env: bool,
+    expected_issuer: str | None,
+    expected_workspace_key_fingerprint: str | None,
+) -> None:
     """Verify an audit package or signed HTML report independently.
 
     For HTML reports: verifies the ECDSA document signature, proving the
@@ -701,9 +899,108 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
     results with reasoning. Verification is fully offline once the Sigstore
     trust root has been cached on the verifying host; use --sigstore-tuf-url
     to point at a pinned trust root for air-gapped review.
+
+    Identity pinning (defense against compromised-platform forgery): pin the
+    customer's expected upstream identity via --expected-ci-identity or
+    --ci-identity-from-env (Sigstore submissions) and/or --expected-workspace-key
+    (workspace-ECDSA submissions). With these pins, a fabricated report
+    containing upstream evidence bound to a different identity than the
+    customer's CI fails verification regardless of how clean the platform's
+    outer signature appears. The OIDC issuer is derived from the auditor-
+    pinned SAN's prefix (github.com → GitHub Actions, gitlab.com → GitLab);
+    self-hosted issuers require explicit --expected-issuer. Workspace-key
+    pinning recomputes the fingerprint from the public key actually used
+    for verification, so a forged package cannot pass the pin by attaching
+    an attacker-held key while claiming the customer's fingerprint.
     """
+    # Resolve --ci-identity-from-env to an explicit SAN. Precedence:
+    # explicit flag (or MIPITI_VERIFY_CI_IDENTITY env var) > auto-derive
+    # flag > none. When both are set we surface a notice on divergence
+    # so the auditor knows which value actually took effect.
+    if ci_identity_from_env:
+        derived = _derive_ci_identity_from_env()
+        if not expected_ci_identity:
+            if derived:
+                expected_ci_identity = derived
+                console.print(
+                    f"[dim]--ci-identity-from-env: auto-derived {derived!r} from CI env[/dim]"
+                )
+            else:
+                console.print(
+                    "[red]Error:[/red] --ci-identity-from-env set but no recognized CI "
+                    "env vars present (GITHUB_WORKFLOW_REF, CI_PROJECT_URL, …). Either "
+                    "run inside GitHub Actions / GitLab CI, or pin --expected-ci-identity "
+                    "explicitly."
+                )
+                raise SystemExit(2)
+        elif derived and derived != expected_ci_identity:
+            console.print(
+                f"[yellow]Note: --ci-identity-from-env would auto-derive "
+                f"{derived!r}, but explicit --expected-ci-identity / "
+                f"MIPITI_VERIFY_CI_IDENTITY={expected_ci_identity!r} takes "
+                f"precedence.[/yellow]"
+            )
+
+    # Validation: --expected-issuer alone is meaningless. policy.Identity
+    # requires both identity (SAN) and issuer; without a SAN to bind to,
+    # the issuer would be silently dropped (UnsafeNoOp chosen instead).
+    # Treat as a usage error so auditors don't believe they're getting
+    # issuer enforcement when they aren't.
+    if expected_issuer and not expected_ci_identity:
+        console.print(
+            "[red]Error:[/red] --expected-issuer requires --expected-ci-identity "
+            "(or --ci-identity-from-env / MIPITI_VERIFY_CI_IDENTITY). "
+            "Pinning the issuer alone provides no SAN check; the issuer "
+            "is silently unused without a SAN to bind to."
+        )
+        raise SystemExit(2)
+
+    # Validation: --expected-model-id / --expected-commit-sha without
+    # --expected-ci-identity is a usage error. The predicate fields
+    # are signed by Fulcio, but Fulcio signs whatever predicate the
+    # OIDC-token-holder supplies — an attacker minting a bundle under
+    # their *own* CI's OIDC can craft any predicate values matching
+    # the auditor's pins. Without a SAN pin constraining whose OIDC
+    # was used, predicate pins do not provide compromised-platform
+    # defense. The flag's documented purpose is compromised-platform
+    # defense, so accepting this configuration silently would let
+    # misconfiguration ship to production. Same precedent as
+    # --expected-issuer alone (which has zero effect): fail closed.
+    if (expected_model_id or expected_commit_sha) and not expected_ci_identity:
+        console.print(
+            "[red]Error:[/red] --expected-model-id / --expected-commit-sha "
+            "require --expected-ci-identity (or --ci-identity-from-env / "
+            "MIPITI_VERIFY_CI_IDENTITY). Without a SAN pin constraining whose "
+            "OIDC produced the bundle, an attacker minting under their own "
+            "CI's OIDC can craft any predicate values matching your pins — "
+            "the predicate pins offer no compromised-platform defense on "
+            "their own."
+        )
+        raise SystemExit(2)
+
     import hashlib
     import base64
+
+    # Bound the input size before reading. Real audit packages are a
+    # few MB at most (DSSE bundle + assertion results); 64 MB is
+    # generous headroom. Without a cap, a maliciously large file
+    # (gigabytes) could OOM the auditor's CI runner — Click's
+    # `type=click.Path(exists=True)` only validates that the file
+    # exists, not its size.
+    _MAX_PACKAGE_SIZE = 64 * 1024 * 1024
+    try:
+        package_size = os.path.getsize(package_file)
+    except OSError as e:
+        console.print(f"[red]Error:[/red] cannot stat {package_file!r}: {e}")
+        raise SystemExit(1)
+    if package_size > _MAX_PACKAGE_SIZE:
+        console.print(
+            f"[red]Error:[/red] audit package is too large "
+            f"({package_size:,} bytes > {_MAX_PACKAGE_SIZE:,} byte limit). "
+            "Real audit packages are a few MB at most; refusing to load a "
+            "gigabyte-sized file to avoid memory exhaustion."
+        )
+        raise SystemExit(1)
 
     # Force UTF-8 — HTML reports and JSON audit packages are UTF-8 by
     # construction; relying on the platform default (cp1252 on Windows)
@@ -714,23 +1011,72 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
 
     # Detect HTML report vs JSON audit package
     if content.strip().startswith("<!DOCTYPE") or content.strip().startswith("<html"):
+        # Identity-pinning flags only apply to JSON audit packages —
+        # HTML reports don't carry the upstream evidence (Sigstore
+        # bundles, workspace-ECDSA submission signatures) that those
+        # flags pin against. Same fail-closed precedent as
+        # `--expected-issuer` alone: the auditor explicitly asked for
+        # an enforcement that the input format cannot deliver, so
+        # silently proceeding with exit 0 would let a misconfigured
+        # CI gate go green when the pin was effectively dropped.
+        # Auditors who want to verify HTML report integrity should
+        # invoke without pin flags; for compromised-platform defense
+        # they must use a JSON audit package.
+        if (
+            expected_ci_identity
+            or expected_workspace_key_fingerprint
+            or expected_model_id
+            or expected_commit_sha
+        ):
+            console.print(
+                "[red]Error:[/red] identity-pinning flags "
+                "(--expected-ci-identity / --expected-workspace-key / "
+                "--expected-model-id / --expected-commit-sha) only apply to "
+                "JSON audit packages. HTML reports do not carry the upstream "
+                "evidence those flags pin against, so the configuration "
+                "would silently provide no defense. Re-run with a JSON audit "
+                "package, or remove the pin flags if you only need to verify "
+                "HTML report integrity."
+            )
+            raise SystemExit(2)
         _audit_html_report(content, key_url)
         return
 
     pkg = json.loads(content)
 
+    # Defensive: a malformed audit package (top-level not a JSON object,
+    # or required object fields with wrong types) shouldn't crash the
+    # auditor's CI gate with a Python traceback. Treat structural
+    # defects as failures with a clean error message — the security
+    # outcome is the same as a clean rejection (auditor's CI sees a
+    # non-zero exit), and the message is actionable.
+    if not isinstance(pkg, dict):
+        console.print(
+            "[red]Error:[/red] audit package must be a JSON object at the "
+            f"top level (got {type(pkg).__name__}). Refusing to verify a "
+            "structurally-invalid package."
+        )
+        raise SystemExit(1)
+
     console.print("\n[bold]Audit Package Verification[/bold]")
     console.print("=" * 40)
     has_failure = False
+    provenance_verified = False  # Bundle verify_artifact succeeded.
+    content_verified = False  # content_integrity signature verify succeeded.
 
     # --- Provenance ---
     console.print("\n[bold]Provenance (Sigstore)[/bold]")
-    prov = pkg.get("provenance") or {}
+    prov_raw = pkg.get("provenance")
+    prov = prov_raw if isinstance(prov_raw, dict) else {}
     bundle_json = prov.get("bundle", "")
+    if not isinstance(bundle_json, str):
+        bundle_json = ""
     content_hash_str = ""
-    ci = pkg.get("content_integrity") or {}
-    if isinstance(ci, dict):
-        content_hash_str = ci.get("results_hash", "")
+    ci_raw = pkg.get("content_integrity")
+    ci = ci_raw if isinstance(ci_raw, dict) else {}
+    content_hash_str = ci.get("results_hash", "") if isinstance(ci, dict) else ""
+    if not isinstance(content_hash_str, str):
+        content_hash_str = ""
     if bundle_json:
         try:
             from sigstore.models import Bundle, ClientTrustConfig
@@ -739,32 +1085,200 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
             bundle = Bundle.from_json(bundle_json)
             cert = bundle.signing_certificate
 
-            # Cryptographic verification — fully offline once the trust root
-            # is cached. Binds the bundle to the content hash the platform
-            # signed in CI.
+            # Cryptographic verification — fully offline when
+            # --sigstore-trust-config is supplied (no outbound to any
+            # Sigstore TUF host at audit time). Binds the bundle to
+            # the content hash the platform signed in CI.
             if content_hash_str:
-                if sigstore_tuf_url:
-                    trust_config = ClientTrustConfig.from_tuf(sigstore_tuf_url, offline=False)
-                    verifier = Verifier._from_trust_config(trust_config) if hasattr(Verifier, "_from_trust_config") else Verifier.production()
+                # Trust-config resolution priority:
+                #   1. --sigstore-trust-config (frozen JSON, offline).
+                #   2. --sigstore-tuf-url (TUF URL, still online for
+                #      metadata fetch).
+                #   3. Default: public Sigstore production.
+                # When the auditor supplies a custom trust root, use it
+                # — never silently fall back to public Sigstore. The
+                # whole point of the flag is to pin verification against
+                # a specific trust root (air-gapped customer Sigstore,
+                # frozen snapshot, etc.). Falling back would replace the
+                # auditor's chosen security guarantee with the public
+                # one without telling them.
+                if sigstore_trust_config_path or sigstore_tuf_url:
+                    if not hasattr(Verifier, "_from_trust_config"):
+                        raise RuntimeError(
+                            "this build of sigstore-python does not expose "
+                            "Verifier._from_trust_config; --sigstore-tuf-url "
+                            "and --sigstore-trust-config cannot be honored. "
+                            "Upgrade sigstore-python or remove the flag to "
+                            "use the public Sigstore trust root."
+                        )
+                    if sigstore_trust_config_path:
+                        from pathlib import Path
+                        data = Path(sigstore_trust_config_path).read_text(
+                            encoding="utf-8"
+                        )
+                        trust_config = ClientTrustConfig.from_json(data)
+                    else:
+                        trust_config = ClientTrustConfig.from_tuf(
+                            sigstore_tuf_url, offline=False
+                        )
+                    verifier = Verifier._from_trust_config(trust_config)
                 else:
                     verifier = Verifier.production()
-                try:
-                    # UnsafeNoOp: we don't bind to a specific issuer/repo here
-                    # because the auditor may be verifying packages from any
-                    # upstream. Backend submission-time verification already
-                    # enforces the expected identity policy.
-                    verifier.verify_artifact(
-                        input_=content_hash_str.encode("utf-8"),
-                        bundle=bundle,
-                        policy=policy.UnsafeNoOp(),
+                # Identity policy: when the auditor pinned an expected
+                # CI identity client-side, enforce it. Without the pin,
+                # fall back to UnsafeNoOp — defends only against the
+                # weaker threat model of "platform behaving honestly,
+                # is the bundle internally consistent." With the pin,
+                # also defends against "platform compromised, fabricated
+                # bundle from attacker-controlled identity" — the
+                # bundle's Fulcio SAN must match the auditor's known
+                # CI identity, otherwise the platform's outer signature
+                # cannot launder it.
+                #
+                # Issuer resolution: explicit --expected-issuer wins;
+                # otherwise we map the auditor-pinned SAN's prefix to
+                # the known OIDC issuer (github.com, gitlab.com). We
+                # never read the bundle's own claim — that would let
+                # the bundle self-attest its issuer and bypass the pin.
+                # For self-hosted issuers the auditor must pin
+                # --expected-issuer explicitly.
+                resolved_issuer = expected_issuer or _infer_issuer(expected_ci_identity)
+                if expected_ci_identity and not resolved_issuer:
+                    console.print(
+                        "  [red]Identity policy: cannot infer OIDC issuer from "
+                        "the pinned SAN — pin --expected-issuer explicitly "
+                        "(self-hosted GitHub Enterprise Server / self-managed "
+                        "GitLab require this).[/red]"
                     )
-                    console.print("  Bundle signature: [green]VERIFIED[/green]")
-                    console.print("  Rekor inclusion:  [green]VERIFIED[/green] (Merkle proof checked)")
-                except Exception as verr:
-                    console.print(f"  Bundle signature: [red]FAILED — {verr}[/red]")
                     has_failure = True
+                else:
+                    try:
+                        if expected_ci_identity and resolved_issuer:
+                            sig_policy = policy.Identity(
+                                identity=expected_ci_identity,
+                                issuer=resolved_issuer,
+                            )
+                        else:
+                            sig_policy = policy.UnsafeNoOp()
+                        # Use verify_dsse instead of verify_artifact so
+                        # we can extract the in-toto Statement and check
+                        # the auditor's pins on its predicate fields
+                        # (model_id, commit_sha). verify_dsse verifies
+                        # the trust chain, signature, and Rekor inclusion;
+                        # we manually verify the artifact-binding by
+                        # comparing the Statement's Subject digest to
+                        # sha256(content_hash_str.encode()) — the same
+                        # check verify_artifact would perform internally.
+                        payload_type, payload_bytes = verifier.verify_dsse(
+                            bundle, sig_policy
+                        )
+                        if payload_type != "application/vnd.in-toto+json":
+                            raise ValueError(
+                                f"unexpected DSSE payload type: {payload_type!r} "
+                                "(expected 'application/vnd.in-toto+json')"
+                            )
+                        statement = json.loads(payload_bytes)
+                        expected_subject_digest = hashlib.sha256(
+                            content_hash_str.encode("utf-8")
+                        ).hexdigest()
+                        subjects = statement.get("subject", []) or []
+                        if not any(
+                            isinstance(s, dict)
+                            and s.get("digest", {}).get("sha256")
+                            == expected_subject_digest
+                            for s in subjects
+                        ):
+                            raise ValueError(
+                                "Bundle Subject digest does not match "
+                                "sha256(content_integrity.results_hash); the "
+                                "bundle was signed for a different artifact "
+                                "than the package claims."
+                            )
+                        provenance_verified = True
+                        console.print("  Bundle signature: [green]VERIFIED[/green]")
+                        console.print("  Rekor inclusion:  [green]VERIFIED[/green] (Merkle proof checked)")
+                        if expected_ci_identity and resolved_issuer:
+                            issuer_note = "" if expected_issuer else " (issuer derived from SAN prefix)"
+                            console.print(
+                                f"  Identity policy:  [green]MATCHED[/green] "
+                                f"(SAN={expected_ci_identity!r}, issuer={resolved_issuer!r}){issuer_note}"
+                            )
+                        else:
+                            console.print(
+                                "  Identity policy:  [yellow]SKIPPED[/yellow] "
+                                "(no --expected-ci-identity pinned)"
+                            )
+
+                        # Extract predicate fields and check
+                        # --expected-model-id / --expected-commit-sha pins.
+                        # The predicate is part of the in-toto Statement
+                        # signed inside the DSSE envelope, so its fields
+                        # are cryptographically bound (an attacker cannot
+                        # tamper without invalidating the bundle). We do
+                        # NOT read these fields from the package's outer
+                        # JSON metadata — those are unsigned and forgeable.
+                        predicate = statement.get("predicate") or {}
+                        if not isinstance(predicate, dict):
+                            predicate = {}
+                        bundle_model_id = predicate.get("model_id") or ""
+                        pipeline_field = predicate.get("pipeline") or {}
+                        if not isinstance(pipeline_field, dict):
+                            pipeline_field = {}
+                        bundle_commit_sha = pipeline_field.get("commit_sha") or ""
+                        if expected_model_id:
+                            if bundle_model_id == expected_model_id:
+                                console.print(
+                                    f"  Model ID pin:    [green]MATCHED[/green] "
+                                    f"(predicate.model_id = {bundle_model_id!r})"
+                                )
+                            else:
+                                console.print(
+                                    f"  Model ID pin:    [red]MISMATCH[/red] "
+                                    f"(expected {expected_model_id!r}, "
+                                    f"bundle predicate has {bundle_model_id!r}). "
+                                    "The audit package is for a different model "
+                                    "than the auditor pinned."
+                                )
+                                has_failure = True
+                        if expected_commit_sha:
+                            if bundle_commit_sha == expected_commit_sha:
+                                console.print(
+                                    f"  Commit SHA pin:  [green]MATCHED[/green] "
+                                    f"(predicate.pipeline.commit_sha = "
+                                    f"{bundle_commit_sha!r})"
+                                )
+                            else:
+                                console.print(
+                                    f"  Commit SHA pin:  [red]MISMATCH[/red] "
+                                    f"(expected {expected_commit_sha!r}, "
+                                    f"bundle predicate has {bundle_commit_sha!r}). "
+                                    "The audit package binds to a different "
+                                    "commit than the auditor pinned — possible "
+                                    "replay of an older verification run."
+                                )
+                                has_failure = True
+                    except Exception as verr:
+                        console.print(f"  Bundle signature: [red]FAILED — {verr}[/red]")
+                        has_failure = True
             else:
                 console.print("  [yellow]No content_hash in package — cannot cryptographically verify[/yellow]")
+                # Bundle is present but there is nothing for it to bind
+                # to (no results_hash). Without verifying the bundle
+                # against the actual content hash, neither the identity
+                # policy nor the predicate-field pins (model_id,
+                # commit_sha) execute — so any bundle-binding pin is
+                # silently skipped. Treat as a failure when the auditor
+                # pinned any property whose enforcement requires the
+                # bundle to actually verify.
+                if expected_ci_identity or expected_model_id or expected_commit_sha:
+                    console.print(
+                        "  [red]A bundle-binding pin (--expected-ci-identity / "
+                        "--expected-model-id / --expected-commit-sha) was set "
+                        "but the package has no results_hash for the bundle to "
+                        "bind to. The bundle cannot be cryptographically "
+                        "verified, and pin enforcement is impossible.[/red]"
+                    )
+                    has_failure = True
 
             console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
             console.print(f"  Not before:       {cert.not_valid_before_utc.isoformat()}")
@@ -777,28 +1291,79 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
             has_failure = True
     else:
         console.print("  [yellow]No Sigstore provenance in package[/yellow]")
+        # When the auditor pinned any bundle-binding property
+        # (--expected-ci-identity / --expected-model-id /
+        # --expected-commit-sha), the absence of a Sigstore bundle is
+        # itself a failure: a compromised platform fabricating a
+        # report could simply omit the upstream evidence to bypass
+        # pinning. Silently passing on a package with no evidence
+        # defeats the auditor's intent.
+        if expected_ci_identity or expected_model_id or expected_commit_sha:
+            console.print(
+                "  [red]A bundle-binding pin (--expected-ci-identity / "
+                "--expected-model-id / --expected-commit-sha) was set but "
+                "the package carries no Sigstore bundle. Pin enforcement is "
+                "impossible without upstream evidence; a compromised "
+                "platform could fabricate reports without bundles to bypass "
+                "the pin.[/red]"
+            )
+            has_failure = True
 
     # --- Content Integrity ---
     console.print("\n[bold]Content Integrity (ECDSA P-256)[/bold]")
-    ci = pkg.get("content_integrity")
-    if ci and ci.get("signature"):
+    ci_raw = pkg.get("content_integrity")
+    # Normalise to dict-or-None: a malformed package (e.g.,
+    # "content_integrity": "string" or [...]) must not crash audit()
+    # at `ci.get("signature")` below.
+    ci = ci_raw if isinstance(ci_raw, dict) else None
+
+    # Canonical hash binding check — runs whenever the package claims
+    # a results_hash, regardless of signature presence. The Sigstore
+    # bundle (when present) binds to results_hash; if the package's
+    # actual verification_run.results don't canonicalize to that hash,
+    # the bundle is committing to a stale or forged claim and the
+    # package is internally inconsistent. Without this top-level
+    # check, a forged package with a real Sigstore bundle bound to
+    # one hash and tampered results would slip through whenever
+    # content_integrity carried no ECDSA signature.
+    stored_hash = ""
+    if ci and isinstance(ci, dict) and ci.get("results_hash"):
         try:
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import ec
-
-            # Recompute hash from results
-            results = pkg["verification_run"]["results"]
-            canonical = json.dumps(results, sort_keys=True, separators=(",", ":"))
-            computed_hash = f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+            results_for_hash = pkg["verification_run"]["results"]
+            canonical = json.dumps(
+                results_for_hash, sort_keys=True, separators=(",", ":")
+            )
+            computed_hash = (
+                f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+            )
             stored_hash = ci["results_hash"]
-
             console.print(f"  Results hash:    {stored_hash}")
             console.print(f"  Recomputed hash: {computed_hash}")
             if computed_hash == stored_hash:
                 console.print("  Hash match:      [green]YES[/green]")
             else:
-                console.print("  Hash match:      [red]NO — results may have been modified[/red]")
+                console.print(
+                    "  Hash match:      [red]NO — results may have been "
+                    "modified[/red]"
+                )
                 has_failure = True
+        except (KeyError, TypeError) as e:
+            console.print(f"  Hash check:      [red]FAILED — {e}[/red]")
+            has_failure = True
+
+    if ci and ci.get("signature"):
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec
+
+            # stored_hash was set above by the canonical-hash check.
+            # If results_hash was missing entirely, recover here so
+            # the signature verify still has something to check
+            # against — though that case implies a malformed package
+            # (signature without a hash to sign over) and will fail
+            # the verify call shortly after.
+            if not stored_hash:
+                stored_hash = ci.get("results_hash", "")
 
             # Verify signature
             pub_pem = ci.get("public_key_pem", "")
@@ -806,54 +1371,177 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])
                 pub_key.verify(sig, stored_hash.encode(), ec.ECDSA(hashes.SHA256()))
-                console.print(f"  Key fingerprint: {ci.get('key_fingerprint', 'unknown')}")
+                content_verified = True
+                # Recompute the fingerprint from the public key actually
+                # used for verification, using the same canonical
+                # algorithm the platform uses (SHA-256 of the DER
+                # SubjectPublicKeyInfo encoding). Without this, the
+                # package's `key_fingerprint` field is just metadata —
+                # a forged package could attach an attacker-controlled
+                # PEM (which signs anything the attacker wants) and
+                # claim any fingerprint it likes, defeating the
+                # --expected-workspace-key pin.
+                der_bytes = pub_key.public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                computed_fp = hashlib.sha256(der_bytes).hexdigest()
+                claimed_fp = ci.get("key_fingerprint", "")
+                console.print(f"  Key fingerprint: {computed_fp}")
                 console.print("  Signature:       [green]VALID[/green]")
+                if claimed_fp and claimed_fp != computed_fp:
+                    console.print(
+                        f"  Fingerprint:     [red]CLAIM MISMATCH[/red] "
+                        f"(package claims {claimed_fp!r}, "
+                        f"recomputed from public_key_pem is {computed_fp!r}). "
+                        "The package's stated fingerprint does not match the "
+                        "key actually used for verification — possible forgery."
+                    )
+                    has_failure = True
+                # Identity pin: when the auditor supplied
+                # --expected-workspace-key, the recomputed fingerprint
+                # of the public key actually used for verification MUST
+                # match the customer's known workspace key. Mismatch =
+                # either a platform-notarized submission (workspace
+                # path wasn't used) or a forged signature from a
+                # different key. Either way, the auditor wanted strict
+                # matching, so fail loudly.
+                if expected_workspace_key_fingerprint:
+                    if computed_fp == expected_workspace_key_fingerprint:
+                        console.print(
+                            f"  Identity pin:    [green]MATCHED[/green] "
+                            f"(workspace key = {expected_workspace_key_fingerprint!r})"
+                        )
+                    else:
+                        console.print(
+                            f"  Identity pin:    [red]MISMATCH[/red] "
+                            f"(expected {expected_workspace_key_fingerprint!r}, "
+                            f"got {computed_fp!r}). Possible causes: this submission "
+                            "was platform-notarized rather than workspace-signed, "
+                            "or the report was forged with a different key."
+                        )
+                        has_failure = True
+                else:
+                    console.print(
+                        "  Identity pin:    [yellow]SKIPPED[/yellow] "
+                        "(no --expected-workspace-key pinned)"
+                    )
             else:
                 console.print("  [yellow]No public key in package — cannot verify signature[/yellow]")
+                if expected_workspace_key_fingerprint:
+                    console.print(
+                        "  [red]--expected-workspace-key was pinned but the "
+                        "package has no public_key_pem to recompute the "
+                        "fingerprint from.[/red]"
+                    )
+                    has_failure = True
         except Exception as e:
             console.print(f"  Signature:       [red]INVALID — {e}[/red]")
             has_failure = True
     else:
         console.print("  [yellow]No content integrity signature in package[/yellow]")
+        # Same logic as the missing-bundle case: when the auditor pinned
+        # the workspace key, omitting the content_integrity signature is
+        # itself a failure. A compromised platform could otherwise drop
+        # the signature to bypass the pin.
+        if expected_workspace_key_fingerprint:
+            console.print(
+                "  [red]--expected-workspace-key was pinned but the package "
+                "carries no content_integrity signature. The pin's intent "
+                "(workspace-signed submissions) cannot be satisfied without "
+                "a signature to verify.[/red]"
+            )
+            has_failure = True
 
     # --- Results ---
-    results = pkg.get("verification_run", {}).get("results", [])
-    controls_map = pkg.get("controls", {})
-    assertions_map = pkg.get("assertions_by_control", {})
-    sufficiency_map = pkg.get("sufficiency", {})
+    # Normalise pkg sub-fields to their expected types so a forged
+    # package with mismatched types (e.g. `"controls": []` instead of
+    # an object, `"assertions_by_control": "string"`, `"sufficiency":
+    # null`) doesn't crash the auditor's CI gate with AttributeError
+    # mid-loop. Same hardening pattern applied to content_integrity
+    # earlier; the security outcome is unchanged either way (exit
+    # non-zero), but the message stays clean instead of being a Python
+    # traceback.
+    vr_raw = pkg.get("verification_run")
+    vr = vr_raw if isinstance(vr_raw, dict) else {}
+    results_raw = vr.get("results", [])
+    results = results_raw if isinstance(results_raw, list) else []
+    controls_raw = pkg.get("controls")
+    controls_map = controls_raw if isinstance(controls_raw, dict) else {}
+    assertions_raw = pkg.get("assertions_by_control")
+    assertions_map = assertions_raw if isinstance(assertions_raw, dict) else {}
+    sufficiency_raw = pkg.get("sufficiency")
+    sufficiency_map = sufficiency_raw if isinstance(sufficiency_raw, dict) else {}
 
-    # Group results by control
+    # Group results by control. Use defensive .get so that a forged
+    # package with missing fields produces a structural failure rather
+    # than an uncaught KeyError traceback in the auditor's CI gate.
+    # Missing `result` is treated as not-pass — we never want a
+    # structural defect to be silently counted as success.
     by_ctrl: dict = {}
+    malformed_count = 0
     for r in results:
-        aid = r["assertion_id"]
+        if not isinstance(r, dict):
+            malformed_count += 1
+            continue
+        aid = r.get("assertion_id")
+        if not aid:
+            malformed_count += 1
+            continue
         # Find which control this assertion belongs to
         ctrl_id = None
         for cid, asserts in assertions_map.items():
-            if any(a["id"] == aid for a in asserts):
+            if not isinstance(asserts, list):
+                continue
+            if any(isinstance(a, dict) and a.get("id") == aid for a in asserts):
                 ctrl_id = cid
                 break
         by_ctrl.setdefault(ctrl_id or "unknown", []).append(r)
 
-    total_pass = sum(1 for r in results if r["result"] == "pass")
-    total_fail = sum(1 for r in results if r["result"] != "pass")
+    total_pass = sum(
+        1 for r in results
+        if isinstance(r, dict) and r.get("result") == "pass"
+    )
+    total_fail = sum(
+        1 for r in results
+        if not isinstance(r, dict) or r.get("result") != "pass"
+    )
+    if malformed_count:
+        console.print(
+            f"\n  [red]{malformed_count} malformed result entr"
+            f"{'y' if malformed_count == 1 else 'ies'} (missing required "
+            "fields). Treating as failure to avoid silent acceptance of "
+            "structurally-invalid packages.[/red]"
+        )
+        has_failure = True
     ctrl_count = len(by_ctrl)
-    suff_count = sum(1 for s in sufficiency_map.values() if s.get("status") == "sufficient")
-    insuff_count = sum(1 for s in sufficiency_map.values() if s.get("status") == "insufficient")
+    suff_count = sum(
+        1 for s in sufficiency_map.values()
+        if isinstance(s, dict) and s.get("status") == "sufficient"
+    )
+    insuff_count = sum(
+        1 for s in sufficiency_map.values()
+        if isinstance(s, dict) and s.get("status") == "insufficient"
+    )
 
     console.print(f"\n[bold]Results ({len(results)} assertions, {ctrl_count} controls)[/bold]")
 
     for ctrl_id, ctrl_results in sorted(by_ctrl.items()):
-        ctrl = controls_map.get(ctrl_id, {})
+        ctrl_raw = controls_map.get(ctrl_id, {})
+        ctrl = ctrl_raw if isinstance(ctrl_raw, dict) else {}
         desc = ctrl.get("description", "")
         console.print(f"\n  [bold]{ctrl_id}[/bold]  {desc}")
 
         for r in ctrl_results:
-            passed = r["result"] == "pass"
+            passed = r.get("result") == "pass"
             icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
             tier = r.get("tier", "?")
-            details = r.get("details", "")
-            reasoning = r.get("reasoning", details)
-            console.print(f"    {icon} {r['assertion_id']}  Tier {tier} {'PASS' if passed else 'FAIL'}")
+            details_raw = r.get("details", "")
+            details = details_raw if isinstance(details_raw, str) else ""
+            reasoning_raw = r.get("reasoning", details)
+            reasoning = reasoning_raw if isinstance(reasoning_raw, str) else ""
+            aid = r.get("assertion_id", "<unknown>")
+            console.print(f"    {icon} {aid}  Tier {tier} {'PASS' if passed else 'FAIL'}")
             if reasoning:
                 # Show full reasoning for failures, first line for passes
                 if not passed:
@@ -865,7 +1553,8 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
                     console.print(f"      {first_line}")
 
         # Sufficiency
-        suff = sufficiency_map.get(ctrl_id, {})
+        suff_raw = sufficiency_map.get(ctrl_id, {})
+        suff = suff_raw if isinstance(suff_raw, dict) else {}
         suff_status = suff.get("status", "pending")
         suff_details = suff.get("details", "")
         if suff_status == "sufficient":
@@ -878,16 +1567,44 @@ def audit(package_file: str, key_url: str, sigstore_tuf_url: str | None) -> None
             console.print(f"    Sufficiency: [yellow]{suff_status}[/yellow]")
 
     # --- Verdict ---
+    # Emit a verdict that accurately describes what was actually
+    # verified. Without this, a package with no signatures (provenance
+    # missing AND content_integrity missing) and no failed results
+    # would print "VERIFIED — provenance authentic, content intact" —
+    # both claims false. Track which checks succeeded and tailor the
+    # text accordingly.
     console.print()
     if has_failure or total_fail > 0:
         console.print(f"[red bold]Verdict: FAILED[/red bold] — {total_pass}/{len(results)} assertions pass, "
                        f"{suff_count}/{ctrl_count} controls sufficient")
+    elif not provenance_verified and not content_verified:
+        # No cryptographic verification ran. Don't claim authenticity.
+        console.print(
+            f"[yellow bold]Verdict: UNVERIFIED[/yellow bold] — no Sigstore "
+            f"provenance and no content_integrity signature were verified. "
+            f"This package contains no cryptographic evidence of authenticity. "
+            f"{total_pass}/{len(results)} assertions pass, "
+            f"{suff_count}/{ctrl_count} controls sufficient"
+        )
     elif insuff_count > 0:
+        verified_parts = []
+        if provenance_verified:
+            verified_parts.append("provenance authentic")
+        if content_verified:
+            verified_parts.append("content intact")
+        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
         console.print(f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — "
+                       f"{prefix}"
                        f"{total_pass}/{len(results)} assertions pass, "
                        f"{suff_count}/{ctrl_count} controls sufficient ({insuff_count} insufficient)")
     else:
-        console.print(f"[green bold]Verdict: VERIFIED[/green bold] — provenance authentic, content intact, "
+        verified_parts = []
+        if provenance_verified:
+            verified_parts.append("provenance authentic")
+        if content_verified:
+            verified_parts.append("content intact")
+        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+        console.print(f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
                        f"{total_pass}/{len(results)} assertions pass, "
                        f"{suff_count}/{ctrl_count} controls sufficient")
     console.print()
