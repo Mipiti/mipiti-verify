@@ -1115,24 +1115,100 @@ class TestAuditPdfReport:
         assert "Malformed signature block" in result.output
         assert "Traceback" not in result.output
 
-    def test_pdf_with_identity_pin_flags_is_usage_error(self, tmp_path):
-        """Identity-pinning flags (Sigstore SAN, workspace key, model id,
-        commit SHA) are rejected for PDF reports — same fail-closed
-        precedent as the HTML branch — because PDFs don't carry the
-        upstream evidence those flags pin against."""
-        pdf_bytes, _ = self._mint_signed_pdf()
+    def test_pdf_pin_flags_without_envelope_is_usage_error(self, tmp_path):
+        """When the PDF carries no embedded audit envelope, identity-
+        pinning flags (Sigstore SAN, workspace key, model id, commit
+        SHA) are rejected with the fail-closed precedent: the PDF
+        cannot deliver compromised-platform defense without the
+        upstream evidence the flags pin against."""
+        pdf_bytes, _ = self._mint_signed_pdf()  # no envelope
         path = tmp_path / "report.pdf"
         path.write_bytes(pdf_bytes)
         runner = CliRunner()
-        result = runner.invoke(main, [
-            "audit", str(path),
-            "--expected-ci-identity",
-            "https://github.com/example/repo/.github/workflows/x.yml@refs/heads/main",
-        ])
-        assert result.exit_code == 2
+        with self._patch_jwks(self._mint_signed_pdf()[1]):
+            # JWKS gets called for the byte-range signature check; the
+            # second mint's jwk doesn't matter because the test
+            # exercises the post-byte-range usage-error path. Use the
+            # actual jwk for the bytes we wrote:
+            pass
+        # Run with the right jwk:
+        pdf_bytes_again, jwk = self._mint_signed_pdf()
+        path.write_bytes(pdf_bytes_again)
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+                "--expected-ci-identity",
+                "https://github.com/example/repo/.github/workflows/x.yml@refs/heads/main",
+            ])
+        assert result.exit_code == 2, result.output
         out_flat = " ".join(result.output.split())
         assert "identity-pinning flags" in out_flat
-        assert "PDF reports do not carry the upstream" in out_flat
+        assert "audit envelope embedded in the PDF" in out_flat
+
+    def test_pdf_with_envelope_and_no_pin_flags_passes(self, tmp_path):
+        """A PDF carrying a minimal audit envelope (no provenance, no
+        content_integrity) and no pinning flags emits the UNVERIFIED
+        verdict for the embedded JSON audit content but exits 0 — the
+        document signature still verified, and the user didn't ask
+        for compromised-platform defense."""
+        import base64, gzip, json
+        from mipiti_verify.cli import _PDF_AUDIT_START, _PDF_AUDIT_END
+
+        envelope = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": None,
+            "content_integrity": None,
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        env_bytes = base64.b64encode(
+            gzip.compress(json.dumps(envelope, separators=(",", ":")).encode())
+        )
+        # Mint the signed PDF body that includes the envelope between
+        # the AUDIT markers, BEFORE the SIG markers.
+        pdf_body = (
+            b"%PDF-1.7\nfake body\n%%EOF\n"
+            + _PDF_AUDIT_START + env_bytes + _PDF_AUDIT_END
+        )
+        pdf_bytes, jwk = self._mint_signed_pdf(pdf_body=pdf_body)
+        path = tmp_path / "with-envelope.pdf"
+        path.write_bytes(pdf_bytes)
+        runner = CliRunner()
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+            ])
+        assert result.exit_code == 0, result.output
+        # Document signature verified.
+        assert "Report integrity verified" in result.output
+        # AND the JSON-audit dispatch ran on the embedded envelope.
+        assert "Audit Package Verification" in result.output
+
+    def test_pdf_envelope_extraction_malformed_fails_cleanly(self, tmp_path):
+        """Audit envelope start marker present, end marker missing —
+        clean error, no Python traceback."""
+        from mipiti_verify.cli import _PDF_AUDIT_START
+
+        pdf_body = (
+            b"%PDF-1.7\nfake body\n%%EOF\n"
+            + _PDF_AUDIT_START + b"truncated-no-end-marker"
+        )
+        pdf_bytes, jwk = self._mint_signed_pdf(pdf_body=pdf_body)
+        path = tmp_path / "broken-envelope.pdf"
+        path.write_bytes(pdf_bytes)
+        runner = CliRunner()
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+            ])
+        assert result.exit_code == 1
+        assert "Audit envelope start marker found but no end marker" in result.output
+        assert "Traceback" not in result.output
 
     def test_pdf_jwks_missing_key_fails_cleanly(self, tmp_path):
         """JWKS reachable but the fingerprint isn't published — clean

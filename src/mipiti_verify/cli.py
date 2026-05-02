@@ -764,6 +764,52 @@ _PDF_SIG_START = b"\n%MIPITI_PDFSIG_v1{"
 _PDF_SIG_END = b"}MIPITI_PDFSIG_END\n"
 _PDF_SIG_PAYLOAD_LEN = 1024
 
+# Audit envelope embedded in PDFs that need to support identity-pinning
+# flags. Producer gzips + base64-encodes the JSON audit envelope (the
+# same shape `mipiti-verify audit archive.json` consumes) and writes
+# it between these markers BEFORE the signature block — so the byte-
+# range signature naturally covers the envelope bytes.
+_PDF_AUDIT_START = b"\n%MIPITI_AUDIT_v1{"
+_PDF_AUDIT_END = b"}MIPITI_AUDIT_END\n"
+
+
+def _extract_pdf_audit_envelope(pdf_bytes: bytes):
+    """Extract the embedded audit envelope from a signed PDF.
+
+    Returns the parsed envelope dict, or None if no envelope is
+    present (legacy PDFs signed before the envelope was embedded, or
+    PDFs whose embedding got stripped by re-saving).
+
+    On structural defect (malformed base64, malformed gzip, malformed
+    JSON, JSON not a dict) prints a clean error and raises SystemExit
+    rather than letting the caller proceed with a half-parsed pin —
+    the auditor's CI sees a non-zero exit, not a Python traceback.
+    """
+    import base64, gzip, json
+
+    start_idx = pdf_bytes.find(_PDF_AUDIT_START)
+    if start_idx < 0:
+        return None
+    payload_start = start_idx + len(_PDF_AUDIT_START)
+    end_idx = pdf_bytes.find(_PDF_AUDIT_END, payload_start)
+    if end_idx < 0:
+        console.print("  [red]Audit envelope start marker found but no end marker — refusing to proceed.[/red]")
+        raise SystemExit(1)
+
+    encoded = pdf_bytes[payload_start:end_idx]
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        raw = gzip.decompress(compressed)
+        envelope = json.loads(raw)
+    except Exception as e:
+        console.print(f"  [red]Failed to decode audit envelope: {e}[/red]")
+        raise SystemExit(1)
+
+    if not isinstance(envelope, dict):
+        console.print("  [red]Audit envelope is not a JSON object — refusing to proceed.[/red]")
+        raise SystemExit(1)
+    return envelope
+
 
 def _audit_pdf_report(pdf_bytes: bytes, key_url: str) -> None:
     """Verify a signed PDF report (byte-range scheme, JWKS-anchored).
@@ -1089,37 +1135,56 @@ def audit(
     # The signed-PDF scheme appends a byte-range signature after %%EOF
     # which the verifier resolves the same way as the HTML scheme:
     # JWKS-keyed public-key lookup by fingerprint, ECDSA-P256 verify.
+    # When the PDF additionally carries an audit envelope (Sigstore
+    # bundles, workspace-ECDSA signatures, content_integrity payload),
+    # we ALSO dispatch through the JSON audit code path so identity-
+    # pinning flags work end-to-end.
     with open(package_file, "rb") as f:
         head = f.read(8)
     if head.startswith(b"%PDF-"):
-        if (
+        with open(package_file, "rb") as f:
+            pdf_bytes = f.read()
+        _audit_pdf_report(pdf_bytes, key_url)
+
+        envelope = _extract_pdf_audit_envelope(pdf_bytes)
+        pinning_requested = bool(
             expected_ci_identity
             or expected_workspace_key_fingerprint
             or expected_model_id
             or expected_commit_sha
-        ):
-            console.print(
-                "[red]Error:[/red] identity-pinning flags "
-                "(--expected-ci-identity / --expected-workspace-key / "
-                "--expected-model-id / --expected-commit-sha) only apply to "
-                "JSON audit packages. PDF reports do not carry the upstream "
-                "Sigstore / workspace-ECDSA evidence those flags pin against; "
-                "silently proceeding would provide no defense. Re-run with a "
-                "JSON audit package, or remove the pin flags if you only need "
-                "to verify PDF report integrity."
-            )
-            raise SystemExit(2)
-        with open(package_file, "rb") as f:
-            pdf_bytes = f.read()
-        _audit_pdf_report(pdf_bytes, key_url)
-        return
-
-    # Force UTF-8 — HTML reports and JSON audit packages are UTF-8 by
-    # construction; relying on the platform default (cp1252 on Windows)
-    # crashes on any non-ASCII byte in a report (e.g. a curly quote or
-    # em-dash) with UnicodeDecodeError.
-    with open(package_file, encoding="utf-8") as f:
-        content = f.read()
+        )
+        if envelope is None:
+            if pinning_requested:
+                console.print(
+                    "[red]Error:[/red] identity-pinning flags "
+                    "(--expected-ci-identity / --expected-workspace-key / "
+                    "--expected-model-id / --expected-commit-sha) require an "
+                    "audit envelope embedded in the PDF. This PDF carries a "
+                    "valid document signature but no upstream evidence "
+                    "(Sigstore bundles, workspace-ECDSA signatures), so the "
+                    "pinning configuration would silently provide no defense. "
+                    "Re-export the PDF from a Mipiti instance new enough to "
+                    "embed the envelope, or use the JSON audit archive "
+                    "(/api/models/<id>/export/full)."
+                )
+                raise SystemExit(2)
+            return
+        # Envelope present — re-encode as JSON and fall through to the
+        # JSON-audit code path. Setting `content` to the JSON string
+        # naturally avoids the HTML branch (no <!DOCTYPE / <html prefix)
+        # so we land at `pkg = json.loads(content)` below.
+        import json as _j
+        content = _j.dumps(envelope)
+        # Skip past the legacy file-read step; the rest of audit()
+        # continues operating on `content`.
+        # (No return here — fall through to JSON dispatch.)
+    else:
+        # Force UTF-8 — HTML reports and JSON audit packages are UTF-8
+        # by construction; relying on the platform default (cp1252 on
+        # Windows) crashes on any non-ASCII byte (e.g. a curly quote
+        # or em-dash) with UnicodeDecodeError.
+        with open(package_file, encoding="utf-8") as f:
+            content = f.read()
 
     # Detect HTML report vs JSON audit package
     if content.strip().startswith("<!DOCTYPE") or content.strip().startswith("<html"):
