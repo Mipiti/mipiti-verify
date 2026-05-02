@@ -673,6 +673,46 @@ def _github_output(report: dict) -> None:
         click.echo("::endgroup::")
 
 
+def _resolve_pubkey_from_jwks(fingerprint: str, key_url: str):
+    """Fetch the JWKS at `key_url`, find the JWK whose `kid` matches
+    `fingerprint`, and reconstruct an EC public key.
+
+    Defaults to the production Mipiti JWKS endpoint when key_url is
+    empty, mirroring the pre-existing HTML auditor behaviour.
+
+    Returns (public_key, fingerprint, key_url_used). Raises SystemExit
+    on any failure (network error, JWK not present) so the caller can
+    use this from the audit command directly.
+    """
+    import base64
+    if not key_url:
+        key_url = "https://api.mipiti.io/.well-known/jwks"
+        console.print(f"  Using default JWKS: {key_url}")
+    try:
+        import httpx
+        resp = httpx.get(key_url, timeout=10)
+        resp.raise_for_status()
+        jwks = resp.json()
+    except httpx.HTTPError as e:
+        console.print(f"  [red]Failed to fetch JWKS: {e}[/red]")
+        raise SystemExit(1)
+
+    jwk = None
+    for k in jwks.get("keys", []):
+        if k.get("kid") == fingerprint:
+            jwk = k
+            break
+    if jwk is None:
+        console.print(f"  [red]Key {fingerprint[:16]}... not found in JWKS[/red]")
+        raise SystemExit(1)
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    x = int.from_bytes(base64.urlsafe_b64decode(jwk["x"] + "=="), "big")
+    y = int.from_bytes(base64.urlsafe_b64decode(jwk["y"] + "=="), "big")
+    pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
+    return pub_numbers.public_key(), fingerprint, key_url
+
+
 def _audit_html_report(content: str, key_url: str) -> None:
     """Verify a signed HTML report."""
     import base64
@@ -681,9 +721,7 @@ def _audit_html_report(content: str, key_url: str) -> None:
 
     console.print("\n[bold]Signed Report Verification[/bold]")
     console.print("=" * 40)
-    has_failure = False
 
-    # Extract signature from HTML comment
     sig_match = re.search(
         r"<!-- mipiti-report-signature:([a-f0-9]+):([A-Za-z0-9+/=]+) -->\s*$",
         content,
@@ -697,55 +735,94 @@ def _audit_html_report(content: str, key_url: str) -> None:
     sig_b64 = sig_match.group(2)
     console.print(f"  Key fingerprint: {fingerprint}")
 
-    # Strip signature to get the signed content
     signed_content = content[:sig_match.start()]
     content_hash = hashlib.sha256(signed_content.encode("utf-8")).digest()
 
-    # Fetch public key from JWKS endpoint
-    if not key_url:
-        key_url = "https://api.mipiti.io/.well-known/jwks"
-        console.print(f"  Using default JWKS: {key_url}")
+    console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
+    pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
 
-    console.print(f"\n[bold]Document Signature (ECDSA P-256)[/bold]")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes
     try:
-        import httpx
-        resp = httpx.get(key_url, timeout=10)
-        resp.raise_for_status()
-        jwks = resp.json()
-
-        # Find key matching fingerprint
-        jwk = None
-        for k in jwks.get("keys", []):
-            if k.get("kid") == fingerprint:
-                jwk = k
-                break
-
-        if jwk is None:
-            console.print(f"  [red]Key {fingerprint[:16]}... not found in JWKS[/red]")
-            has_failure = True
-        else:
-            # Reconstruct EC public key from JWK
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-
-            x = int.from_bytes(base64.urlsafe_b64decode(jwk["x"] + "=="), "big")
-            y = int.from_bytes(base64.urlsafe_b64decode(jwk["y"] + "=="), "big")
-            pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
-            pub_key = pub_numbers.public_key()
-
-            sig = base64.b64decode(sig_b64)
-            pub_key.verify(sig, content_hash, ec.ECDSA(hashes.SHA256()))
-            console.print("  Signature:       [green]VALID[/green]")
-            console.print("  Document has not been modified since the platform generated it.")
-    except httpx.HTTPError as e:
-        console.print(f"  [red]Failed to fetch JWKS: {e}[/red]")
-        has_failure = True
+        sig = base64.b64decode(sig_b64)
+        pub_key.verify(sig, content_hash, ec.ECDSA(hashes.SHA256()))
+        console.print("  Signature:       [green]VALID[/green]")
+        console.print("  Document has not been modified since the platform generated it.")
     except Exception as e:
         console.print(f"  Signature:       [red]INVALID — {e}[/red]")
-        has_failure = True
-
-    if has_failure:
         raise SystemExit(1)
+
+    console.print("\n[green bold]Report integrity verified.[/green bold]\n")
+
+
+# Byte-range PDF signing scheme: the producer (backend exporter) appends
+# `\n%MIPITI_PDFSIG_v1{<1024-byte payload>}MIPITI_PDFSIG_END\n` after the
+# PDF's %%EOF. Payload = `<fingerprint>:<base64_sig>` space-padded to a
+# fixed length. The signature covers the bytes outside the payload —
+# i.e., the original PDF plus the start/end markers themselves.
+_PDF_SIG_START = b"\n%MIPITI_PDFSIG_v1{"
+_PDF_SIG_END = b"}MIPITI_PDFSIG_END\n"
+_PDF_SIG_PAYLOAD_LEN = 1024
+
+
+def _audit_pdf_report(pdf_bytes: bytes, key_url: str) -> None:
+    """Verify a signed PDF report (byte-range scheme, JWKS-anchored).
+
+    Same trust model as `_audit_html_report`: extract the embedded
+    fingerprint, fetch the public key from JWKS by fingerprint, recompute
+    SHA-256 over the bytes outside the payload, ECDSA-verify.
+    """
+    import base64
+    import hashlib
+
+    console.print("\n[bold]Signed PDF Report Verification[/bold]")
+    console.print("=" * 40)
+
+    start_idx = pdf_bytes.find(_PDF_SIG_START)
+    if start_idx < 0:
+        console.print("  [red]No signature block found in PDF[/red]")
+        console.print("  This PDF was not signed by a Mipiti instance, or the")
+        console.print("  signature was stripped (e.g., re-saved through a")
+        console.print("  different PDF tool, or printed-to-PDF rather than")
+        console.print("  exported from Mipiti directly).")
+        raise SystemExit(1)
+    payload_start = start_idx + len(_PDF_SIG_START)
+    end_idx = pdf_bytes.find(_PDF_SIG_END, payload_start)
+    if end_idx < 0 or (end_idx - payload_start) != _PDF_SIG_PAYLOAD_LEN:
+        console.print("  [red]Malformed signature block in PDF[/red]")
+        console.print(f"  Expected {_PDF_SIG_PAYLOAD_LEN} payload bytes, found "
+                      f"{end_idx - payload_start if end_idx >= 0 else 'no terminator'}.")
+        raise SystemExit(1)
+
+    try:
+        payload = pdf_bytes[payload_start:end_idx].rstrip(b" ").decode("ascii")
+    except UnicodeDecodeError:
+        console.print("  [red]Signature payload contains non-ASCII bytes[/red]")
+        raise SystemExit(1)
+    fingerprint, sep, sig_b64 = payload.partition(":")
+    if not sep or not fingerprint or not sig_b64:
+        console.print("  [red]Signature payload has unexpected shape[/red]")
+        console.print("  Expected `<fingerprint>:<base64_sig>` inside markers.")
+        raise SystemExit(1)
+    console.print(f"  Key fingerprint: {fingerprint}")
+
+    covered = pdf_bytes[:payload_start] + pdf_bytes[end_idx:]
+    content_hash = hashlib.sha256(covered).digest()
+
+    console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
+    pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes
+    try:
+        sig = base64.b64decode(sig_b64)
+        pub_key.verify(sig, content_hash, ec.ECDSA(hashes.SHA256()))
+        console.print("  Signature:       [green]VALID[/green]")
+        console.print("  PDF has not been modified since the platform generated it.")
+    except Exception as e:
+        console.print(f"  Signature:       [red]INVALID — {e}[/red]")
+        raise SystemExit(1)
+
     console.print("\n[green bold]Report integrity verified.[/green bold]\n")
 
 
@@ -888,10 +965,16 @@ def audit(
     expected_issuer: str | None,
     expected_workspace_key_fingerprint: str | None,
 ) -> None:
-    """Verify an audit package or signed HTML report independently.
+    """Verify an audit package, signed HTML report, or signed PDF report.
 
-    For HTML reports: verifies the ECDSA document signature, proving the
-    report has not been modified since the platform generated it.
+    For HTML reports: verifies the ECDSA document signature embedded as a
+    trailing HTML comment, proving the report has not been modified since
+    the platform generated it.
+
+    For PDF reports: verifies the byte-range ECDSA signature appended after
+    the PDF's %%EOF (the same fingerprint-keyed JWKS trust anchor as the
+    HTML scheme — `mipiti-verify audit report.pdf`). PDF readers tolerate
+    the trailing signature block; the rendered document is unchanged.
 
     For JSON audit packages: cryptographically verifies the Sigstore bundle
     (signature chain → Fulcio root; Rekor Merkle inclusion proof; SCT), the
@@ -1001,6 +1084,35 @@ def audit(
             "gigabyte-sized file to avoid memory exhaustion."
         )
         raise SystemExit(1)
+
+    # PDFs are binary; sniff the magic before attempting a UTF-8 read.
+    # The signed-PDF scheme appends a byte-range signature after %%EOF
+    # which the verifier resolves the same way as the HTML scheme:
+    # JWKS-keyed public-key lookup by fingerprint, ECDSA-P256 verify.
+    with open(package_file, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"%PDF-"):
+        if (
+            expected_ci_identity
+            or expected_workspace_key_fingerprint
+            or expected_model_id
+            or expected_commit_sha
+        ):
+            console.print(
+                "[red]Error:[/red] identity-pinning flags "
+                "(--expected-ci-identity / --expected-workspace-key / "
+                "--expected-model-id / --expected-commit-sha) only apply to "
+                "JSON audit packages. PDF reports do not carry the upstream "
+                "Sigstore / workspace-ECDSA evidence those flags pin against; "
+                "silently proceeding would provide no defense. Re-run with a "
+                "JSON audit package, or remove the pin flags if you only need "
+                "to verify PDF report integrity."
+            )
+            raise SystemExit(2)
+        with open(package_file, "rb") as f:
+            pdf_bytes = f.read()
+        _audit_pdf_report(pdf_bytes, key_url)
+        return
 
     # Force UTF-8 — HTML reports and JSON audit packages are UTF-8 by
     # construction; relying on the platform default (cp1252 on Windows)
