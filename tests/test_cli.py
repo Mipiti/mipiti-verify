@@ -1499,3 +1499,186 @@ class TestRekorAnchor:
             ])
         assert result.exit_code == 1
         assert "expected EC/P-256" in result.output
+
+
+class TestRekorEntrySnapshot(TestRekorAnchor):
+    """Snapshot mode: --rekor-entry-snapshot DIR resolves the public
+    key from a local directory of pre-saved Sigstore bundles. Fully
+    offline / air-gapped — no Mipiti, no Rekor, no network access at
+    audit time. Inherits helper methods from TestRekorAnchor."""
+
+    SAN_PIN = (
+        "https://github.com/Mipiti/mipiti/.github/workflows/"
+        "anchor-signing-key.yml@refs/heads/main"
+    )
+
+    def _pubkey_obj(self, priv_key):
+        from cryptography.hazmat.primitives import serialization
+        return serialization.load_pem_public_key(
+            priv_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+
+    def test_snapshot_dir_resolves_html(self, tmp_path):
+        """Two bundles in the snapshot dir; one matches the report's
+        kid. Verifier picks it, validates, succeeds."""
+        from unittest.mock import patch
+
+        k1 = self._key_pair()  # report-signing key (snapshot has it)
+        k2 = self._key_pair()  # decoy bundle for an unrelated kid
+        kid_k1 = self._key_fingerprint(k1)
+        kid_k2 = self._key_fingerprint(k2)
+
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "decoy-k2.sigstore").write_bytes(b"decoy-bundle-bytes")
+        (snapshot_dir / "match-k1.sigstore").write_bytes(b"match-bundle-bytes")
+
+        def fake_verify(bundle_bytes, **kwargs):
+            if bundle_bytes == b"decoy-bundle-bytes":
+                return self._pubkey_obj(k2), kid_k2
+            if bundle_bytes == b"match-bundle-bytes":
+                return self._pubkey_obj(k1), kid_k1
+            raise ValueError("unknown bundle bytes")
+
+        html = self._build_signed_html(k1)
+        report = tmp_path / "report.html"
+        report.write_text(html, encoding="utf-8")
+
+        runner = CliRunner()
+        with patch(
+            "mipiti_verify.cli._verify_anchor_bundle_bytes",
+            side_effect=fake_verify,
+        ):
+            result = runner.invoke(main, [
+                "audit", str(report),
+                "--rekor-entry-snapshot", str(snapshot_dir),
+                "--expected-anchor-identity", self.SAN_PIN,
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Snapshot match:" in result.output
+        assert "Report integrity verified" in result.output
+
+    def test_snapshot_dir_no_match_fails(self, tmp_path):
+        """Snapshot dir has bundles, but none for the report's kid."""
+        from unittest.mock import patch
+
+        k1 = self._key_pair()
+        k2 = self._key_pair()
+        kid_k2 = self._key_fingerprint(k2)
+
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "decoy.sigstore").write_bytes(b"decoy")
+
+        def fake_verify(bundle_bytes, **kwargs):
+            return self._pubkey_obj(k2), kid_k2
+
+        html = self._build_signed_html(k1)
+        report = tmp_path / "report.html"
+        report.write_text(html, encoding="utf-8")
+
+        runner = CliRunner()
+        with patch(
+            "mipiti_verify.cli._verify_anchor_bundle_bytes",
+            side_effect=fake_verify,
+        ):
+            result = runner.invoke(main, [
+                "audit", str(report),
+                "--rekor-entry-snapshot", str(snapshot_dir),
+                "--expected-anchor-identity", self.SAN_PIN,
+            ])
+        assert result.exit_code == 1
+        assert "No bundle in" in result.output
+
+    def test_snapshot_dir_empty_fails(self, tmp_path):
+        """Empty snapshot dir is a clean failure, not a traceback."""
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        report = tmp_path / "report.html"
+        report.write_text(self._build_signed_html(self._key_pair()), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(report),
+            "--rekor-entry-snapshot", str(snapshot_dir),
+            "--expected-anchor-identity", self.SAN_PIN,
+        ])
+        assert result.exit_code == 1
+        assert "no *.sigstore bundle files" in result.output
+        assert "Traceback" not in result.output
+
+    def test_snapshot_skips_bad_bundles(self, tmp_path):
+        """One corrupt bundle in the dir; another is valid and matches.
+        Resolver skips the bad one, picks the good one."""
+        from unittest.mock import patch
+
+        k1 = self._key_pair()
+        kid_k1 = self._key_fingerprint(k1)
+
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "00-broken.sigstore").write_bytes(b"corrupt")
+        (snapshot_dir / "01-good.sigstore").write_bytes(b"good")
+
+        def fake_verify(bundle_bytes, **kwargs):
+            if bundle_bytes == b"corrupt":
+                raise ValueError("synthetic-corrupt")
+            return self._pubkey_obj(k1), kid_k1
+
+        html = self._build_signed_html(k1)
+        report = tmp_path / "report.html"
+        report.write_text(html, encoding="utf-8")
+
+        runner = CliRunner()
+        with patch(
+            "mipiti_verify.cli._verify_anchor_bundle_bytes",
+            side_effect=fake_verify,
+        ):
+            result = runner.invoke(main, [
+                "audit", str(report),
+                "--rekor-entry-snapshot", str(snapshot_dir),
+                "--expected-anchor-identity", self.SAN_PIN,
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Snapshot match:" in result.output
+
+    def test_snapshot_without_san_pin_fails_closed(self, tmp_path):
+        """--rekor-entry-snapshot without --expected-anchor-identity is
+        a usage error — without the SAN pin, any bundle in the dir
+        could be accepted regardless of who signed it."""
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        # Need at least one bundle so we get past the empty-dir check
+        # and exercise the SAN-pin gate inside _resolve_pubkey_from_rekor_snapshot.
+        (snapshot_dir / "x.sigstore").write_bytes(b"x")
+        report = tmp_path / "report.html"
+        report.write_text(self._build_signed_html(self._key_pair()), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(report),
+            "--rekor-entry-snapshot", str(snapshot_dir),
+        ])
+        assert result.exit_code == 2
+        out_flat = " ".join(result.output.split())
+        assert "requires --expected-anchor-identity" in out_flat
+
+    def test_snapshot_and_url_anchor_mutually_exclusive(self, tmp_path):
+        """--rekor-anchor and --rekor-entry-snapshot together is a
+        usage error — they're alternative resolution paths."""
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "x.sigstore").write_bytes(b"x")
+        report = tmp_path / "report.html"
+        report.write_text(self._build_signed_html(self._key_pair()), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(report),
+            "--rekor-anchor", "https://example.test/anchors/k.sigstore",
+            "--rekor-entry-snapshot", str(snapshot_dir),
+            "--expected-anchor-identity", self.SAN_PIN,
+        ])
+        assert result.exit_code == 2
+        out_flat = " ".join(result.output.split())
+        assert "mutually exclusive" in out_flat

@@ -866,7 +866,199 @@ def _resolve_pubkey_from_anchor(
     return pub_key, manifest["kid"], anchor_url
 
 
-def _audit_html_report(content: str, key_url: str, pre_resolved=None) -> None:
+def _verify_anchor_bundle_bytes(
+    bundle_bytes: bytes,
+    expected_san: str,
+    expected_issuer: str | None,
+    sigstore_tuf_url: str | None = None,
+    sigstore_trust_config_path: str | None = None,
+):
+    """Validate a Sigstore bundle (raw bytes) against the public Sigstore
+    trust root and the auditor's SAN pin, then extract the (kid, pubkey)
+    pair from the signed manifest.
+
+    Shared helper between URL-based anchor resolution
+    (`_resolve_pubkey_from_anchor`) and snapshot-based resolution
+    (`_resolve_pubkey_from_rekor_snapshot`). Returns
+    (public_key, manifest_kid). Raises ValueError on any failure so
+    the caller can decide whether to fail the whole audit (URL path)
+    or skip this entry and try the next (snapshot path iterating
+    over multiple bundles).
+    """
+    import base64
+    import json
+
+    if not expected_san:
+        raise ValueError("anchor SAN pin is required (fail-closed precedent)")
+
+    try:
+        from sigstore.models import Bundle, ClientTrustConfig
+        from sigstore.verify import Verifier
+        from sigstore.verify.policy import Identity
+    except ImportError as e:
+        raise ValueError(f"sigstore-python not installed: {e}")
+
+    try:
+        bundle = Bundle.from_json(bundle_bytes.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"not a valid Sigstore bundle: {e}")
+
+    try:
+        if sigstore_trust_config_path:
+            tc = ClientTrustConfig.from_json(
+                open(sigstore_trust_config_path, "r").read()
+            )
+            verifier = Verifier._from_trust_config(tc)
+        elif sigstore_tuf_url:
+            from sigstore._internal.tuf import TrustUpdater
+            tu = TrustUpdater(sigstore_tuf_url, offline=False)
+            tc = tu.get_trust_config()
+            verifier = Verifier._from_trust_config(tc)
+        else:
+            verifier = Verifier.production()
+    except Exception as e:
+        raise ValueError(f"failed to initialize Sigstore verifier: {e}")
+
+    issuer = expected_issuer or _infer_issuer(expected_san)
+    if not issuer:
+        raise ValueError(
+            f"could not infer issuer from SAN={expected_san!r}; pass "
+            "--expected-anchor-issuer explicitly for self-hosted OIDC"
+        )
+    policy = Identity(identity=expected_san, issuer=issuer)
+
+    try:
+        _, payload_bytes = verifier.verify_dsse(bundle, policy)
+    except Exception as e:
+        raise ValueError(f"signature INVALID: {e}")
+
+    try:
+        manifest = json.loads(payload_bytes)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"manifest not valid JSON: {e}")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest is not a JSON object")
+
+    required = ("kid", "kty", "crv", "x", "y")
+    missing = [k for k in required if k not in manifest]
+    if missing:
+        raise ValueError(f"manifest missing fields: {missing}")
+    if manifest["kty"] != "EC" or manifest["crv"] != "P-256":
+        raise ValueError(
+            f"unexpected key type ({manifest['kty']}/{manifest['crv']}); "
+            "expected EC/P-256"
+        )
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    try:
+        x = int.from_bytes(base64.urlsafe_b64decode(manifest["x"] + "=="), "big")
+        y = int.from_bytes(base64.urlsafe_b64decode(manifest["y"] + "=="), "big")
+    except Exception as e:
+        raise ValueError(f"manifest x/y not valid base64url: {e}")
+    pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
+    return pub_numbers.public_key(), manifest["kid"]
+
+
+def _resolve_pubkey_from_rekor_snapshot(
+    snapshot_dir: str,
+    expected_san: str,
+    expected_issuer: str | None,
+    target_kid: str,
+    sigstore_tuf_url: str | None = None,
+    sigstore_trust_config_path: str | None = None,
+):
+    """Resolve the report's signing key from a directory of pre-saved
+    Sigstore anchor bundles — fully offline / air-gapped.
+
+    The auditor captures matching anchor bundles at report-receipt
+    time (e.g., via cosign / sigstore CLI / a one-time fetch from a
+    public mirror) and passes the directory at audit time. Combined
+    with `--sigstore-trust-config <tuf.json>`, the entire verification
+    chain is offline-replayable years later with no live Mipiti or
+    Rekor access required.
+
+    Iterates `<snapshot_dir>/*.sigstore`, validates each bundle
+    against the public Sigstore trust root + SAN pin (skipping
+    individual invalid entries), returns the first whose manifest's
+    `kid` matches `target_kid`. Raises SystemExit(1) if no match.
+
+    Returns (public_key, manifest_kid, snapshot_dir).
+    """
+    if not expected_san:
+        console.print(
+            "[red]Error:[/red] --rekor-entry-snapshot requires "
+            "--expected-anchor-identity. An anchor without a pinned "
+            "SAN provides no defense — any validly-signed Sigstore "
+            "bundle in the snapshot dir would be accepted regardless "
+            "of who signed it."
+        )
+        raise SystemExit(2)
+
+    import os.path
+    import glob
+
+    if not os.path.isdir(snapshot_dir):
+        console.print(
+            f"[red]Error:[/red] --rekor-entry-snapshot {snapshot_dir!r} is "
+            "not a directory."
+        )
+        raise SystemExit(1)
+
+    bundle_paths = sorted(glob.glob(os.path.join(snapshot_dir, "*.sigstore")))
+    if not bundle_paths:
+        console.print(
+            f"[red]Error:[/red] no *.sigstore bundle files in {snapshot_dir!r}. "
+            "Auditors capture matching anchor bundles at report-receipt time "
+            "(e.g., via the sigstore CLI or cosign) and pass the directory."
+        )
+        raise SystemExit(1)
+
+    console.print(f"  Snapshot dir: {snapshot_dir} ({len(bundle_paths)} bundle(s))")
+    console.print(f"  Target kid:   {target_kid[:16]}...")
+
+    skipped = 0
+    for path in bundle_paths:
+        try:
+            with open(path, "rb") as f:
+                bundle_bytes = f.read()
+        except OSError as e:
+            console.print(f"  [yellow]skipping {path}: {e}[/yellow]")
+            skipped += 1
+            continue
+        try:
+            pub_key, manifest_kid = _verify_anchor_bundle_bytes(
+                bundle_bytes,
+                expected_san=expected_san,
+                expected_issuer=expected_issuer,
+                sigstore_tuf_url=sigstore_tuf_url,
+                sigstore_trust_config_path=sigstore_trust_config_path,
+            )
+        except ValueError as e:
+            # Skip individual bad entries — the snapshot might have
+            # bundles for unrelated reports / kids / past key rotations.
+            console.print(f"  [dim]{os.path.basename(path)}: {e}[/dim]")
+            skipped += 1
+            continue
+        if manifest_kid == target_kid:
+            console.print(
+                f"  Snapshot match: {os.path.basename(path)}, "
+                f"SAN={expected_san}, kid={manifest_kid[:16]}..."
+            )
+            return pub_key, manifest_kid, snapshot_dir
+
+    console.print(
+        f"  [red]No bundle in {snapshot_dir!r} matches kid {target_kid[:16]}... "
+        f"({len(bundle_paths)} candidate(s), {skipped} skipped).[/red]"
+    )
+    raise SystemExit(1)
+
+
+def _audit_html_report(
+    content: str,
+    key_url: str,
+    pre_resolved=None,
+    snapshot_resolver=None,
+) -> None:
     """Verify a signed HTML report.
 
     `pre_resolved`, when given, is a (public_key, kid) tuple from
@@ -875,6 +1067,14 @@ def _audit_html_report(content: str, key_url: str, pre_resolved=None) -> None:
     fingerprint matches the anchor manifest's `kid` (defends against
     a valid anchor for a different key being substituted), then use
     the anchor-resolved public key. JWKS is bypassed entirely.
+
+    `snapshot_resolver`, when given, is a callable
+    `(target_kid: str) -> (public_key, kid)` that resolves the public
+    key by searching a directory of pre-saved Sigstore bundles for
+    one whose manifest matches the report's fingerprint. Used for
+    fully offline / air-gapped review. Takes precedence over
+    `pre_resolved` and JWKS lookup; cannot be combined with the
+    URL-based anchor path (mutually exclusive at the audit() entry).
     """
     import base64
     import hashlib
@@ -900,7 +1100,18 @@ def _audit_html_report(content: str, key_url: str, pre_resolved=None) -> None:
     content_hash = hashlib.sha256(signed_content.encode("utf-8")).digest()
 
     console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
-    if pre_resolved is not None:
+    if snapshot_resolver is not None:
+        pub_key, anchor_kid, _ = snapshot_resolver(fingerprint)
+        # snapshot_resolver picked the entry that already matches
+        # `fingerprint`; the consistency check below is a defense
+        # against a buggy resolver returning the wrong tuple.
+        if anchor_kid != fingerprint:
+            console.print(
+                f"  [red]Snapshot resolver returned kid {anchor_kid[:16]}... "
+                f"but report fingerprint is {fingerprint[:16]}.[/red]"
+            )
+            raise SystemExit(1)
+    elif pre_resolved is not None:
         pub_key, anchor_kid = pre_resolved
         if anchor_kid != fingerprint:
             console.print(
@@ -985,14 +1196,20 @@ def _extract_pdf_audit_envelope(pdf_bytes: bytes):
     return envelope
 
 
-def _audit_pdf_report(pdf_bytes: bytes, key_url: str, pre_resolved=None) -> None:
+def _audit_pdf_report(
+    pdf_bytes: bytes,
+    key_url: str,
+    pre_resolved=None,
+    snapshot_resolver=None,
+) -> None:
     """Verify a signed PDF report (byte-range scheme).
 
     Trust model is the same as `_audit_html_report`: extract the embedded
     fingerprint, recover the public key (JWKS by default, or via the
     Rekor-anchor `pre_resolved` tuple when the auditor opted into
-    independent-of-JWKS verification), recompute SHA-256 over the bytes
-    outside the payload, ECDSA-verify.
+    URL-based independent-of-JWKS verification, or via the
+    `snapshot_resolver` callable for offline directory-based resolution),
+    recompute SHA-256 over the bytes outside the payload, ECDSA-verify.
     """
     import base64
     import hashlib
@@ -1032,7 +1249,15 @@ def _audit_pdf_report(pdf_bytes: bytes, key_url: str, pre_resolved=None) -> None
     content_hash = hashlib.sha256(covered).digest()
 
     console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
-    if pre_resolved is not None:
+    if snapshot_resolver is not None:
+        pub_key, anchor_kid, _ = snapshot_resolver(fingerprint)
+        if anchor_kid != fingerprint:
+            console.print(
+                f"  [red]Snapshot resolver returned kid {anchor_kid[:16]}... "
+                f"but PDF fingerprint is {fingerprint[:16]}.[/red]"
+            )
+            raise SystemExit(1)
+    elif pre_resolved is not None:
         pub_key, anchor_kid = pre_resolved
         if anchor_kid != fingerprint:
             console.print(
@@ -1230,6 +1455,23 @@ def _audit_pdf_report(pdf_bytes: bytes, key_url: str, pre_resolved=None) -> None
         "issuer. Example: 'https://token.actions.githubusercontent.com'."
     ),
 )
+@click.option(
+    "--rekor-entry-snapshot",
+    "rekor_entry_snapshot_dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    help=(
+        "Directory of pre-saved Sigstore anchor bundles (`*.sigstore` "
+        "files) — fully offline / air-gapped resolution path. The auditor "
+        "captures matching anchor bundles at report-receipt time (e.g., "
+        "via the sigstore CLI or by snapshotting from any public mirror) "
+        "and passes the directory at audit time. Combined with "
+        "`--sigstore-trust-config <tuf.json>`, the entire verification "
+        "chain is offline-replayable indefinitely with no live Mipiti or "
+        "Rekor access required. Requires --expected-anchor-identity for "
+        "the SAN pin. Mutually exclusive with --rekor-anchor."
+    ),
+)
 def audit(
     package_file: str,
     key_url: str,
@@ -1244,6 +1486,7 @@ def audit(
     rekor_anchor_url: str | None,
     expected_anchor_identity: str | None,
     expected_anchor_issuer: str | None,
+    rekor_entry_snapshot_dir: str | None,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
 
@@ -1287,6 +1530,14 @@ def audit(
     Useful when the originating Mipiti instance is offline / wound
     down — the chain remains verifiable for as long as Rekor remains
     publicly replicated.
+
+    Air-gapped review: pass --rekor-entry-snapshot DIR pointing at a
+    directory of pre-saved Sigstore anchor bundles (`*.sigstore`
+    files) captured at report-receipt time. Combined with
+    --sigstore-trust-config (a snapshotted TUF root), the entire
+    verification chain is offline-replayable indefinitely with no
+    live Mipiti or Rekor access required. Mutually exclusive with
+    --rekor-anchor (URL-based one-shot vs directory-based search).
     """
     # Resolve --ci-identity-from-env to an explicit SAN. Precedence:
     # explicit flag (or MIPITI_VERIFY_CI_IDENTITY env var) > auto-derive
@@ -1354,24 +1605,38 @@ def audit(
         raise SystemExit(2)
 
     # Validation: --expected-anchor-identity / --expected-anchor-issuer
-    # are meaningful only with --rekor-anchor. Out without it, we'd be
-    # silently accepting (or refusing) pins the auditor explicitly
-    # configured — clean usage error instead.
-    if (expected_anchor_identity or expected_anchor_issuer) and not rekor_anchor_url:
+    # are meaningful only with --rekor-anchor or --rekor-entry-snapshot.
+    # Without either, we'd be silently accepting (or refusing) pins the
+    # auditor explicitly configured — clean usage error instead.
+    if (expected_anchor_identity or expected_anchor_issuer) and not (
+        rekor_anchor_url or rekor_entry_snapshot_dir
+    ):
         console.print(
             "[red]Error:[/red] --expected-anchor-identity / "
-            "--expected-anchor-issuer require --rekor-anchor. Without an "
-            "anchor URL to validate, these pins have nothing to apply to."
+            "--expected-anchor-issuer require --rekor-anchor or "
+            "--rekor-entry-snapshot. Without an anchor URL or local "
+            "snapshot directory to validate, these pins have nothing to "
+            "apply to."
         )
         raise SystemExit(2)
 
-    # Resolve the anchor up-front. The recovered (pubkey, kid) tuple is
-    # threaded into _audit_html_report / _audit_pdf_report so they
-    # bypass JWKS entirely. Anchor resolution itself fails-closed on a
-    # missing SAN pin (per `_resolve_pubkey_from_anchor`).
+    if rekor_anchor_url and rekor_entry_snapshot_dir:
+        console.print(
+            "[red]Error:[/red] --rekor-anchor and --rekor-entry-snapshot "
+            "are mutually exclusive. The first fetches a single bundle "
+            "from a URL; the second resolves from a local directory of "
+            "pre-saved bundles."
+        )
+        raise SystemExit(2)
+
+    # Resolve the anchor up-front for the URL path. The recovered
+    # (pubkey, kid) tuple is threaded into _audit_html_report /
+    # _audit_pdf_report so they bypass JWKS entirely. Anchor
+    # resolution itself fails-closed on a missing SAN pin (per
+    # `_resolve_pubkey_from_anchor`).
     anchor_pre_resolved = None
     if rekor_anchor_url:
-        console.print("\n[bold]Resolving signing key via Rekor anchor[/bold]")
+        console.print("\n[bold]Resolving signing key via Rekor anchor (URL)[/bold]")
         console.print("=" * 40)
         pub_key, anchor_kid, _ = _resolve_pubkey_from_anchor(
             anchor_url=rekor_anchor_url,
@@ -1381,6 +1646,37 @@ def audit(
             sigstore_trust_config_path=sigstore_trust_config_path,
         )
         anchor_pre_resolved = (pub_key, anchor_kid)
+
+    # The snapshot path resolves LAZILY because it needs the report's
+    # fingerprint to pick the matching bundle from the directory.
+    # Build a closure the audit functions call once they extract the
+    # fingerprint from the artifact.
+    snapshot_resolver = None
+    if rekor_entry_snapshot_dir:
+        console.print(
+            "\n[bold]Snapshot mode: resolving via local Sigstore bundles[/bold]"
+        )
+        console.print("=" * 40)
+
+        def _make_snapshot_resolver(dir_, san, issuer, tuf_url, tc_path):
+            def _resolve(target_kid: str):
+                return _resolve_pubkey_from_rekor_snapshot(
+                    snapshot_dir=dir_,
+                    expected_san=san,
+                    expected_issuer=issuer,
+                    target_kid=target_kid,
+                    sigstore_tuf_url=tuf_url,
+                    sigstore_trust_config_path=tc_path,
+                )
+            return _resolve
+
+        snapshot_resolver = _make_snapshot_resolver(
+            rekor_entry_snapshot_dir,
+            expected_anchor_identity or "",
+            expected_anchor_issuer,
+            sigstore_tuf_url,
+            sigstore_trust_config_path,
+        )
 
     import hashlib
     import base64
@@ -1419,7 +1715,11 @@ def audit(
     if head.startswith(b"%PDF-"):
         with open(package_file, "rb") as f:
             pdf_bytes = f.read()
-        _audit_pdf_report(pdf_bytes, key_url, pre_resolved=anchor_pre_resolved)
+        _audit_pdf_report(
+            pdf_bytes, key_url,
+            pre_resolved=anchor_pre_resolved,
+            snapshot_resolver=snapshot_resolver,
+        )
 
         envelope = _extract_pdf_audit_envelope(pdf_bytes)
         pinning_requested = bool(
@@ -1491,7 +1791,11 @@ def audit(
                 "HTML report integrity."
             )
             raise SystemExit(2)
-        _audit_html_report(content, key_url, pre_resolved=anchor_pre_resolved)
+        _audit_html_report(
+            content, key_url,
+            pre_resolved=anchor_pre_resolved,
+            snapshot_resolver=snapshot_resolver,
+        )
         return
 
     pkg = json.loads(content)
