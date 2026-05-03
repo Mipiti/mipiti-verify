@@ -713,8 +713,169 @@ def _resolve_pubkey_from_jwks(fingerprint: str, key_url: str):
     return pub_numbers.public_key(), fingerprint, key_url
 
 
-def _audit_html_report(content: str, key_url: str) -> None:
-    """Verify a signed HTML report."""
+def _resolve_pubkey_from_anchor(
+    anchor_url: str,
+    expected_san: str,
+    expected_issuer: str | None,
+    sigstore_tuf_url: str | None = None,
+    sigstore_trust_config_path: str | None = None,
+):
+    """Resolve a public key by validating a Sigstore Rekor anchor bundle.
+
+    Anchor flow (alternative to JWKS for vendor-survivability):
+      1. Fetch the bundle from `anchor_url`.
+      2. Validate against the public Sigstore trust root: Fulcio cert
+         chain, Rekor inclusion proof, DSSE signature.
+      3. Pin the bundle's SAN to `expected_san` (out-of-band-known
+         Mipiti workflow identity). Fail-closed without a SAN pin.
+      4. Extract the manifest payload (canonical JSON: kid, kty, crv,
+         x, y, alg, use, anchored_at, anchored_by_workflow).
+      5. Recover the EC public key from the manifest's `x`/`y`.
+
+    Returns (public_key, manifest_kid, anchor_url). Raises SystemExit
+    on any failure (network, structural, signature-invalid, SAN
+    mismatch).
+
+    The recovered public key is independently verifiable years after
+    the original report was issued, with no dependency on Mipiti's
+    JWKS endpoint or any Mipiti-controlled infrastructure.
+    """
+    import base64
+    import json
+
+    if not expected_san:
+        # The fail-closed precedent matches `--expected-issuer` alone:
+        # an unpinned anchor would let an attacker substitute any
+        # validly-signed Sigstore bundle (e.g., from their own GitHub
+        # repo) and have the verifier accept it as Mipiti's. Refuse
+        # to proceed.
+        console.print(
+            "[red]Error:[/red] --rekor-anchor requires --expected-anchor-identity. "
+            "An anchor without a pinned SAN provides no defense — any validly-"
+            "signed Sigstore bundle would be accepted regardless of who signed it. "
+            "Pin the canonical Mipiti workflow SAN, e.g. "
+            "'https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main'."
+        )
+        raise SystemExit(2)
+
+    console.print(f"  Anchor URL: {anchor_url}")
+    try:
+        import httpx
+        resp = httpx.get(anchor_url, timeout=15)
+        resp.raise_for_status()
+        bundle_bytes = resp.content
+    except httpx.HTTPError as e:
+        console.print(f"  [red]Failed to fetch anchor bundle: {e}[/red]")
+        raise SystemExit(1)
+
+    # Sigstore bundle parsing + verification reuses the same code path
+    # the JSON-audit dispatch uses for assertion-submission bundles.
+    # The payload is bytes (the canonical JSON manifest); we recover
+    # them from the verified DSSE envelope before parsing as JSON.
+    try:
+        from sigstore.models import Bundle, ClientTrustConfig
+        from sigstore.verify import Verifier
+        from sigstore.verify.policy import Identity
+    except ImportError as e:
+        console.print(f"  [red]sigstore-python not installed: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        bundle = Bundle.from_json(bundle_bytes.decode("utf-8"))
+    except Exception as e:
+        console.print(f"  [red]Anchor bundle is not a valid Sigstore bundle: {e}[/red]")
+        raise SystemExit(1)
+
+    # Build the Sigstore Verifier — same trust-root resolution the
+    # JSON-audit path uses (--sigstore-tuf-url for online pinning,
+    # --sigstore-trust-config for fully offline air-gapped review).
+    try:
+        if sigstore_trust_config_path:
+            tc = ClientTrustConfig.from_json(
+                open(sigstore_trust_config_path, "r").read()
+            )
+            verifier = Verifier._from_trust_config(tc)
+        elif sigstore_tuf_url:
+            from sigstore._internal.tuf import TrustUpdater
+            tu = TrustUpdater(sigstore_tuf_url, offline=False)
+            tc = tu.get_trust_config()
+            verifier = Verifier._from_trust_config(tc)
+        else:
+            verifier = Verifier.production()
+    except Exception as e:
+        console.print(f"  [red]Failed to initialize Sigstore verifier: {e}[/red]")
+        raise SystemExit(1)
+
+    # Pin the SAN. Issuer optional; required only for self-hosted
+    # OIDC providers per the same precedent in the JSON-audit path.
+    issuer = expected_issuer or _infer_issuer(expected_san)
+    if not issuer:
+        console.print(
+            "[red]Error:[/red] could not infer issuer from "
+            f"--expected-anchor-identity={expected_san!r}. Pass "
+            "--expected-anchor-issuer explicitly for self-hosted OIDC."
+        )
+        raise SystemExit(2)
+    policy = Identity(identity=expected_san, issuer=issuer)
+
+    # Verify the bundle's signature + cert chain + Rekor inclusion
+    # proof against the chosen trust root, AND that the cert SAN
+    # matches the auditor's pin. `verify_dsse` returns the (type,
+    # payload_bytes) tuple; payload_bytes is the canonical manifest
+    # we control on the producer side.
+    try:
+        type_, payload_bytes = verifier.verify_dsse(bundle, policy)
+    except Exception as e:
+        console.print(f"  [red]Anchor signature INVALID: {e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        manifest = json.loads(payload_bytes)
+    except json.JSONDecodeError as e:
+        console.print(f"  [red]Anchor manifest is not valid JSON: {e}[/red]")
+        raise SystemExit(1)
+    if not isinstance(manifest, dict):
+        console.print("  [red]Anchor manifest is not a JSON object.[/red]")
+        raise SystemExit(1)
+
+    required = ("kid", "kty", "crv", "x", "y")
+    missing = [k for k in required if k not in manifest]
+    if missing:
+        console.print(f"  [red]Anchor manifest missing fields: {missing}[/red]")
+        raise SystemExit(1)
+    if manifest["kty"] != "EC" or manifest["crv"] != "P-256":
+        console.print(
+            f"  [red]Anchor manifest has unexpected key type "
+            f"({manifest['kty']}/{manifest['crv']}); expected EC/P-256.[/red]"
+        )
+        raise SystemExit(1)
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    try:
+        x = int.from_bytes(base64.urlsafe_b64decode(manifest["x"] + "=="), "big")
+        y = int.from_bytes(base64.urlsafe_b64decode(manifest["y"] + "=="), "big")
+    except Exception as e:
+        console.print(f"  [red]Anchor manifest x/y not valid base64url: {e}[/red]")
+        raise SystemExit(1)
+    pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
+    pub_key = pub_numbers.public_key()
+
+    console.print(
+        f"  Anchor verified: SAN matches {expected_san}, manifest kid={manifest['kid'][:16]}..."
+    )
+    return pub_key, manifest["kid"], anchor_url
+
+
+def _audit_html_report(content: str, key_url: str, pre_resolved=None) -> None:
+    """Verify a signed HTML report.
+
+    `pre_resolved`, when given, is a (public_key, kid) tuple from
+    `_resolve_pubkey_from_anchor` — the auditor opted into the
+    Rekor-anchor trust path. We confirm the report's embedded
+    fingerprint matches the anchor manifest's `kid` (defends against
+    a valid anchor for a different key being substituted), then use
+    the anchor-resolved public key. JWKS is bypassed entirely.
+    """
     import base64
     import hashlib
     import re
@@ -739,7 +900,20 @@ def _audit_html_report(content: str, key_url: str) -> None:
     content_hash = hashlib.sha256(signed_content.encode("utf-8")).digest()
 
     console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
-    pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
+    if pre_resolved is not None:
+        pub_key, anchor_kid = pre_resolved
+        if anchor_kid != fingerprint:
+            console.print(
+                f"  [red]Anchor manifest kid {anchor_kid[:16]}... does not "
+                f"match report fingerprint {fingerprint[:16]}...[/red]"
+            )
+            console.print(
+                "  The supplied anchor binds a different signing key than the "
+                "one that signed this report. Refusing to verify."
+            )
+            raise SystemExit(1)
+    else:
+        pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
 
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import hashes
@@ -811,12 +985,14 @@ def _extract_pdf_audit_envelope(pdf_bytes: bytes):
     return envelope
 
 
-def _audit_pdf_report(pdf_bytes: bytes, key_url: str) -> None:
-    """Verify a signed PDF report (byte-range scheme, JWKS-anchored).
+def _audit_pdf_report(pdf_bytes: bytes, key_url: str, pre_resolved=None) -> None:
+    """Verify a signed PDF report (byte-range scheme).
 
-    Same trust model as `_audit_html_report`: extract the embedded
-    fingerprint, fetch the public key from JWKS by fingerprint, recompute
-    SHA-256 over the bytes outside the payload, ECDSA-verify.
+    Trust model is the same as `_audit_html_report`: extract the embedded
+    fingerprint, recover the public key (JWKS by default, or via the
+    Rekor-anchor `pre_resolved` tuple when the auditor opted into
+    independent-of-JWKS verification), recompute SHA-256 over the bytes
+    outside the payload, ECDSA-verify.
     """
     import base64
     import hashlib
@@ -856,7 +1032,20 @@ def _audit_pdf_report(pdf_bytes: bytes, key_url: str) -> None:
     content_hash = hashlib.sha256(covered).digest()
 
     console.print("\n[bold]Document Signature (ECDSA P-256)[/bold]")
-    pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
+    if pre_resolved is not None:
+        pub_key, anchor_kid = pre_resolved
+        if anchor_kid != fingerprint:
+            console.print(
+                f"  [red]Anchor manifest kid {anchor_kid[:16]}... does not "
+                f"match PDF fingerprint {fingerprint[:16]}...[/red]"
+            )
+            console.print(
+                "  The supplied anchor binds a different signing key than the "
+                "one that signed this PDF. Refusing to verify."
+            )
+            raise SystemExit(1)
+    else:
+        pub_key, _, _ = _resolve_pubkey_from_jwks(fingerprint, key_url)
 
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import hashes
@@ -999,6 +1188,48 @@ def _audit_pdf_report(pdf_bytes: bytes, key_url: str) -> None:
         "workspace settings UI)."
     ),
 )
+@click.option(
+    "--rekor-anchor",
+    "rekor_anchor_url",
+    default=None,
+    help=(
+        "URL to a Sigstore-signed anchor bundle binding the platform's "
+        "signing key to a known Mipiti CI workflow identity. When supplied, "
+        "the verifier resolves the public key from the anchor manifest "
+        "(after validating Fulcio cert chain + Rekor inclusion proof + DSSE "
+        "signature against the public Sigstore trust root) instead of "
+        "fetching it from the platform's JWKS endpoint. Defends against "
+        "vendor-survivability: a 2026 report can still be verified in 2030 "
+        "even if the originating Mipiti instance is offline. Requires "
+        "--expected-anchor-identity (the canonical Mipiti workflow SAN, "
+        "out-of-band-pinned by the auditor)."
+    ),
+)
+@click.option(
+    "--expected-anchor-identity",
+    "expected_anchor_identity",
+    default=None,
+    help=(
+        "Pin the SAN of the Sigstore-Fulcio identity that signed the "
+        "anchor bundle. Required with --rekor-anchor. Example for SaaS: "
+        "'https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main'. "
+        "On-prem operators pin their own anchoring workflow's SAN. "
+        "Without this pin the anchor is meaningless — any validly-signed "
+        "Sigstore bundle would be accepted regardless of who signed it."
+    ),
+)
+@click.option(
+    "--expected-anchor-issuer",
+    "expected_anchor_issuer",
+    default=None,
+    help=(
+        "Pin the OIDC issuer of the anchor bundle's signing identity. "
+        "Optional for github.com / gitlab.com SANs (derived from the SAN "
+        "prefix, same as --expected-issuer). Required for self-hosted "
+        "issuers where the SAN prefix doesn't unambiguously identify the "
+        "issuer. Example: 'https://token.actions.githubusercontent.com'."
+    ),
+)
 def audit(
     package_file: str,
     key_url: str,
@@ -1010,6 +1241,9 @@ def audit(
     ci_identity_from_env: bool,
     expected_issuer: str | None,
     expected_workspace_key_fingerprint: str | None,
+    rekor_anchor_url: str | None,
+    expected_anchor_identity: str | None,
+    expected_anchor_issuer: str | None,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
 
@@ -1041,6 +1275,18 @@ def audit(
     pinning recomputes the fingerprint from the public key actually used
     for verification, so a forged package cannot pass the pin by attaching
     an attacker-held key while claiming the customer's fingerprint.
+
+    Vendor-survivability (defense against loss-of-platform): pass
+    --rekor-anchor and --expected-anchor-identity to resolve the
+    platform's signing key independently of JWKS reachability. The
+    verifier fetches the anchor bundle (a Sigstore-signed manifest
+    binding the platform's public key to a known Mipiti CI identity,
+    recorded in the public Rekor transparency log), validates it
+    against the public Sigstore trust root, confirms the SAN matches
+    the auditor's pin, and recovers the public key from the manifest.
+    Useful when the originating Mipiti instance is offline / wound
+    down — the chain remains verifiable for as long as Rekor remains
+    publicly replicated.
     """
     # Resolve --ci-identity-from-env to an explicit SAN. Precedence:
     # explicit flag (or MIPITI_VERIFY_CI_IDENTITY env var) > auto-derive
@@ -1107,6 +1353,35 @@ def audit(
         )
         raise SystemExit(2)
 
+    # Validation: --expected-anchor-identity / --expected-anchor-issuer
+    # are meaningful only with --rekor-anchor. Out without it, we'd be
+    # silently accepting (or refusing) pins the auditor explicitly
+    # configured — clean usage error instead.
+    if (expected_anchor_identity or expected_anchor_issuer) and not rekor_anchor_url:
+        console.print(
+            "[red]Error:[/red] --expected-anchor-identity / "
+            "--expected-anchor-issuer require --rekor-anchor. Without an "
+            "anchor URL to validate, these pins have nothing to apply to."
+        )
+        raise SystemExit(2)
+
+    # Resolve the anchor up-front. The recovered (pubkey, kid) tuple is
+    # threaded into _audit_html_report / _audit_pdf_report so they
+    # bypass JWKS entirely. Anchor resolution itself fails-closed on a
+    # missing SAN pin (per `_resolve_pubkey_from_anchor`).
+    anchor_pre_resolved = None
+    if rekor_anchor_url:
+        console.print("\n[bold]Resolving signing key via Rekor anchor[/bold]")
+        console.print("=" * 40)
+        pub_key, anchor_kid, _ = _resolve_pubkey_from_anchor(
+            anchor_url=rekor_anchor_url,
+            expected_san=expected_anchor_identity or "",
+            expected_issuer=expected_anchor_issuer,
+            sigstore_tuf_url=sigstore_tuf_url,
+            sigstore_trust_config_path=sigstore_trust_config_path,
+        )
+        anchor_pre_resolved = (pub_key, anchor_kid)
+
     import hashlib
     import base64
 
@@ -1144,7 +1419,7 @@ def audit(
     if head.startswith(b"%PDF-"):
         with open(package_file, "rb") as f:
             pdf_bytes = f.read()
-        _audit_pdf_report(pdf_bytes, key_url)
+        _audit_pdf_report(pdf_bytes, key_url, pre_resolved=anchor_pre_resolved)
 
         envelope = _extract_pdf_audit_envelope(pdf_bytes)
         pinning_requested = bool(
@@ -1216,7 +1491,7 @@ def audit(
                 "HTML report integrity."
             )
             raise SystemExit(2)
-        _audit_html_report(content, key_url)
+        _audit_html_report(content, key_url, pre_resolved=anchor_pre_resolved)
         return
 
     pkg = json.loads(content)
