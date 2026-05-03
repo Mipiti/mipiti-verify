@@ -1230,3 +1230,272 @@ class TestAuditPdfReport:
         assert result.exit_code == 1
         assert "not found in JWKS" in result.output
         assert "Traceback" not in result.output
+
+
+class TestRekorAnchor:
+    """Verify that --rekor-anchor resolves trust independently of JWKS.
+
+    The auditor passes a URL to a Sigstore-signed bundle binding the
+    platform's public key to a known Mipiti CI workflow identity. The
+    verifier validates the bundle, confirms the SAN, recovers the
+    public key from the manifest, and uses it to verify the report's
+    ECDSA signature without contacting the platform's JWKS.
+
+    Tests use synthetic bundles (mocked Sigstore Bundle / Verifier) so
+    they run without OIDC. A separate id-token-write CI job mints real
+    Fulcio bundles for end-to-end coverage.
+    """
+
+    def _key_pair(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        return ec.generate_private_key(ec.SECP256R1())
+
+    def _key_to_jwk_fields(self, key):
+        import base64
+        nums = key.public_key().public_numbers()
+        x = base64.urlsafe_b64encode(nums.x.to_bytes(32, "big")).rstrip(b"=").decode()
+        y = base64.urlsafe_b64encode(nums.y.to_bytes(32, "big")).rstrip(b"=").decode()
+        return x, y
+
+    def _key_fingerprint(self, key):
+        import hashlib
+        from cryptography.hazmat.primitives import serialization
+        der = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return hashlib.sha256(der).hexdigest()
+
+    def _build_signed_html(self, key):
+        """Mint a signed-HTML report using `key`. Returns the HTML string.
+
+        The verifier hashes everything BEFORE the trailing signature
+        comment — including the leading newline. Match that exactly
+        when computing the signature here so the test's HTML verifies.
+        """
+        import base64
+        import hashlib
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        body = "<!DOCTYPE html><html><body><h1>Test report</h1></body></html>\n"
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        sig = key.sign(digest, ec.ECDSA(hashes.SHA256()))
+        sig_b64 = base64.b64encode(sig).decode()
+        fp = self._key_fingerprint(key)
+        return body + f"<!-- mipiti-report-signature:{fp}:{sig_b64} -->\n"
+
+    def _mock_anchor(self, manifest):
+        """Patch sigstore Bundle.from_json + Verifier.production so
+        verify_dsse returns the supplied manifest dict as DSSE payload."""
+        import json as _j
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_cert.not_valid_after_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_log = MagicMock()
+        fake_log.log_index = 42
+        fake_log.integrated_time = 0
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+        fake_bundle.log_entry = fake_log
+
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/json",
+            _j.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+
+        return (
+            patch("sigstore.models.Bundle.from_json", return_value=fake_bundle),
+            patch("sigstore.verify.Verifier.production", return_value=fake_verifier),
+        )
+
+    def _patch_anchor_fetch(self, anchor_bytes=b"fake-bundle-bytes"):
+        from unittest.mock import MagicMock, patch
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.content = anchor_bytes
+        return patch("httpx.get", return_value=mock_resp)
+
+    def test_anchor_without_san_pin_fails_closed(self, tmp_path):
+        """--rekor-anchor without --expected-anchor-identity is a usage
+        error — accepting any validly-signed Sigstore bundle would let
+        an attacker substitute their own bundle and have it accepted."""
+        path = tmp_path / "report.html"
+        path.write_text(self._build_signed_html(self._key_pair()), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(path),
+            "--rekor-anchor", "https://example.test/anchors/k1.sigstore",
+        ])
+        assert result.exit_code == 2
+        out_flat = " ".join(result.output.split())
+        assert "--rekor-anchor requires --expected-anchor-identity" in out_flat
+
+    def test_anchor_pin_without_url_is_usage_error(self, tmp_path):
+        """--expected-anchor-identity without --rekor-anchor has nothing
+        to apply to — usage error rather than silent no-op."""
+        path = tmp_path / "report.html"
+        path.write_text(self._build_signed_html(self._key_pair()), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(path),
+            "--expected-anchor-identity",
+            "repo:Mipiti/mipiti:ref:refs/heads/main:workflow:foo.yml@refs/heads/main",
+        ])
+        assert result.exit_code == 2
+        out_flat = " ".join(result.output.split())
+        assert "require --rekor-anchor" in out_flat
+
+    def test_anchor_resolves_html_signature(self, tmp_path):
+        """Anchor resolves the public key, HTML signature verifies
+        against it — JWKS never contacted."""
+        from unittest.mock import patch
+
+        key = self._key_pair()
+        fp = self._key_fingerprint(key)
+        x, y = self._key_to_jwk_fields(key)
+        manifest = {
+            "kid": fp,
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x,
+            "y": y,
+            "alg": "ES256",
+            "use": "sig",
+            "anchored_at": 1714752000,
+            "anchored_by_workflow":
+                "Mipiti/mipiti/.github/workflows/anchor-signing-key.yml",
+        }
+        html = self._build_signed_html(key)
+        path = tmp_path / "report.html"
+        path.write_text(html, encoding="utf-8")
+
+        bundle_patch, verifier_patch = self._mock_anchor(manifest)
+        # Spy on httpx.get so we can assert JWKS was NOT contacted.
+        from unittest.mock import MagicMock
+        anchor_resp = MagicMock()
+        anchor_resp.raise_for_status = MagicMock()
+        anchor_resp.content = b"fake-bundle"
+        with bundle_patch, verifier_patch, patch(
+            "httpx.get", return_value=anchor_resp,
+        ) as mock_get:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--rekor-anchor", "https://example.test/anchors/k1.sigstore",
+                "--expected-anchor-identity",
+                "https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Report integrity verified" in result.output
+        assert "Anchor verified" in result.output
+        # JWKS was not contacted — only the anchor URL was fetched.
+        urls = [c.args[0] for c in mock_get.call_args_list if c.args]
+        assert all("/.well-known/jwks" not in u for u in urls), urls
+
+    def test_anchor_kid_mismatch_fails(self, tmp_path):
+        """Anchor binds key K1, but the report's signature fingerprint
+        is K2. Refuse to verify even if the anchor itself is otherwise
+        valid — defends against a real anchor for a different key
+        being substituted."""
+        # Generate two keys; HTML signed by `report_key`, anchor manifest
+        # binds `anchor_key`.
+        report_key = self._key_pair()
+        anchor_key = self._key_pair()
+        x, y = self._key_to_jwk_fields(anchor_key)
+        manifest = {
+            "kid": self._key_fingerprint(anchor_key),
+            "kty": "EC", "crv": "P-256", "x": x, "y": y,
+            "alg": "ES256", "use": "sig",
+        }
+        html = self._build_signed_html(report_key)
+        path = tmp_path / "report.html"
+        path.write_text(html, encoding="utf-8")
+
+        bundle_patch, verifier_patch = self._mock_anchor(manifest)
+        with bundle_patch, verifier_patch, self._patch_anchor_fetch():
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--rekor-anchor", "https://example.test/anchors/k1.sigstore",
+                "--expected-anchor-identity",
+                "https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main",
+            ])
+        assert result.exit_code == 1
+        assert "does not" in result.output and "match" in result.output
+        assert "Refusing to verify" in result.output
+
+    def test_anchor_resolves_pdf_signature(self, tmp_path):
+        """Same anchor flow works for the PDF audit dispatch."""
+        from unittest.mock import patch
+        from mipiti_verify.cli import (
+            _PDF_SIG_START, _PDF_SIG_END, _PDF_SIG_PAYLOAD_LEN,
+        )
+        import base64, hashlib
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = self._key_pair()
+        fp = self._key_fingerprint(key)
+        x_b, y_b = self._key_to_jwk_fields(key)
+        manifest = {
+            "kid": fp,
+            "kty": "EC", "crv": "P-256", "x": x_b, "y": y_b,
+            "alg": "ES256", "use": "sig",
+        }
+
+        pdf_body = b"%PDF-1.7\nfake body\n%%EOF\n"
+        covered = pdf_body + _PDF_SIG_START + _PDF_SIG_END
+        digest = hashlib.sha256(covered).digest()
+        signature = key.sign(digest, ec.ECDSA(hashes.SHA256()))
+        sig_b64 = base64.b64encode(signature).decode()
+        payload = f"{fp}:{sig_b64}".encode()
+        payload = payload + b" " * (_PDF_SIG_PAYLOAD_LEN - len(payload))
+        pdf_bytes = pdf_body + _PDF_SIG_START + payload + _PDF_SIG_END
+        path = tmp_path / "report.pdf"
+        path.write_bytes(pdf_bytes)
+
+        bundle_patch, verifier_patch = self._mock_anchor(manifest)
+        with bundle_patch, verifier_patch, self._patch_anchor_fetch():
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--rekor-anchor", "https://example.test/anchors/k1.sigstore",
+                "--expected-anchor-identity",
+                "https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Anchor verified" in result.output
+        assert "Report integrity verified" in result.output
+
+    def test_anchor_manifest_wrong_curve_fails(self, tmp_path):
+        """Anchor manifest with a non-P-256 curve is rejected — keeps
+        the verifier from accidentally accepting future-keyed manifests
+        that the rest of the pipeline can't actually verify."""
+        key = self._key_pair()
+        fp = self._key_fingerprint(key)
+        x, y = self._key_to_jwk_fields(key)
+        manifest = {
+            "kid": fp,
+            "kty": "EC", "crv": "P-384", "x": x, "y": y,
+            "alg": "ES384", "use": "sig",
+        }
+        html = self._build_signed_html(key)
+        path = tmp_path / "report.html"
+        path.write_text(html, encoding="utf-8")
+
+        bundle_patch, verifier_patch = self._mock_anchor(manifest)
+        with bundle_patch, verifier_patch, self._patch_anchor_fetch():
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--rekor-anchor", "https://example.test/anchors/k1.sigstore",
+                "--expected-anchor-identity",
+                "https://github.com/Mipiti/mipiti/.github/workflows/anchor-signing-key.yml@refs/heads/main",
+            ])
+        assert result.exit_code == 1
+        assert "expected EC/P-256" in result.output
