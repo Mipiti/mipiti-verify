@@ -67,6 +67,8 @@ jobs:
           java -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: audit (compromised-platform invariants I1-I7) ---"
           java -jar tla2tools.jar -config audit.cfg -workers auto audit.tla
+          echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R10) ---"
+          java -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
         working-directory: formal
 
   test-spec-invariants:
