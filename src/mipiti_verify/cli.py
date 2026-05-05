@@ -1083,8 +1083,11 @@ def _audit_html_report(
     console.print("\n[bold]Signed Report Verification[/bold]")
     console.print("=" * 40)
 
+    # Anchor on `\n<!--` (the producer-appended separator) so
+    # `content[:sig_match.start()]` excludes the `\n` that's outside
+    # the signed bytes.
     sig_match = re.search(
-        r"<!-- mipiti-report-signature:([a-f0-9]+):([A-Za-z0-9+/=]+) -->\s*$",
+        r"\n<!-- mipiti-report-signature:([a-f0-9]+):([A-Za-z0-9+/=]+) -->\s*$",
         content,
     )
     if not sig_match:

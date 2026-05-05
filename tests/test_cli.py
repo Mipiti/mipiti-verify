@@ -590,6 +590,101 @@ class TestAuditIdentityPinning:
         assert "Traceback" not in result.output
 
 
+class TestSignedHtmlReportRegression:
+    """The producer appends `"\\n<!-- ... -->\\n"` to the rendered
+    HTML; the leading `\\n` is outside the signed bytes. The verifier
+    regex must anchor on that `\\n` so `content[:sig.start()]` excludes
+    it. Pinned: body-ends-with-`\\n` (the common case) verifies;
+    body-without-trailing-`\\n` verifies; missing leading `\\n` fails.
+    """
+
+    def _key_pair(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        return ec.generate_private_key(ec.SECP256R1())
+
+    def _key_fingerprint(self, key):
+        import hashlib
+        from cryptography.hazmat.primitives import serialization
+        der = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return hashlib.sha256(der).hexdigest()
+
+    def _patched_jwks(self, key, fingerprint):
+        """Mock JWKS resolution to return `key` for `fingerprint`."""
+        from unittest.mock import patch
+        return patch(
+            "mipiti_verify.cli._resolve_pubkey_from_jwks",
+            return_value=(key.public_key(), fingerprint, None),
+        )
+
+    def _signed_report(self, key, body):
+        """Mint a signed HTML report exactly as production
+        `sign_report_html` does: signs `body` (including its own
+        trailing newline if present), appends `\\n<!-- ... -->\\n`."""
+        import base64
+        import hashlib
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        sig = key.sign(digest, ec.ECDSA(hashes.SHA256()))
+        sig_b64 = base64.b64encode(sig).decode()
+        fp = self._key_fingerprint(key)
+        return body + f"\n<!-- mipiti-report-signature:{fp}:{sig_b64} -->\n", fp
+
+    def test_body_ending_with_newline_verifies(self, tmp_path):
+        """Body ends with `\\n` followed by `\\n<!-- ... -->\\n`."""
+        key = self._key_pair()
+        body = "<!DOCTYPE html><html><body>Report content here.</body></html>\n"
+        report, fp = self._signed_report(key, body)
+        path = tmp_path / "report.html"
+        path.write_text(report, encoding="utf-8")
+        with self._patched_jwks(key, fp):
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", str(path)])
+        assert result.exit_code == 0, result.output
+        assert "Signature:" in result.output
+        assert "VALID" in result.output
+
+    def test_body_without_trailing_newline_verifies(self, tmp_path):
+        """Body has no trailing `\\n`; the appended block's leading
+        `\\n` is the regex anchor regardless."""
+        key = self._key_pair()
+        body = "<!DOCTYPE html><html><body>No trailing newline</body></html>"
+        report, fp = self._signed_report(key, body)
+        path = tmp_path / "report.html"
+        path.write_text(report, encoding="utf-8")
+        with self._patched_jwks(key, fp):
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", str(path)])
+        assert result.exit_code == 0, result.output
+        assert "VALID" in result.output
+
+    def test_missing_leading_newline_fails_loud(self, tmp_path):
+        """Body without trailing `\\n`, appended block lacks leading
+        `\\n`: regex doesn't match, exit 1, "No signature found"."""
+        key = self._key_pair()
+        body = "<!DOCTYPE html><html><body>Body no newline</body></html>"
+        import base64
+        import hashlib
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        sig = key.sign(digest, ec.ECDSA(hashes.SHA256()))
+        sig_b64 = base64.b64encode(sig).decode()
+        fp = self._key_fingerprint(key)
+        report = body + f"<!-- mipiti-report-signature:{fp}:{sig_b64} -->\n"
+        path = tmp_path / "report.html"
+        path.write_text(report, encoding="utf-8")
+        with self._patched_jwks(key, fp):
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", str(path)])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "No signature found" in out_flat
+
+
 class TestPredicatePinRequiresSanPin:
     """Predicate pins (model_id / commit_sha) without --expected-ci-identity
     are a usage error. The flags' documented purpose is compromised-
@@ -1269,9 +1364,11 @@ class TestRekorAnchor:
     def _build_signed_html(self, key):
         """Mint a signed-HTML report using `key`. Returns the HTML string.
 
-        The verifier hashes everything BEFORE the trailing signature
-        comment — including the leading newline. Match that exactly
-        when computing the signature here so the test's HTML verifies.
+        Signs the HTML body, then appends
+        ``f"\\n<!-- mipiti-report-signature:{fp}:{sig_b64} -->\\n"``.
+        The leading ``\\n`` between body and comment is part of the
+        appended block, NOT part of the signed bytes — same invariant
+        the verifier's regex anchor depends on.
         """
         import base64
         import hashlib
@@ -1282,7 +1379,7 @@ class TestRekorAnchor:
         sig = key.sign(digest, ec.ECDSA(hashes.SHA256()))
         sig_b64 = base64.b64encode(sig).decode()
         fp = self._key_fingerprint(key)
-        return body + f"<!-- mipiti-report-signature:{fp}:{sig_b64} -->\n"
+        return body + f"\n<!-- mipiti-report-signature:{fp}:{sig_b64} -->\n"
 
     def _mock_anchor(self, manifest):
         """Patch sigstore Bundle.from_json + Verifier.production so
