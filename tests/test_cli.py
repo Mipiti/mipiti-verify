@@ -1779,3 +1779,197 @@ class TestRekorEntrySnapshot(TestRekorAnchor):
         assert result.exit_code == 2
         out_flat = " ".join(result.output.split())
         assert "mutually exclusive" in out_flat
+
+
+class TestKeySourceDiscriminator:
+    """Cover the four `key_source` branches the verifier dispatches on.
+
+    Older audit envelopes (pre-discriminator) don't carry `key_source`
+    at all — those paths are exercised by the `TestAuditIdentityPinning`
+    fixtures above. These tests pin behaviour for the explicit
+    `key_source` values an issuer may emit.
+    """
+
+    def _platform_signed_pkg(
+        self, tmp_path, key_source: str, **extra_ci_fields,
+    ):
+        """Reuse the audit-pinning fixture's signed-pkg shape, then
+        layer a `key_source` field (and any extras) onto
+        `content_integrity` so the verifier dispatches on the new
+        discriminator."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        der_bytes = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        fp = hashlib.sha256(der_bytes).hexdigest()
+        ci = {
+            "key_source": key_source,
+            "results_hash": stored,
+            "signature": base64.b64encode(sig).decode(),
+            "key_fingerprint": fp,
+            "public_key_pem": pub_pem,
+        }
+        ci.update(extra_ci_fields)
+        pkg = {
+            "model": {"id": "m1", "title": "t", "feature_description": "fd",
+                      "version": 1, "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [], "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": ci,
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path), fp
+
+    def test_platform_key_source_verifies_normally(self, tmp_path):
+        """`key_source: "platform"` should take the embedded-PEM verify
+        branch and report VALID — same as a legacy audit package."""
+        path, _ = self._platform_signed_pkg(
+            tmp_path, "platform",
+            key_authority="aws-kms",
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        assert "VALID" in result.output
+
+    def test_workspace_key_source_verifies_normally(self, tmp_path):
+        """`key_source: "workspace"` should also take the embedded-PEM
+        verify branch and report VALID."""
+        path, _ = self._platform_signed_pkg(
+            tmp_path, "workspace",
+            workspace_id="ws-42",
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        assert "VALID" in result.output
+
+    def test_unverifiable_orphan_emits_clean_warning_not_failure(
+        self, tmp_path,
+    ):
+        """Orphan fingerprints surface as a yellow `UNRESOLVED` notice,
+        not a hard failure. Without --expected-workspace-key the audit
+        exits 0 — the row's signature half is unverifiable but the
+        rest of the package is intact."""
+        # Orphan path needs a fingerprint that doesn't recompute from
+        # the embedded PEM (so `public_key_pem` should NOT be present
+        # — orphan rows have no resolvable PEM).
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        orphan_fp = (
+            "a53a0a8821238371068b1c0f5cc829927ee47e5d575f2889f4018c8fe765db7a"
+        )
+        pkg = {
+            "model": {"id": "m1", "title": "t", "feature_description": "fd",
+                      "version": 1, "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [], "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "key_source": "unverifiable_orphan",
+                "results_hash": stored,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": orphan_fp,
+                "public_key_pem": "",
+                "unavailable_reason": "unresolved_fingerprint",
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", str(path)])
+        assert result.exit_code == 0
+        assert "UNRESOLVED" in result.output
+        # Customer-trust framing: when Sigstore provenance is present
+        # the row remains verified — message must say so explicitly.
+        assert "Sigstore provenance" in result.output
+
+    def test_unverifiable_orphan_with_workspace_pin_fails(self, tmp_path):
+        """Pinning --expected-workspace-key on an orphan row is treated
+        as a hard failure (the pin's intent — workspace-signed
+        submissions — cannot be satisfied without a resolvable key)."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        orphan_fp = "deadbeef" * 8
+        pkg = {
+            "model": {"id": "m1", "title": "t", "feature_description": "fd",
+                      "version": 1, "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [], "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "key_source": "unverifiable_orphan",
+                "results_hash": stored,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": orphan_fp,
+                "public_key_pem": "",
+                "unavailable_reason": "unresolved_fingerprint",
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", str(path),
+            "--expected-workspace-key", "ff" * 32,
+        ])
+        assert result.exit_code == 1
+        assert "UNRESOLVED" in result.output

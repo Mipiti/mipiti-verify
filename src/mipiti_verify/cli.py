@@ -2162,6 +2162,58 @@ def audit(
             console.print(f"  Hash check:      [red]FAILED — {e}[/red]")
             has_failure = True
 
+    # The audit envelope may carry a `key_source` field declaring which
+    # signing path produced this verification run. Three independently
+    # verifiable paths are supported (see the Mipiti documentation page
+    # "Evidence-driven Verification"); the verifier branches on this
+    # discriminator so each path is checked appropriately:
+    #
+    #   "sigstore"            — Sigstore provenance: a Fulcio-issued
+    #                           short-lived certificate plus a Rekor
+    #                           transparency-log inclusion proof, both
+    #                           verified above against Sigstore's
+    #                           public trust root. This is the
+    #                           canonical trust anchor for the row;
+    #                           any redundant content_integrity
+    #                           signature is not re-checked here.
+    #   "platform"            — server-notarized via the issuer's
+    #                           ECDSA P-256 key. The signing key is
+    #                           published in the issuer's JWKS
+    #                           endpoint (`/.well-known/jwks`), and
+    #                           older retired keys remain published
+    #                           there too so reports signed under
+    #                           rotated keys still verify
+    #                           indefinitely. The embedded
+    #                           public_key_pem is the verifier input.
+    #   "workspace"           — customer-uploaded ECDSA P-256 key.
+    #                           Customers upload these in Workspace
+    #                           Settings > Security > Signing Key for
+    #                           CI systems that don't issue OIDC
+    #                           tokens (Jenkins, Buildkite, air-gapped
+    #                           runners, etc.). The embedded
+    #                           public_key_pem is the verifier input;
+    #                           the embedded workspace_id binds the
+    #                           key to the workspace that owns the
+    #                           threat model.
+    #   "unverifiable_orphan" — the row's fingerprint does not appear
+    #                           in the issuer's published key set
+    #                           (JWKS / retired-keys history /
+    #                           workspace-uploaded keys). The local
+    #                           signature half cannot be checked, but
+    #                           when the row carries Sigstore
+    #                           provenance the report remains verified
+    #                           via that path. Pinning
+    #                           --expected-workspace-key on an
+    #                           unresolved fingerprint is treated as
+    #                           a hard fail since the pin's intent
+    #                           cannot be satisfied.
+    #
+    # Audit envelopes without a `key_source` field (older issuer
+    # builds) fall through to the legacy fingerprint-blind PEM
+    # verification — same behaviour as before this discriminator was
+    # introduced, so older packages continue to verify unchanged.
+    key_source = ci.get("key_source", "") if ci else ""
+
     if ci and ci.get("signature"):
         try:
             from cryptography.hazmat.primitives import hashes, serialization
@@ -2178,7 +2230,16 @@ def audit(
 
             # Verify signature
             pub_pem = ci.get("public_key_pem", "")
-            if pub_pem:
+            if key_source == "sigstore":
+                # The Sigstore bundle path above is authoritative for
+                # this row; skip the redundant content_integrity verify
+                # entirely. `provenance_verified` already reflects the
+                # bundle's verdict.
+                console.print(
+                    "  Signature:       [cyan]SKIPPED[/cyan] "
+                    "(Sigstore provenance is the trust anchor for this row)"
+                )
+            elif pub_pem:
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])
                 pub_key.verify(sig, stored_hash.encode(), ec.ECDSA(hashes.SHA256()))
@@ -2237,6 +2298,30 @@ def audit(
                         "  Identity pin:    [yellow]SKIPPED[/yellow] "
                         "(no --expected-workspace-key pinned)"
                     )
+            elif key_source == "unverifiable_orphan":
+                # The issuer's published key set has no entry for this
+                # row's fingerprint, so the local signature can't be
+                # cryptographically verified here. When the row carries
+                # Sigstore provenance (verified above), that is the
+                # canonical trust anchor and the report remains
+                # verified — surfaced as a yellow note rather than a
+                # hard fail. When the auditor pinned
+                # --expected-workspace-key the pin's intent cannot be
+                # satisfied without a resolvable key, so fail.
+                fp = ci.get("key_fingerprint", "")
+                console.print(
+                    f"  Signature:       [yellow]UNRESOLVED[/yellow] — "
+                    f"issuer's published key set has no entry for this row's "
+                    f"fingerprint ({fp[:16]}…). When Sigstore provenance is "
+                    "present (above), that is the canonical trust anchor and "
+                    "the report remains verified."
+                )
+                if expected_workspace_key_fingerprint:
+                    console.print(
+                        "  [red]--expected-workspace-key was pinned but the "
+                        "row's fingerprint did not resolve to any known key.[/red]"
+                    )
+                    has_failure = True
             else:
                 console.print("  [yellow]No public key in package — cannot verify signature[/yellow]")
                 if expected_workspace_key_fingerprint:
