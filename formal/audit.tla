@@ -366,6 +366,22 @@ Init == /\ pkg \in Package
         /\ (pkg.bundle = ABSENT
             => /\ pkg.bundle_bind_hash = NONE
                /\ pkg.bundle_bind_signature = NONE)
+        \* When the bundle-bind branch will FAIL early — either because
+        \* bundle_bind_hash is NONE (malformed envelope) or because it
+        \* doesn't equal bundle.bound_hash (mismatched bind) — the
+        \* Audit operator returns FAILED before evaluating the
+        \* bundle_bind_signature check. The signature is dead on those
+        \* states; pin it to NONE so TLC doesn't enumerate the three
+        \* signature values per dead state. Roughly 4/9 of bundle-
+        \* present states fall in this category — significant
+        \* state-space savings, no precision loss (every invariant V
+        \* is invariant under bundle_bind_signature permutations on
+        \* states where the verdict is determined by the prior
+        \* branches).
+        /\ ((pkg.bundle # ABSENT
+             /\ (\/ pkg.bundle_bind_hash = NONE
+                 \/ pkg.bundle.bound_hash # pkg.bundle_bind_hash))
+            => pkg.bundle_bind_signature = NONE)
 
 Next == UNCHANGED vars
 
