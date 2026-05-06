@@ -457,6 +457,7 @@ V1_SigstoreSkipSoundness ==
      /\ pkg.bundle.bound_hash = pkg.results_hash
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
+     /\ pins.issuer_explicit = NONE
      /\ pins.workspace_fp = NONE
      /\ pins.model_id = NONE
      /\ pins.commit_sha = NONE)
@@ -477,6 +478,7 @@ V2_OrphanWithBundleVerified ==
      /\ pkg.bundle.bound_hash = pkg.results_hash
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
+     /\ pins.issuer_explicit = NONE
      /\ pins.workspace_fp = NONE
      /\ pins.model_id = NONE
      /\ pins.commit_sha = NONE)
