@@ -733,16 +733,24 @@ def _all_packages(include_bundle_rows: bool):
     return pkgs
 
 
-def _all_pins(real_san: str | None):
+def _all_pins():
     """Full Pins cross-product over all five dimensions: SAN, issuer,
     workspace fingerprint, model_id, commit_sha. Expansion with
     model_id and commit_sha exercises I12 and I13 for every package
     shape (in particular, the no-bundle / no-results_hash / matched
     bundle rows). Local BFS row count is ~8000, runs in ~80s.
+
+    The "<real_san>" placeholder represents the workflow SAN of the
+    runtime CI run (resolved by `_resolve_pins_san()` at test-execution
+    time). Including it as a constant placeholder — rather than
+    inserting `_REAL_SAN` directly — keeps test-collection deterministic
+    across pytest-xdist workers (each worker may see a different
+    `_REAL_SAN` value or no value at all under transient mint failures;
+    using a placeholder de-couples collection from the network call).
+    Tests requiring the real SAN skip via `_resolve_pins_san()` when
+    `_REAL_SAN` is None at runtime.
     """
-    sans = [NONE, SAN_GH_A, SAN_GH_B, SAN_SELF]
-    if real_san:
-        sans.append(real_san)
+    sans = [NONE, SAN_GH_A, SAN_GH_B, SAN_SELF, "<real_san>"]
     pins_list = []
     for san in sans:
         for iss in [NONE, ISS_GH, ISS_SELF]:
@@ -766,14 +774,43 @@ def _all_pins(real_san: str | None):
     return pins_list
 
 
-# Lazily resolve the real SAN at module import. _ensure_real_bundles()
-# is what actually mints; if it succeeds, _REAL_SAN is populated.
-# We call it eagerly here so PACKAGES / PINS_LIST sizes are stable
-# across the test session (parametrised IDs are computed at collection
-# time and must not change between runs).
-_HAS_REAL_BUNDLES = _ensure_real_bundles()
-PACKAGES = _all_packages(include_bundle_rows=_HAS_REAL_BUNDLES)
-PINS_LIST = _all_pins(_REAL_SAN)
+# PACKAGES enumeration is *deterministic* — always includes bundle
+# rows regardless of whether real Fulcio bundles are available at
+# this moment. The runtime materialiser at _materialise() handles
+# the no-OIDC case via pytest.skip, so non-CI runs and fork-PR runs
+# emit the same test IDs but skip the bundle-row tests at execution
+# time.
+#
+# Critical for pytest-xdist correctness: every worker process imports
+# this module independently, and pytest-xdist requires every worker
+# to collect IDENTICAL test IDs. If the collection were gated by
+# `_ensure_real_bundles()` (which makes a network call to Fulcio
+# that can succeed for some workers and fail for others under
+# transient conditions or rate limits), workers would disagree on
+# PACKAGES and xdist would refuse to run with "Different tests were
+# collected between gw1 and gw2."
+#
+# `_REAL_SAN` is also computed pre-collection, but `_all_pins()`
+# tolerates None (it just doesn't add the real-SAN pin variant —
+# again, no test-ID divergence).
+_ensure_real_bundles()  # populate _REAL_SAN / _REAL_BUNDLES if available
+PACKAGES = _all_packages(include_bundle_rows=True)
+PINS_LIST = _all_pins()
+
+
+def _resolve_pins_san(pins: dict) -> dict:
+    """Replace the placeholder pin SAN with the real workflow SAN.
+
+    Returns the original pins dict if no resolution is needed. Skips
+    the test (via pytest.skip) if the placeholder is set but no real
+    SAN was minted — same skip-pattern as `_materialise()` uses for
+    bundle-present rows.
+    """
+    if pins.get("san") != "<real_san>":
+        return pins
+    if _REAL_SAN is None:
+        pytest.skip("Real-SAN pin needs Fulcio mint (CI OIDC required)")
+    return {**pins, "san": _REAL_SAN}
 
 
 def _resolve_bundle_san(pkg: dict) -> dict:
@@ -857,15 +894,16 @@ def test_implementation_matches_spec(tmp_path, pkg, pins):
     offending (pkg, pins) ID in the test name so it's actionable.
     """
     pkg_resolved = _resolve_bundle_san(pkg)
-    expected = audit_spec(pkg_resolved, pins)
+    pins_resolved = _resolve_pins_san(pins)
+    expected = audit_spec(pkg_resolved, pins_resolved)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
-    result = runner.invoke(main, ["audit", path] + _pin_args(pins))
+    result = runner.invoke(main, ["audit", path] + _pin_args(pins_resolved))
     actual = _classify(result)
     assert actual == expected, (
         f"Spec/impl divergence:\n"
         f"  pkg = {pkg_resolved}\n"
-        f"  pins = {pins}\n"
+        f"  pins = {pins_resolved}\n"
         f"  spec verdict = {expected}\n"
         f"  impl verdict = {actual}\n"
         f"  output:\n{result.output}"
@@ -883,6 +921,7 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     if test_implementation_matches_spec also fails for the same row.
     """
     pkg_resolved = _resolve_bundle_san(pkg)
+    pins = _resolve_pins_san(pins)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
     result = runner.invoke(main, ["audit", path] + _pin_args(pins))
