@@ -61,14 +61,20 @@ jobs:
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
           curl -sL "$TLC_URL" -o tla2tools.jar
           echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
+          # JVM tuning: -Xmx8g headroom for the audit.tla state space
+          # (~57M distinct states post key_source extension); ParallelGC
+          # cuts GC stalls on the large young-gen the BFS produces.
+          # Both flags are precision-preserving — they tune wall-clock,
+          # not the verdict.
+          JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
           echo "--- TLC: VerificationPipeline reverify=false ---"
-          java -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
+          java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: VerificationPipeline reverify=true ---"
-          java -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
+          java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: audit (compromised-platform invariants I1-I7) ---"
-          java -jar tla2tools.jar -config audit.cfg -workers auto audit.tla
+          java $JAVA_OPTS -jar tla2tools.jar -config audit.cfg -workers auto audit.tla
           echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R10) ---"
-          java -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
+          java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
         working-directory: formal
 
   test-spec-invariants:
@@ -98,7 +104,15 @@ jobs:
         run: pip install --require-hashes -r requirements.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx
+        run: pip install --no-deps -e . && pip install pytest pytest-mock respx pytest-xdist
 
       - name: Run audit-spec BFS implementation check
-        run: python -m pytest -v tests/test_spec_invariants.py
+        # Parallelize across all available CPU cores via pytest-xdist.
+        # Parametrized rows are pure functions of (pkg, pins) — no
+        # shared state between rows, so xdist-safe by construction.
+        # Real Fulcio bundle minting is per-worker (each xdist worker
+        # is a distinct process and re-mints its bundle set on first
+        # use); the 4 worker × ~8 predicate-combo mint cost is well
+        # under one minute, and the ~7,200-row BFS work is the
+        # dominant cost — net 3-4x speedup on a 4-core runner.
+        run: python -m pytest -v -n auto tests/test_spec_invariants.py
