@@ -72,11 +72,34 @@ C2 = "commit-sha-2"
 NONE = None
 ABSENT = "ABSENT"
 
-# Two real ECDSA keypairs — fingerprints are computed canonically
-# (SHA-256 of DER SubjectPublicKeyInfo), the same way the platform
-# and the audit verifier compute them.
-def _genkey() -> ec.EllipticCurvePrivateKey:
-    return ec.generate_private_key(ec.SECP256R1())
+# Two ECDSA keypairs deterministically derived from constant scalars.
+# Used to back the BFS's notion of "fingerprint A" and "fingerprint
+# B" — concrete values both the spec and the implementation can
+# verify signatures against.
+#
+# Deterministic derivation (rather than ec.generate_private_key()) is
+# load-bearing under pytest-xdist: every xdist worker process imports
+# this module independently, so per-worker fresh keys would embed
+# different fingerprints into the parametrize IDs of PACKAGES — and
+# xdist requires every worker to collect the *same* test IDs. Using
+# a fixed scalar produces the same key every time without any private
+# key material in source.
+#
+# The scalars are arbitrary — chosen as the SHA-256 hash of a known
+# label, mod the P-256 curve order. Same approach as RFC 6979's
+# deterministic ECDSA, just for keypair derivation rather than nonce
+# derivation. The keys are throwaway test fixtures.
+_P256_ORDER = (
+    0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+)
+
+
+def _derive_key(label: bytes) -> ec.EllipticCurvePrivateKey:
+    scalar = int.from_bytes(hashlib.sha256(label).digest(), "big")
+    # Map into the valid range [1, n-1]. The hash is uniform-random
+    # over a 256-bit space; mod-(n-1) plus 1 gets us a valid scalar.
+    scalar = (scalar % (_P256_ORDER - 1)) + 1
+    return ec.derive_private_key(scalar, ec.SECP256R1())
 
 
 def _fp(key: ec.EllipticCurvePrivateKey) -> str:
@@ -87,8 +110,8 @@ def _fp(key: ec.EllipticCurvePrivateKey) -> str:
     return hashlib.sha256(der).hexdigest()
 
 
-KEY_A = _genkey()
-KEY_B = _genkey()
+KEY_A = _derive_key(b"mipiti-test-spec-invariants-key-a")
+KEY_B = _derive_key(b"mipiti-test-spec-invariants-key-b")
 FP_A = _fp(KEY_A)
 FP_B = _fp(KEY_B)
 
