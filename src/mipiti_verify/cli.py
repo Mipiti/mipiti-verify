@@ -1926,8 +1926,31 @@ def audit(
                         # the trust chain, signature, and Rekor inclusion;
                         # we manually verify the artifact-binding by
                         # comparing the Statement's Subject digest to
-                        # sha256(content_hash_str.encode()) — the same
-                        # check verify_artifact would perform internally.
+                        # the envelope's `bundle_bind_hash` field.
+                        #
+                        # Bundle-bind contract (envelope-observable):
+                        #
+                        # The envelope's content_integrity block carries
+                        # `bundle_bind_hash` — the same hex digest the
+                        # issuer minted into the bundle's in-toto Subject
+                        # at signing time. The verifier compares the two
+                        # values directly: no canonicalisation, no
+                        # rehashing on either side. This is a deliberate
+                        # break from the older Subject-vs-results_hash
+                        # link, which conflated two distinct domains
+                        # (bundle binding vs results-hash content
+                        # integrity) and accidentally double-hashed the
+                        # binding value, producing a guaranteed mismatch
+                        # against any well-formed bundle.
+                        #
+                        # `bundle_bind_signature` (when populated) is an
+                        # ECDSA signature over `bundle_bind_hash` produced
+                        # by the platform key whose public material is
+                        # already embedded in the envelope as
+                        # `content_integrity.public_key_pem`. Verifying it
+                        # gives the auditor tamper-evidence on the binding
+                        # claim itself — flipping bundle_bind_hash without
+                        # also forging the signature is detected here.
                         payload_type, payload_bytes = verifier.verify_dsse(
                             bundle, sig_policy
                         )
@@ -1937,9 +1960,28 @@ def audit(
                                 "(expected 'application/vnd.in-toto+json')"
                             )
                         statement = json.loads(payload_bytes)
-                        expected_subject_digest = hashlib.sha256(
-                            content_hash_str.encode("utf-8")
-                        ).hexdigest()
+                        bundle_bind_hash_raw = ci.get("bundle_bind_hash", "")
+                        if not isinstance(bundle_bind_hash_raw, str):
+                            bundle_bind_hash_raw = ""
+                        bundle_bind_signature = ci.get(
+                            "bundle_bind_signature", ""
+                        )
+                        if not isinstance(bundle_bind_signature, str):
+                            bundle_bind_signature = ""
+                        if not bundle_bind_hash_raw:
+                            raise ValueError(
+                                "Bundle present but no bundle_bind_hash in "
+                                "content_integrity. The envelope contract "
+                                "requires the issuer to populate this field "
+                                "alongside any Sigstore bundle so the "
+                                "verifier can bind the bundle to the "
+                                "envelope without canonicalisation."
+                            )
+                        expected_subject_digest = (
+                            bundle_bind_hash_raw[len("sha256:"):]
+                            if bundle_bind_hash_raw.startswith("sha256:")
+                            else bundle_bind_hash_raw
+                        )
                         subjects = statement.get("subject", []) or []
                         if not any(
                             isinstance(s, dict)
@@ -1949,13 +1991,63 @@ def audit(
                         ):
                             raise ValueError(
                                 "Bundle Subject digest does not match "
-                                "sha256(content_integrity.results_hash); the "
-                                "bundle was signed for a different artifact "
-                                "than the package claims."
+                                "content_integrity.bundle_bind_hash; the "
+                                "bundle was signed over a different value "
+                                "than the envelope claims."
                             )
+                        # Platform tamper-detection on bundle_bind_hash.
+                        # When the envelope carries a signature over the
+                        # binding value, verify it against the platform
+                        # public key already embedded in the envelope.
+                        # Fail-closed: an invalid or malformed signature
+                        # is a fail, not a soft warning. A missing
+                        # signature is permitted (see the comment block
+                        # above) — only the issuer-side surface decides
+                        # whether to populate it.
+                        if bundle_bind_signature:
+                            from cryptography.hazmat.primitives import (
+                                hashes as _bb_hashes,
+                                serialization as _bb_serialization,
+                            )
+                            from cryptography.hazmat.primitives.asymmetric import (
+                                ec as _bb_ec,
+                            )
+                            pub_pem_for_bind = ci.get("public_key_pem", "")
+                            if not pub_pem_for_bind:
+                                raise ValueError(
+                                    "bundle_bind_signature is present but "
+                                    "the envelope has no public_key_pem to "
+                                    "verify it against."
+                                )
+                            try:
+                                bb_pub = _bb_serialization.load_pem_public_key(
+                                    pub_pem_for_bind.encode()
+                                )
+                                bb_sig_bytes = base64.b64decode(
+                                    bundle_bind_signature
+                                )
+                                bb_pub.verify(
+                                    bb_sig_bytes,
+                                    bundle_bind_hash_raw.encode("utf-8"),
+                                    _bb_ec.ECDSA(_bb_hashes.SHA256()),
+                                )
+                            except Exception as bb_err:
+                                raise ValueError(
+                                    f"bundle_bind_signature INVALID — {bb_err}"
+                                )
                         provenance_verified = True
                         console.print("  Bundle signature: [green]VERIFIED[/green]")
                         console.print("  Rekor inclusion:  [green]VERIFIED[/green] (Merkle proof checked)")
+                        if bundle_bind_signature:
+                            console.print(
+                                "  Bundle bind:      [green]VERIFIED[/green] "
+                                "(explicit hash + platform signature)"
+                            )
+                        else:
+                            console.print(
+                                "  Bundle bind:      [green]VERIFIED[/green] "
+                                "(explicit hash)"
+                            )
                         if expected_ci_identity and resolved_issuer:
                             issuer_note = "" if expected_issuer else " (issuer derived from SAN prefix)"
                             console.print(
@@ -2273,6 +2365,28 @@ def audit(
                                 f"got {computed_fp!r})."
                             )
                             has_failure = True
+            elif key_source == "unverifiable_orphan":
+                # Key-source-aware paths take precedence over the
+                # legacy fingerprint-blind PEM verification below. The
+                # envelope's public_key_pem may still be populated on
+                # an orphan row (e.g. when the platform attached its
+                # own key for the bundle-bind signature), but its
+                # presence is unrelated to the row's signing identity.
+                # Branch handler is below.
+                fp = ci.get("key_fingerprint", "")
+                console.print(
+                    f"  Signature:       [yellow]UNRESOLVED[/yellow] — "
+                    f"issuer's published key set has no entry for this row's "
+                    f"fingerprint ({fp[:16]}…). When Sigstore provenance is "
+                    "present (above), that is the canonical trust anchor and "
+                    "the report remains verified."
+                )
+                if expected_workspace_key_fingerprint:
+                    console.print(
+                        "  [red]--expected-workspace-key was pinned but the "
+                        "row's fingerprint did not resolve to any known key.[/red]"
+                    )
+                    has_failure = True
             elif pub_pem:
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])
@@ -2332,30 +2446,6 @@ def audit(
                         "  Identity pin:    [yellow]SKIPPED[/yellow] "
                         "(no --expected-workspace-key pinned)"
                     )
-            elif key_source == "unverifiable_orphan":
-                # The issuer's published key set has no entry for this
-                # row's fingerprint, so the local signature can't be
-                # cryptographically verified here. When the row carries
-                # Sigstore provenance (verified above), that is the
-                # canonical trust anchor and the report remains
-                # verified — surfaced as a yellow note rather than a
-                # hard fail. When the auditor pinned
-                # --expected-workspace-key the pin's intent cannot be
-                # satisfied without a resolvable key, so fail.
-                fp = ci.get("key_fingerprint", "")
-                console.print(
-                    f"  Signature:       [yellow]UNRESOLVED[/yellow] — "
-                    f"issuer's published key set has no entry for this row's "
-                    f"fingerprint ({fp[:16]}…). When Sigstore provenance is "
-                    "present (above), that is the canonical trust anchor and "
-                    "the report remains verified."
-                )
-                if expected_workspace_key_fingerprint:
-                    console.print(
-                        "  [red]--expected-workspace-key was pinned but the "
-                        "row's fingerprint did not resolve to any known key.[/red]"
-                    )
-                    has_failure = True
             else:
                 console.print("  [yellow]No public key in package — cannot verify signature[/yellow]")
                 if expected_workspace_key_fingerprint:

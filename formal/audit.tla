@@ -102,7 +102,22 @@ Package == [
     bundle                 : (Bundle \cup {ABSENT}),
     ws_sig                 : (WSSig \cup {ABSENT}),
     results_hash           : (Hashes \cup {NONE}),
-    results_canonical_hash : Hashes
+    results_canonical_hash : Hashes,
+    \* bundle_bind_hash: the explicit envelope-level hash the verifier
+    \* compares to bundle.bound_hash (the bundle's in-toto Subject
+    \* digest). The verifier does NOT canonicalise or rehash either
+    \* side; equality is checked directly. NONE means the envelope
+    \* omitted the field — accepted only when the envelope carries no
+    \* bundle (post-cutover envelopes always pair the two).
+    \*
+    \* bundle_bind_signature: BOOLEAN abstraction of "the platform
+    \* signature over bundle_bind_hash verifies against the platform
+    \* public key already embedded in the envelope." TRUE means the
+    \* signature is present and valid; FALSE means present but
+    \* invalid (or missing public key); ABSENT (modelled as NONE
+    \* below) means the envelope omitted the signature entirely.
+    bundle_bind_hash       : (Hashes \cup {NONE}),
+    bundle_bind_signature  : (BOOLEAN \cup {NONE})
 ]
 
 Pins == [
@@ -212,20 +227,44 @@ Audit(k, q) ==
     ELSE IF k.bundle # ABSENT /\ ~k.bundle.valid
     THEN "FAILED"
 
-    \* Bundle present but doesn't bind to package's claimed results_hash.
-    ELSE IF k.bundle # ABSENT /\ k.results_hash # NONE
-         /\ k.bundle.bound_hash # k.results_hash
+    \* Bundle present but the envelope's explicit binding hash is
+    \* missing or doesn't equal the bundle's Subject digest. The
+    \* verifier reads bundle_bind_hash directly off the envelope and
+    \* compares to bundle.bound_hash with no rehashing on either
+    \* side; absence of bundle_bind_hash on a bundle-bearing envelope
+    \* is a hard fail (older envelopes that omitted the field are
+    \* not supported).
+    ELSE IF k.bundle # ABSENT /\ k.bundle_bind_hash = NONE
     THEN "FAILED"
 
-    \* Bundle present but no results_hash to bind to. The platform
-    \* produces bundles together with content_integrity.results_hash;
-    \* a bundle without the corresponding hash is a malformed /
-    \* tampered package shape. Fail unconditionally — a workspace-
-    \* ECDSA fallback path that would otherwise yield VERIFIED is
-    \* not allowed when a Sigstore bundle is also in the package
-    \* but cannot be verified.
+    ELSE IF k.bundle # ABSENT
+         /\ k.bundle_bind_hash # NONE
+         /\ k.bundle.bound_hash # k.bundle_bind_hash
+    THEN "FAILED"
+
+    \* Bundle present + bundle_bind_signature populated but invalid.
+    \* The platform signature over bundle_bind_hash gives the auditor
+    \* tamper-evidence on the binding claim itself; an invalid
+    \* signature is a hard fail. NONE means the envelope omitted the
+    \* signature — that's permitted; only present-but-invalid fails.
+    ELSE IF k.bundle # ABSENT
+         /\ k.bundle_bind_signature = FALSE
+    THEN "FAILED"
+
+    \* Bundle present but no results_hash to bind the canonical hash
+    \* check to. The issuer pairs each bundle with a results_hash for
+    \* canonical-hash content-integrity; a bundle without it is a
+    \* malformed / tampered envelope shape. Fail unconditionally — a
+    \* workspace-ECDSA fallback path that would otherwise yield
+    \* VERIFIED is not allowed when a Sigstore bundle is also in the
+    \* package but cannot be verified.
     ELSE IF k.bundle # ABSENT /\ k.results_hash = NONE
     THEN "FAILED"
+
+    \* Bundle ↔ envelope binding is checked above against the
+    \* explicit bundle_bind_hash field. results_hash is independently
+    \* recomputed downstream against the platform's content-integrity
+    \* signature; it is not part of the bundle-bind check.
 
     \* Bundle present + model_id pin + bundle predicate doesn't match.
     ELSE IF k.bundle # ABSENT /\ q.model_id # NONE
@@ -315,6 +354,34 @@ Audit(k, q) ==
 (***************************************************************************)
 Init == /\ pkg \in Package
         /\ pins \in Pins
+        \* When the envelope carries no bundle, bundle_bind_hash and
+        \* bundle_bind_signature describe the bundle-bind relationship
+        \* for an absent bundle and have no observable behaviour — the
+        \* Audit operator never reads them when bundle = ABSENT. Pin
+        \* them to canonical "absent" sentinels so TLC does not
+        \* enumerate equivalent-output duplicates. Precision-preserving:
+        \* every invariant V is invariant under bundle_bind_*
+        \* permutations when bundle = ABSENT, so collapsing those
+        \* states cannot hide a counterexample.
+        /\ (pkg.bundle = ABSENT
+            => /\ pkg.bundle_bind_hash = NONE
+               /\ pkg.bundle_bind_signature = NONE)
+        \* When the bundle-bind branch will FAIL early — either because
+        \* bundle_bind_hash is NONE (malformed envelope) or because it
+        \* doesn't equal bundle.bound_hash (mismatched bind) — the
+        \* Audit operator returns FAILED before evaluating the
+        \* bundle_bind_signature check. The signature is dead on those
+        \* states; pin it to NONE so TLC doesn't enumerate the three
+        \* signature values per dead state. Roughly 4/9 of bundle-
+        \* present states fall in this category — significant
+        \* state-space savings, no precision loss (every invariant V
+        \* is invariant under bundle_bind_signature permutations on
+        \* states where the verdict is determined by the prior
+        \* branches).
+        /\ ((pkg.bundle # ABSENT
+             /\ (\/ pkg.bundle_bind_hash = NONE
+                 \/ pkg.bundle.bound_hash # pkg.bundle_bind_hash))
+            => pkg.bundle_bind_signature = NONE)
 
 Next == UNCHANGED vars
 
@@ -398,17 +465,16 @@ I7_SanRequiredForCoPins ==
     => Audit(pkg, pins) = "USAGE_ERROR"
 
 \* I8 — bundle present + positive verdict ⇒ bundle's bound_hash
-\* equals the package's claimed results_hash. Defense-in-depth on
-\* top of Sigstore's verify_artifact, which raises when the bundle's
-\* Subject digest doesn't equal sha256(input_). With the malformed-
-\* bundle (no results_hash) case now an unconditional FAILED in the
-\* Audit operator, this invariant holds without an ws_sig=ABSENT
-\* exception.
-I8_BundleBoundToResultsHash ==
+\* equals the explicit envelope bundle_bind_hash field. results_hash
+\* is independently recomputed downstream against the platform's
+\* content-integrity signature; it is not part of the bundle-bind
+\* check. A malformed envelope where a bundle is present without a
+\* bundle_bind_hash is unconditionally FAILED by the Audit operator.
+I8_BundleBoundToBundleBindHash ==
     (Audit(pkg, pins) \in {"VERIFIED", "PARTIALLY_VERIFIED"}
      /\ pkg.bundle # ABSENT)
-    => /\ pkg.results_hash # NONE
-       /\ pkg.bundle.bound_hash = pkg.results_hash
+    => /\ pkg.bundle_bind_hash # NONE
+       /\ pkg.bundle.bound_hash = pkg.bundle_bind_hash
 
 \* I9 — VERIFIED requires every present signature to verify, not just
 \* one. I5 alone is too weak: it allows VERIFIED when ANY signature
@@ -479,6 +545,25 @@ I13_BundleCommitShaMatchesPin ==
      /\ pins.commit_sha # NONE)
     => pkg.bundle.predicate_commit_sha = pins.commit_sha
 
+\* I14 — VERIFIED with bundle present implies the envelope's explicit
+\* bundle_bind_hash is populated AND equals the bundle's in-toto
+\* Subject digest (bundle.bound_hash). When bundle_bind_signature is
+\* present, it must be valid. The verifier compares both values
+\* directly with no canonicalisation, no rehashing — the contract is
+\* "envelope says X, bundle was signed over X." Defends against:
+\*   - issuer-side regressions where the binding value is computed
+\*     differently on signing vs verifying sides;
+\*   - silent acceptance of a bundle whose Subject digest doesn't
+\*     match anything the envelope explicitly commits to;
+\*   - tampered bundle_bind_hash (caught by signature check when the
+\*     issuer populated bundle_bind_signature).
+I14_BundleBindExplicit ==
+    (Audit(pkg, pins) = "VERIFIED"
+     /\ pkg.bundle # ABSENT)
+    => /\ pkg.bundle_bind_hash # NONE
+       /\ pkg.bundle.bound_hash = pkg.bundle_bind_hash
+       /\ pkg.bundle_bind_signature # FALSE
+
 \* V1 — Sigstore-skip soundness. When the issuer marks a row's
 \* ws_sig with key_source = KS_SIGSTORE, the verifier MUST NOT FAIL
 \* the audit on ws_sig.valid alone (the sigstore bundle path is the
@@ -494,7 +579,8 @@ V1_SigstoreSkipSoundness ==
      /\ pkg.bundle # ABSENT
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
-     /\ pkg.bundle.bound_hash = pkg.results_hash
+     /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+     /\ pkg.bundle_bind_signature # FALSE
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
      /\ pins.issuer_explicit = NONE
@@ -515,7 +601,8 @@ V2_OrphanWithBundleVerified ==
      /\ pkg.bundle # ABSENT
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
-     /\ pkg.bundle.bound_hash = pkg.results_hash
+     /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+     /\ pkg.bundle_bind_signature # FALSE
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
      /\ pins.issuer_explicit = NONE
@@ -555,12 +642,13 @@ SecurityInvariants ==
     /\ I5_VerifiedImpliesEvidence
     /\ I6_ContentHashBoundToResults
     /\ I7_SanRequiredForCoPins
-    /\ I8_BundleBoundToResultsHash
+    /\ I8_BundleBoundToBundleBindHash
     /\ I9_AllPresentSignaturesValid
     /\ I10_UnboundBundleNotVerified
     /\ I11_BundleSanMatchesPin
     /\ I12_BundleModelIdMatchesPin
     /\ I13_BundleCommitShaMatchesPin
+    /\ I14_BundleBindExplicit
     /\ V1_SigstoreSkipSoundness
     /\ V2_OrphanWithBundleVerified
     /\ V3_OrphanWithWorkspacePinFails

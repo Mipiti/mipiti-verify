@@ -752,13 +752,24 @@ class TestPredicatePins:
         """Build a package whose provenance contains a bundle JSON
         that, when mocked-verified, returns the supplied DSSE
         predicate. The bundle JSON itself doesn't need to be valid
-        because the verifier is mocked end-to-end."""
+        because the verifier is mocked end-to-end.
+
+        The bundle's Subject digest matches `bundle_bind_hash` in the
+        content_integrity block — that is the explicit binding the
+        post-cutover verifier checks (no rehashing on either side).
+        """
         import base64 as _b64
         import hashlib as _h
         import json as _j
 
         canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
         results_hash = "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+        # Pick any content-hash-shaped value as the bundle bind anchor;
+        # the mocked verifier returns whatever digest we put in the
+        # statement's Subject and the verifier compares it directly to
+        # bundle_bind_hash. Using the same value keeps the helper's
+        # invariant-shape simple.
+        bundle_bind_hash_hex = _h.sha256(results_hash.encode()).hexdigest()
         pkg = {
             "model": {"id": "m1"},
             "controls": [],
@@ -766,6 +777,7 @@ class TestPredicatePins:
             "provenance": {"bundle": "{\"placeholder\": true}"},
             "content_integrity": {
                 "results_hash": results_hash,
+                "bundle_bind_hash": bundle_bind_hash_hex,
             },
             "assertions_by_control": {},
             "sufficiency": {},
@@ -779,7 +791,7 @@ class TestPredicatePins:
                 {
                     "name": "test",
                     "digest": {
-                        "sha256": _h.sha256(results_hash.encode()).hexdigest()
+                        "sha256": bundle_bind_hash_hex
                     },
                 }
             ],
@@ -957,6 +969,180 @@ class TestPredicatePins:
         assert result.exit_code == 1
         out_flat = " ".join(result.output.split())
         assert "MISMATCH" in out_flat
+
+
+class TestBundleBindExplicit:
+    """I14 — explicit bundle_bind_hash on the envelope.
+
+    The verifier reads `content_integrity.bundle_bind_hash` directly
+    off the envelope and compares to the bundle's in-toto Subject
+    digest with no canonicalisation, no rehashing on either side.
+    Older envelopes that omit the field are rejected (no legacy
+    fallback). When `bundle_bind_signature` is populated, the
+    verifier checks it against the platform public key already
+    embedded in the envelope.
+    """
+
+    def _build_pkg_with_bind(self, tmp_path, *, bundle_bind_hash,
+                              subject_digest, sign_with_key=None,
+                              valid_signature=True,
+                              omit_signature=False):
+        """Build a minimal audit package shaped for the bundle-bind
+        verifier branch: a placeholder bundle (the Sigstore client is
+        mocked to return our chosen statement), an explicit
+        bundle_bind_hash, and (optionally) a platform signature over
+        bundle_bind_hash. The mocked verify_dsse returns a statement
+        whose Subject digest is `subject_digest` — which the verifier
+        compares directly to `bundle_bind_hash`.
+        """
+        import base64 as _b64
+        import hashlib as _h
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        results_hash = "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+
+        if sign_with_key is None:
+            sign_with_key = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = sign_with_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+
+        ci = {
+            "results_hash": results_hash,
+            "public_key_pem": pub_pem,
+        }
+        if bundle_bind_hash is not None:
+            ci["bundle_bind_hash"] = bundle_bind_hash
+            if not omit_signature:
+                msg = (
+                    bundle_bind_hash.encode("utf-8")
+                    if valid_signature
+                    else b"forgery-attempt"
+                )
+                bb_sig = sign_with_key.sign(msg, ec.ECDSA(hashes.SHA256()))
+                ci["bundle_bind_signature"] = _b64.b64encode(bb_sig).decode()
+
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": ci,
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "t", "digest": {"sha256": subject_digest}}
+            ],
+            "predicateType": "https://mipiti.io/attestations/v1/verification-run",
+            "predicate": {"model_id": "m1", "pipeline": {"commit_sha": "abc"}},
+        }
+        return str(path), statement
+
+    def _patch_sigstore(self, statement):
+        """Patch the Sigstore Bundle and Verifier symbols so verify_dsse
+        returns the supplied Statement payload. Same shape as the
+        existing TestPredicatePins helper."""
+        import json as _j
+        from datetime import datetime, timezone
+
+        from unittest.mock import MagicMock, patch
+
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_cert.not_valid_after_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_log = MagicMock()
+        fake_log.log_index = 1
+        fake_log.integrated_time = 0
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+        fake_bundle.log_entry = fake_log
+
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/vnd.in-toto+json",
+            _j.dumps(statement).encode("utf-8"),
+        )
+
+        return (
+            patch("sigstore.models.Bundle.from_json", return_value=fake_bundle),
+            patch("sigstore.verify.Verifier.production", return_value=fake_verifier),
+        )
+
+    def test_matching_bind_hash_verifies(self, tmp_path):
+        """Modern envelope: bundle present + bundle_bind_hash matching
+        the bundle's Subject digest + valid platform signature →
+        verifier emits the green 'Bundle bind: VERIFIED' line and the
+        audit succeeds (no failure on the bind check)."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "ab" * 32  # arbitrary 32-byte hex
+        path, statement = self._build_pkg_with_bind(
+            tmp_path,
+            bundle_bind_hash=bind_hex,
+            subject_digest=bind_hex,
+            sign_with_key=key,
+            valid_signature=True,
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        out_flat = " ".join(result.output.split())
+        assert "Bundle bind:" in out_flat
+        assert "VERIFIED" in out_flat
+        # The bind branch must not have produced a failure marker.
+        assert "Bundle Subject digest does not match" not in out_flat
+        assert "bundle_bind_signature INVALID" not in out_flat
+
+    def test_missing_bind_hash_fails(self, tmp_path):
+        """Bundle present without bundle_bind_hash on the envelope =
+        FAILED. The post-cutover verifier rejects envelopes that omit
+        the explicit binding (no legacy fallback)."""
+        bind_hex = "cd" * 32
+        path, statement = self._build_pkg_with_bind(
+            tmp_path,
+            bundle_bind_hash=None,  # field omitted on envelope
+            subject_digest=bind_hex,
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert (
+            "no bundle_bind_hash" in out_flat
+            or "Bundle present but no bundle_bind_hash" in out_flat
+        )
+
+    def test_mismatched_bind_hash_fails(self, tmp_path):
+        """bundle_bind_hash claims one digest, bundle's Subject is over
+        a different digest → FAILED with the bind-mismatch diagnostic."""
+        path, statement = self._build_pkg_with_bind(
+            tmp_path,
+            bundle_bind_hash="ee" * 32,
+            subject_digest="ff" * 32,  # bundle was minted over a
+                                        # different value
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Bundle Subject digest does not match" in out_flat
 
 
 class TestInferIssuer:

@@ -7,6 +7,15 @@ against the same invariants. It complements the `VerificationPipeline`
 spec in this directory which covers the verification pipeline's
 fail-closed properties.
 
+The bundle-binding contract (I14) is observable purely from the
+envelope: the `content_integrity` block carries `bundle_bind_hash`
+(and optionally `bundle_bind_signature`); the verifier compares
+the value against the bundle's in-toto Subject digest directly,
+with no canonicalisation. This verifier version requires
+post-cutover envelopes — older envelopes that omit
+`bundle_bind_hash` are rejected when a Sigstore bundle is
+present.
+
 ## Files
 
 - `audit.tla` — TLA+ module. Models the verifier as a pure function
@@ -183,15 +192,16 @@ or by reading the bundle's predicate out-of-band.
   the audit would not catch the discrepancy. The canonical-hash
   check is now hoisted to run whenever `results_hash` is claimed.
 - Usage error for pinning issuer alone (`I7`).
-- Bundle bound_hash matches results_hash on positive verdict (`I8`)
-  — defense-in-depth on top of Sigstore's verify_artifact.
+- Bundle bound_hash matches the envelope's `bundle_bind_hash` on
+  positive verdict (`I8`) — defense-in-depth on top of Sigstore's
+  verify_artifact.
 - All present signatures must be valid, not just one (`I9`).
   Strengthens `I5`: a VERIFIED package with a valid bundle and an
   invalid co-located workspace signature is not VERIFIED.
 - Unbindable bundle (no results_hash) cannot yield VERIFIED (`I10`).
-  Surfaced as a spec/impl divergence by the formal review: the
-  spec previously said VERIFIED for bundle-present + no-pin + no-
-  results_hash, but the implementation correctly emits UNVERIFIED.
+  A bundle present without the results_hash it was minted to bind
+  to is structurally malformed; the audit emits UNVERIFIED rather
+  than letting the bundle quietly drop from verification.
 - Bundle SAN matches the auditor pin on VERIFIED (`I11`) —
   symmetric counterpart of `I3` for SAN.
 - Bundle predicate `model_id` matches the auditor pin (`I12`) —
@@ -202,6 +212,21 @@ or by reading the bundle's predicate out-of-band.
   (`I13`) — defends against replay of an older verification run
   for a different commit. Same source: signed predicate, not outer
   metadata.
+- Bundle bind via explicit envelope hash (`I14`). The envelope
+  carries a `bundle_bind_hash` field that the verifier compares
+  *directly* to the bundle's in-toto Subject digest — no
+  canonicalisation, no rehashing on either side. When the envelope
+  also carries `bundle_bind_signature`, the verifier checks it
+  against the platform public key embedded alongside it. A
+  Sigstore bundle present in the envelope without `bundle_bind_hash`
+  is rejected: an envelope-side binding is required to verify that
+  the bundle is bound to the package the auditor was handed. Defends against:
+    - issuer-side regressions where the binding value is computed
+      one way at signing and another way at verifying;
+    - silent acceptance of a bundle whose Subject digest doesn't
+      match anything the envelope explicitly commits to;
+    - tampered `bundle_bind_hash` (caught by the platform
+      signature when populated).
 
 **Abstracted away (oracles)**:
 - The Sigstore trust chain (Fulcio CA + Rekor inclusion proof + SCT)
