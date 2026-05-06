@@ -354,6 +354,18 @@ Audit(k, q) ==
 (***************************************************************************)
 Init == /\ pkg \in Package
         /\ pins \in Pins
+        \* When the envelope carries no bundle, bundle_bind_hash and
+        \* bundle_bind_signature describe the bundle-bind relationship
+        \* for an absent bundle and have no observable behaviour — the
+        \* Audit operator never reads them when bundle = ABSENT. Pin
+        \* them to canonical "absent" sentinels so TLC does not
+        \* enumerate equivalent-output duplicates. Precision-preserving:
+        \* every invariant V is invariant under bundle_bind_*
+        \* permutations when bundle = ABSENT, so collapsing those
+        \* states cannot hide a counterexample.
+        /\ (pkg.bundle = ABSENT
+            => /\ pkg.bundle_bind_hash = NONE
+               /\ pkg.bundle_bind_signature = NONE)
 
 Next == UNCHANGED vars
 
