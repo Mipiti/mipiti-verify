@@ -370,14 +370,22 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig: claimed_fp (when present) must match signing_key_fp.
+    # Skipped for KS_SIGSTORE — sigstore is the trust anchor, ws_sig
+    # is the issuer's redundant notarization, not a customer claim.
+    ws_key_source = ws_sig.get("key_source", "legacy") if ws_sig is not ABSENT else None
     if (
         ws_sig is not ABSENT
+        and ws_key_source != "sigstore"
         and ws_sig["claimed_fp"] is not None
         and ws_sig["claimed_fp"] != ws_sig["signing_key_fp"]
     ):
         return "FAILED"
 
     # Workspace sig + pin: signing_key_fp must match pinned fp.
+    # KS_ORPHAN rows have signing_key_fp not in published key set —
+    # workspace_fp pin against an orphan row falls through here when
+    # the fingerprint comparison fails (which it always will for
+    # orphan rows, since orphan_fp != any registered workspace_fp).
     if (
         ws_sig is not ABSENT
         and pins["workspace_fp"] is not None
@@ -386,7 +394,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig present but signature itself invalid.
-    if ws_sig is not ABSENT and not ws_sig["valid"]:
+    # Skipped for KS_SIGSTORE (the bundle is the trust anchor — the
+    # redundant ws_sig is not re-verified) and for KS_ORPHAN (the
+    # row's key was not in the issuer's published set, so
+    # ws_sig.valid is "unknown" rather than "invalid"; verdict
+    # relies on bundle path or falls to UNVERIFIED).
+    if (
+        ws_sig is not ABSENT
+        and ws_key_source not in ("sigstore", "unverifiable_orphan")
+        and not ws_sig["valid"]
+    ):
         return "FAILED"
 
     # Hash mismatch between claimed and canonical.
@@ -403,7 +420,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     # provenance_verified = False. Without this clause the spec would
     # diverge from the implementation in the no-pin + bundle-but-no-
     # results_hash case.
-    if (bundle is ABSENT or pkg["results_hash"] is None) and ws_sig is ABSENT:
+    #
+    # Refined for key_source: KS_SIGSTORE-tagged and KS_ORPHAN-tagged
+    # ws_sigs do not contribute to verifier confidence on their own
+    # (former is sigstore-skipped, latter is unverifiable). Treat
+    # them like ABSENT for this UNVERIFIED check.
+    ws_no_evidence = (
+        ws_sig is ABSENT
+        or ws_key_source in ("sigstore", "unverifiable_orphan")
+    )
+    if (bundle is ABSENT or pkg["results_hash"] is None) and ws_no_evidence:
         return "UNVERIFIED"
 
     return "VERIFIED"
@@ -451,6 +477,18 @@ def _materialise(tmp_path, pkg: dict) -> str:
             "key_fingerprint": ws_sig["claimed_fp"] or "",
             "public_key_pem": pub_pem,
         }
+        # Pass key_source through to the envelope so the verifier
+        # branches on it. Legacy rows omit the field (legacy issuer
+        # builds didn't emit it); explicit values exercise V1/V2/V3.
+        ks = ws_sig.get("key_source", "legacy")
+        if ks != "legacy":
+            ci["key_source"] = ks
+        if ks == "unverifiable_orphan":
+            # Orphan rows have no resolvable PEM by definition. The
+            # verifier branches on this state and surfaces UNRESOLVED
+            # rather than verifying against the embedded PEM.
+            ci["public_key_pem"] = ""
+            ci["unavailable_reason"] = "unresolved_fingerprint"
 
     # --- provenance (Sigstore bundle) ---
     provenance = None
@@ -553,7 +591,9 @@ def _all_packages(include_bundle_rows: bool):
         "results_canonical_hash": "h1",
     })
     # Workspace-signed packages with each (signing_key_fp, claimed_fp,
-    # valid) combination.
+    # valid) combination. key_source = "legacy" preserves the
+    # pre-discriminator semantics (ws_sig.valid required for VERIFIED)
+    # so the existing 7,200-row BFS coverage of I1-I13 is unchanged.
     for signing_fp in [FP_A, FP_B]:
         for claimed_fp in [NONE, FP_A, FP_B]:
             for valid in [True, False]:
@@ -565,6 +605,7 @@ def _all_packages(include_bundle_rows: bool):
                             "claimed_fp": claimed_fp,
                             "message_hash": results_hash,
                             "valid": valid,
+                            "key_source": "legacy",
                         },
                         "results_hash": results_hash,
                         "results_canonical_hash": "h1",
@@ -636,6 +677,33 @@ def _all_packages(include_bundle_rows: bool):
                 "results_hash": NONE,
                 "results_canonical_hash": "h1",
             })
+
+        # V1 / V2 / V3 coverage: rows where ws_sig.key_source is
+        # KS_SIGSTORE or KS_ORPHAN AND a real Sigstore bundle is
+        # present. These exercise the new key_source-aware Audit
+        # branches that admit ws_sig.valid=False (sigstore-skipped
+        # or orphan-unknown) when bundle drives the verdict.
+        for ks in ["sigstore", "unverifiable_orphan"]:
+            for ws_valid in [True, False]:
+                pkgs.append({
+                    "bundle": {
+                        "san": "<real_san>",
+                        "issuer": ISS_GH,
+                        "bound_hash": "h1",
+                        "predicate_model_id": M1,
+                        "predicate_commit_sha": C1,
+                        "valid": True,
+                    },
+                    "ws_sig": {
+                        "signing_key_fp": FP_A,
+                        "claimed_fp": NONE,
+                        "message_hash": "h1",
+                        "valid": ws_valid,
+                        "key_source": ks,
+                    },
+                    "results_hash": "h1",
+                    "results_canonical_hash": "h1",
+                })
     return pkgs
 
 
