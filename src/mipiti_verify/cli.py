@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import click
 from rich.console import Console
@@ -82,6 +83,53 @@ def _derive_ci_identity_from_env() -> str | None:
     return None
 
 console = Console()
+
+
+def _call_with_tuf_retry(fn):
+    """Call `fn()` with up to 3 attempts (2s/4s backoff) on transient
+    TUF refresh failures. Public Sigstore TUF mirrors occasionally
+    return 5xx; a single hiccup shouldn't fail an audit. Non-transient
+    errors propagate immediately.
+    """
+    backoffs = [2, 4]
+    for attempt in range(3):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            transient = (
+                "tuf" in msg
+                or "refresh" in msg
+                or "metadata" in msg
+            )
+            if not transient or attempt == len(backoffs):
+                raise
+            time.sleep(backoffs[attempt])
+
+
+def _build_sigstore_verifier(
+    sigstore_trust_config_path: str | None,
+    sigstore_tuf_url: str | None,
+):
+    """Construct a Sigstore Verifier honoring trust-root resolution
+    options. The live-TUF path retries via `_call_with_tuf_retry`;
+    pinned-config and custom-TUF paths are deterministic (filesystem
+    read or single-shot fetch) and don't retry.
+    """
+    from sigstore.models import ClientTrustConfig
+    from sigstore.verify import Verifier
+
+    if sigstore_trust_config_path:
+        with open(sigstore_trust_config_path, "r") as f:
+            tc = ClientTrustConfig.from_json(f.read())
+        return Verifier._from_trust_config(tc)
+
+    if sigstore_tuf_url:
+        from sigstore._internal.tuf import TrustUpdater
+        tu = TrustUpdater(sigstore_tuf_url, offline=False)
+        return Verifier._from_trust_config(tu.get_trust_config())
+
+    return _call_with_tuf_retry(Verifier.production)
 
 
 @click.group()
@@ -786,22 +834,10 @@ def _resolve_pubkey_from_anchor(
         console.print(f"  [red]Anchor bundle is not a valid Sigstore bundle: {e}[/red]")
         raise SystemExit(1)
 
-    # Build the Sigstore Verifier — same trust-root resolution the
-    # JSON-audit path uses (--sigstore-tuf-url for online pinning,
-    # --sigstore-trust-config for fully offline air-gapped review).
     try:
-        if sigstore_trust_config_path:
-            tc = ClientTrustConfig.from_json(
-                open(sigstore_trust_config_path, "r").read()
-            )
-            verifier = Verifier._from_trust_config(tc)
-        elif sigstore_tuf_url:
-            from sigstore._internal.tuf import TrustUpdater
-            tu = TrustUpdater(sigstore_tuf_url, offline=False)
-            tc = tu.get_trust_config()
-            verifier = Verifier._from_trust_config(tc)
-        else:
-            verifier = Verifier.production()
+        verifier = _build_sigstore_verifier(
+            sigstore_trust_config_path, sigstore_tuf_url
+        )
     except Exception as e:
         console.print(f"  [red]Failed to initialize Sigstore verifier: {e}[/red]")
         raise SystemExit(1)
@@ -904,18 +940,9 @@ def _verify_anchor_bundle_bytes(
         raise ValueError(f"not a valid Sigstore bundle: {e}")
 
     try:
-        if sigstore_trust_config_path:
-            tc = ClientTrustConfig.from_json(
-                open(sigstore_trust_config_path, "r").read()
-            )
-            verifier = Verifier._from_trust_config(tc)
-        elif sigstore_tuf_url:
-            from sigstore._internal.tuf import TrustUpdater
-            tu = TrustUpdater(sigstore_tuf_url, offline=False)
-            tc = tu.get_trust_config()
-            verifier = Verifier._from_trust_config(tc)
-        else:
-            verifier = Verifier.production()
+        verifier = _build_sigstore_verifier(
+            sigstore_trust_config_path, sigstore_tuf_url
+        )
     except Exception as e:
         raise ValueError(f"failed to initialize Sigstore verifier: {e}")
 
@@ -1882,7 +1909,7 @@ def audit(
                         )
                     verifier = Verifier._from_trust_config(trust_config)
                 else:
-                    verifier = Verifier.production()
+                    verifier = _call_with_tuf_retry(Verifier.production)
                 # Identity policy: when the auditor pinned an expected
                 # CI identity client-side, enforce it. Without the pin,
                 # fall back to UnsafeNoOp — defends only against the
