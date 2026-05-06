@@ -19,7 +19,10 @@ leaves the CI runner.
 
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,11 @@ from sigstore.dsse import StatementBuilder, Subject
 from sigstore.models import ClientTrustConfig
 from sigstore.oidc import IdentityToken
 from sigstore.sign import SigningContext
+
+# Predicate encoding tag. When set, the bulky `assertions` and
+# `results` arrays are moved into `compressed_payload` (gzip + base64
+# of canonical JSON `{assertions, results}`).
+_COMPRESSION_GZIP_BASE64 = "gzip+base64"
 
 
 # In-toto predicate type for a Mipiti verification run. Versioned; changes
@@ -130,6 +138,15 @@ def sign_verification_statement(
 
     hex_digest = digest_bytes.hex()
 
+    # Move the bulky arrays into compressed_payload (gzip + base64 of
+    # canonical JSON of {assertions, results}).
+    inner = json.dumps(
+        {"assertions": assertions, "results": results},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    compressed_payload = base64.b64encode(gzip.compress(inner)).decode("ascii")
+
     statement = (
         StatementBuilder()
         .subjects(
@@ -147,8 +164,8 @@ def sign_verification_statement(
                 "tier": tier,
                 "content_hash": content_hash,
                 "pipeline": pipeline,
-                "assertions": assertions,
-                "results": results,
+                "encoding": _COMPRESSION_GZIP_BASE64,
+                "compressed_payload": compressed_payload,
             }
         )
         .build()

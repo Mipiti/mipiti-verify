@@ -113,8 +113,19 @@ class TestSignVerificationStatement:
         assert predicate_call["tier"] == 1
         assert predicate_call["content_hash"] == content_hash
         assert predicate_call["pipeline"]["commit_sha"] == "deadbeef"
-        assert predicate_call["assertions"][0]["id"] == "asrt_001"
-        assert predicate_call["results"][0]["result"] == "pass"
+        # Bulky arrays are moved into compressed_payload — gzip+base64
+        # of canonical JSON of {assertions, results}.
+        assert predicate_call["encoding"] == "gzip+base64"
+        import base64 as _b64, gzip as _gz, json as _json
+        inner = _json.loads(
+            _gz.decompress(_b64.b64decode(predicate_call["compressed_payload"]))
+            .decode("utf-8")
+        )
+        assert inner["assertions"][0]["id"] == "asrt_001"
+        assert inner["results"][0]["result"] == "pass"
+        # Assertions/results are NOT also inlined — that defeats the point.
+        assert "assertions" not in predicate_call
+        assert "results" not in predicate_call
 
         # Exactly one Subject on the Statement; digest binding verified in
         # the full integration test (live Fulcio/Rekor).
@@ -166,3 +177,147 @@ class TestSignVerificationStatement:
         mock_trust_config.from_json.assert_called_once()
         mock_trust_config.from_tuf.assert_not_called()
         mock_trust_config.production.assert_not_called()
+
+    @patch("mipiti_verify.sigstore_signer.SigningContext")
+    @patch("mipiti_verify.sigstore_signer.ClientTrustConfig")
+    @patch("mipiti_verify.sigstore_signer.IdentityToken")
+    @patch("mipiti_verify.sigstore_signer.StatementBuilder")
+    def test_compressed_payload_round_trips_to_canonical_json(
+        self,
+        mock_statement_builder_cls: MagicMock,
+        mock_identity: MagicMock,
+        mock_trust_config: MagicMock,
+        mock_signing_context: MagicMock,
+    ) -> None:
+        """encoding = "gzip+base64", compressed_payload =
+        base64(gzip(canonical JSON of {assertions, results})). Mirrors
+        the inversion here so a producer/consumer drift fails locally."""
+        import base64
+        import gzip
+        import json
+
+        builder_instance = MagicMock()
+        builder_instance.subjects.return_value = builder_instance
+        builder_instance.predicate_type.return_value = builder_instance
+        builder_instance.predicate.return_value = builder_instance
+        builder_instance.build.return_value = object()
+        mock_statement_builder_cls.return_value = builder_instance
+
+        fake_bundle = MagicMock()
+        fake_bundle.to_json.return_value = "{}"
+        fake_signer = MagicMock()
+        fake_signer.sign_dsse.return_value = fake_bundle
+        cm = MagicMock()
+        cm.__enter__.return_value = fake_signer
+        cm.__exit__.return_value = False
+        ctx = MagicMock()
+        ctx.signer.return_value = cm
+        mock_signing_context.from_trust_config.return_value = ctx
+
+        # Realistic-shape rows; descriptions/reasoning are the bulky
+        # fields that pushed bundles past 256KB pre-compression.
+        assertions = [
+            {
+                "id": f"asrt_{i:03d}",
+                "type": "function_exists",
+                "params": {"name": f"check_{i}"},
+                "description": "x" * 200,
+            }
+            for i in range(50)
+        ]
+        results = [
+            {
+                "assertion_id": f"asrt_{i:03d}",
+                "tier": 2,
+                "result": "pass",
+                "reasoning": "x" * 200,
+            }
+            for i in range(50)
+        ]
+
+        sign_verification_statement(
+            "token", model_id="m1", tier=2, content_hash=_valid_hash(),
+            pipeline={}, assertions=assertions, results=results,
+        )
+
+        predicate = builder_instance.predicate.call_args.args[0]
+        assert predicate["encoding"] == "gzip+base64"
+        compressed = predicate["compressed_payload"]
+        assert isinstance(compressed, str)
+
+        recovered = json.loads(
+            gzip.decompress(base64.b64decode(compressed)).decode("utf-8")
+        )
+        assert recovered["assertions"] == assertions
+        assert recovered["results"] == results
+
+        # Compression actually shrinks the payload — sanity-check the
+        # whole point of this code path. Bulky descriptions / reasoning
+        # are highly compressible.
+        raw_json = json.dumps(
+            {"assertions": assertions, "results": results},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        assert len(compressed) < len(raw_json) // 2
+
+    @patch("mipiti_verify.sigstore_signer.SigningContext")
+    @patch("mipiti_verify.sigstore_signer.ClientTrustConfig")
+    @patch("mipiti_verify.sigstore_signer.IdentityToken")
+    @patch("mipiti_verify.sigstore_signer.StatementBuilder")
+    def test_compressed_payload_uses_canonical_json(
+        self,
+        mock_statement_builder_cls: MagicMock,
+        mock_identity: MagicMock,
+        mock_trust_config: MagicMock,
+        mock_signing_context: MagicMock,
+    ) -> None:
+        """Inner JSON uses `sort_keys=True` + tight separators so two
+        identical inputs produce identical compressed bytes (the DSSE
+        signature covers them)."""
+        import base64
+        import gzip
+        import json
+
+        builder_instance = MagicMock()
+        builder_instance.subjects.return_value = builder_instance
+        builder_instance.predicate_type.return_value = builder_instance
+        builder_instance.predicate.return_value = builder_instance
+        builder_instance.build.return_value = object()
+        mock_statement_builder_cls.return_value = builder_instance
+
+        fake_signer = MagicMock()
+        fake_signer.sign_dsse.return_value = MagicMock(to_json=lambda: "{}")
+        cm = MagicMock()
+        cm.__enter__.return_value = fake_signer
+        cm.__exit__.return_value = False
+        mock_signing_context.from_trust_config.return_value = MagicMock(
+            signer=lambda _identity: cm
+        )
+
+        # Same rows, different key order on input — canonical JSON
+        # should produce identical compressed_payload either way.
+        rows_a = {"id": "asrt_1", "type": "t", "description": "d"}
+        rows_b = {"description": "d", "type": "t", "id": "asrt_1"}
+
+        sign_verification_statement(
+            "token", model_id="m1", tier=1, content_hash=_valid_hash(),
+            pipeline={}, assertions=[rows_a], results=[],
+        )
+        comp_a = builder_instance.predicate.call_args.args[0]["compressed_payload"]
+
+        sign_verification_statement(
+            "token", model_id="m1", tier=1, content_hash=_valid_hash(),
+            pipeline={}, assertions=[rows_b], results=[],
+        )
+        comp_b = builder_instance.predicate.call_args.args[0]["compressed_payload"]
+
+        assert comp_a == comp_b
+        # The inflated JSON also matches the canonical form on disk.
+        inflated = json.loads(
+            gzip.decompress(base64.b64decode(comp_a)).decode("utf-8")
+        )
+        assert inflated == {
+            "assertions": [{"description": "d", "id": "asrt_1", "type": "t"}],
+            "results": [],
+        }
