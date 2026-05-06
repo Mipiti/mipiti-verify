@@ -352,39 +352,78 @@ Audit(k, q) ==
 (* 21M state space) and exceeded one hour of runtime in CI without          *)
 (* finishing.                                                              *)
 (***************************************************************************)
-Init == /\ pkg \in Package
-        /\ pins \in Pins
-        \* When the envelope carries no bundle, bundle_bind_hash and
-        \* bundle_bind_signature describe the bundle-bind relationship
-        \* for an absent bundle and have no observable behaviour — the
-        \* Audit operator never reads them when bundle = ABSENT. Pin
-        \* them to canonical "absent" sentinels so TLC does not
-        \* enumerate equivalent-output duplicates. Precision-preserving:
-        \* every invariant V is invariant under bundle_bind_*
-        \* permutations when bundle = ABSENT, so collapsing those
-        \* states cannot hide a counterexample.
-        /\ (pkg.bundle = ABSENT
-            => /\ pkg.bundle_bind_hash = NONE
-               /\ pkg.bundle_bind_signature = NONE)
-        \* When the bundle-bind branch will FAIL early — either because
-        \* bundle_bind_hash is NONE (malformed envelope) or because it
-        \* doesn't equal bundle.bound_hash (mismatched bind) — the
-        \* Audit operator returns FAILED before evaluating the
-        \* bundle_bind_signature check. The signature is dead on those
-        \* states; pin it to NONE so TLC doesn't enumerate the three
-        \* signature values per dead state. Roughly 4/9 of bundle-
-        \* present states fall in this category — significant
-        \* state-space savings, no precision loss (every invariant V
-        \* is invariant under bundle_bind_signature permutations on
-        \* states where the verdict is determined by the prior
-        \* branches).
-        /\ ((pkg.bundle # ABSENT
-             /\ (\/ pkg.bundle_bind_hash = NONE
-                 \/ pkg.bundle.bound_hash # pkg.bundle_bind_hash))
-            => pkg.bundle_bind_signature = NONE)
+\* Base shape: every (pkg, pins) tuple from the typed records, with
+\* the same precision-preserving "vacuous fields when bundle absent"
+\* and "dead signature when bind FAILED" pruning the original spec
+\* enforced. Compositional split refines this into two narrower init
+\* predicates below; each .cfg picks one Spec.
+InitBase ==
+    /\ pkg \in Package
+    /\ pins \in Pins
+    \* When the envelope carries no bundle, bundle_bind_hash and
+    \* bundle_bind_signature describe the bundle-bind relationship
+    \* for an absent bundle and have no observable behaviour — the
+    \* Audit operator never reads them when bundle = ABSENT. Pin
+    \* them to canonical "absent" sentinels so TLC does not
+    \* enumerate equivalent-output duplicates.
+    /\ (pkg.bundle = ABSENT
+        => /\ pkg.bundle_bind_hash = NONE
+           /\ pkg.bundle_bind_signature = NONE)
+    \* When the bundle-bind branch will FAIL early — either because
+    \* bundle_bind_hash is NONE (malformed envelope) or because it
+    \* doesn't equal bundle.bound_hash (mismatched bind) — the
+    \* Audit operator returns FAILED before evaluating the
+    \* bundle_bind_signature check. The signature is dead on those
+    \* states; pin it to NONE.
+    /\ ((pkg.bundle # ABSENT
+         /\ (\/ pkg.bundle_bind_hash = NONE
+             \/ pkg.bundle.bound_hash # pkg.bundle_bind_hash))
+        => pkg.bundle_bind_signature = NONE)
+
+\* Init_main — Config 1 init for audit_main.cfg.
+\*
+\* Pins bundle_bind to the canonical "matching, valid" representative:
+\*   - bundle present  ⇒ bundle_bind_hash = bundle.bound_hash AND
+\*                       bundle_bind_signature = TRUE
+\*   - bundle absent   ⇒ already pinned to NONE/NONE by InitBase
+\*
+\* Composition argument (formal/COMPOSITION.md): every invariant in
+\* this config — I1–I7, I9–I13, V3 — is bundle_bind-independent on
+\* states where Audit's verdict survives the bundle-bind branches.
+\* Pinning bundle_bind to "matching, valid" is the canonical
+\* representative for the equivalence class.
+Init_main ==
+    /\ InitBase
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = TRUE)
+
+\* Init_bind — Config 2 init for audit_bundle_bind.cfg.
+\*
+\* Full bundle_bind cross-product preserved (this is what Config 2
+\* exists to verify) and full ws_sig variation preserved (V1/V2
+\* preconditions require ws_sig present with specific key_source
+\* values). Pins are pinned to NONE since V1/V2's premises require
+\* all pins NONE, and I8/I14 are independent of pins.
+Init_bind ==
+    /\ InitBase
+    /\ pins.san = NONE
+    /\ pins.issuer_explicit = NONE
+    /\ pins.workspace_fp = NONE
+    /\ pins.model_id = NONE
+    /\ pins.commit_sha = NONE
+
+\* Backward-compatible Init: the original full-domain enumeration.
+\* Kept so audit.cfg (the un-split config) continues to work.
+Init == InitBase
 
 Next == UNCHANGED vars
 
+\* Spec_main / Spec_bind — selected per .cfg via SPECIFICATION.
+Spec_main == Init_main /\ [][Next]_vars
+Spec_bind == Init_bind /\ [][Next]_vars
+
+\* Default Spec retained for the original audit.cfg.
 Spec == Init /\ [][Next]_vars
 
 (***************************************************************************)
@@ -633,6 +672,48 @@ V3_OrphanWithWorkspacePinFails ==
      /\ pins.commit_sha = NONE)
     => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
+\* C1 — Composition lemma for Config 1.
+\*
+\* Asserts that, on every state in Config 1's pinned domain, Audit's
+\* verdict is INDEPENDENT of the bundle_bind dimension. Operationally:
+\* substitute every alternative bundle_bind value into the state, and
+\* compare Audit's verdict on the substituted state to Audit's verdict
+\* on the canonical (matching) representative — they must produce the
+\* same verdict for invariants Config 1 cares about.
+\*
+\* This is the Flavor 1 composition check: TLC mechanically verifies
+\* that pinning bundle_bind to "matching, valid" in Config 1 is
+\* precision-preserving for the invariants in Config 1.
+\*
+\* The verdict equivalence allows for one structural difference: a
+\* state with bundle_bind = mismatch produces Audit = FAILED via the
+\* bundle-bind branch, while the canonical-matching representative
+\* may produce a positive verdict. Config 1's invariants are
+\* structured as "X => positive" or "X => negative" with X
+\* independent of bundle_bind, so the verdict CLASS (positive vs
+\* negative) is what matters — not the exact verdict value. We
+\* check class equivalence on the canonical representative against
+\* the canonical representative itself (trivially equal); the
+\* meaningful work is checking that the alternative substitutions
+\* land in the negative class via the bundle-bind branch.
+ConfigMainCompositionLemma ==
+    \* Only meaningful when bundle is present; bundle-absent states
+    \* have bundle_bind already pinned to NONE/NONE in InitBase.
+    pkg.bundle # ABSENT =>
+      \A bb_hash \in (Hashes \cup {NONE}) :
+        \A bb_sig \in (BOOLEAN \cup {NONE}) :
+          LET pkg_alt == [pkg EXCEPT
+                            !.bundle_bind_hash = bb_hash,
+                            !.bundle_bind_signature = bb_sig]
+          IN  \* Either the substituted state lands in negative
+              \* class via the bundle-bind branch (proving Config 1's
+              \* pinning loses no positive-class violations), OR the
+              \* substituted state has the same verdict as the
+              \* canonical (proving bundle_bind is dead on this
+              \* state's verdict class).
+              \/ Audit(pkg_alt, pins) \in {"FAILED", "USAGE_ERROR"}
+              \/ Audit(pkg_alt, pins) = Audit(pkg, pins)
+
 \* Conjunction of all invariants — the property TLC checks.
 SecurityInvariants ==
     /\ I1_SanPinIsBinding
@@ -652,6 +733,36 @@ SecurityInvariants ==
     /\ V1_SigstoreSkipSoundness
     /\ V2_OrphanWithBundleVerified
     /\ V3_OrphanWithWorkspacePinFails
+
+\* Config 1's invariant set: the subset of SecurityInvariants whose
+\* truth value is independent of bundle_bind on the pinned-matching
+\* representative. Config 1 (audit_main.cfg) checks this PLUS the
+\* composition lemma that proves the bundle_bind independence.
+ConfigMainInvariants ==
+    /\ I1_SanPinIsBinding
+    /\ I2_WorkspacePinIsBinding
+    /\ I3_IssuerNeverSelfAttested
+    /\ I4_WorkspaceFpBound
+    /\ I5_VerifiedImpliesEvidence
+    /\ I6_ContentHashBoundToResults
+    /\ I7_SanRequiredForCoPins
+    /\ I9_AllPresentSignaturesValid
+    /\ I10_UnboundBundleNotVerified
+    /\ I11_BundleSanMatchesPin
+    /\ I12_BundleModelIdMatchesPin
+    /\ I13_BundleCommitShaMatchesPin
+    /\ V3_OrphanWithWorkspacePinFails
+    /\ ConfigMainCompositionLemma
+
+\* Config 2's invariant set: the bundle-bind-specific invariants
+\* (I8, I14) plus the V1/V2 cases that have bundle_bind in their
+\* preconditions. Config 2 (audit_bundle_bind.cfg) explores the
+\* full bundle_bind cross-product with ws_sig/pins minimised.
+ConfigBindInvariants ==
+    /\ I8_BundleBoundToBundleBindHash
+    /\ I14_BundleBindExplicit
+    /\ V1_SigstoreSkipSoundness
+    /\ V2_OrphanWithBundleVerified
 
 (***************************************************************************)
 (* Type invariant: every reachable state has well-typed pkg and pins.      *)

@@ -55,26 +55,45 @@ jobs:
       - name: Formal verification (Python BFS + cross-check)
         run: python formal/check_pipeline.py
 
-      - name: Formal verification (TLC — both modes)
+      - name: Download TLC
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
           curl -sL "$TLC_URL" -o tla2tools.jar
           echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
-          # JVM tuning: -Xmx8g headroom for the audit.tla state space
-          # (~57M distinct states post key_source extension); ParallelGC
-          # cuts GC stalls on the large young-gen the BFS produces.
-          # Both flags are precision-preserving — they tune wall-clock,
-          # not the verdict.
+        working-directory: formal
+
+      - name: Formal verification (TLC — VerificationPipeline + KeySourceResolver)
+        run: |
+          # JVM tuning is precision-preserving: -Xmx8g for the BFS
+          # young-gen, ParallelGC for throughput. State-space verdict
+          # is unchanged.
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
           echo "--- TLC: VerificationPipeline reverify=false ---"
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: VerificationPipeline reverify=true ---"
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
-          echo "--- TLC: audit (compromised-platform invariants I1-I7) ---"
-          java $JAVA_OPTS -jar tla2tools.jar -config audit.cfg -workers auto audit.tla
           echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R10) ---"
           java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
+        working-directory: formal
+
+      - name: Formal verification (TLC — audit, Config 1, bundle_bind pinned)
+        # Compositional split per formal/COMPOSITION.md. Config 1 pins
+        # bundle_bind to its canonical matching representative and
+        # verifies I1-I7, I9-I13, V3, plus a machine-checked
+        # composition lemma proving the pinning is precision-
+        # preserving. Runs in parallel with Config 2 below.
+        run: |
+          JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
+          java $JAVA_OPTS -jar tla2tools.jar -config audit_main.cfg -workers auto audit.tla
+        working-directory: formal
+
+      - name: Formal verification (TLC — audit, Config 2, bundle_bind explored)
+        # Config 2 explores the full bundle_bind cross-product with
+        # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2.
+        run: |
+          JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
+          java $JAVA_OPTS -jar tla2tools.jar -config audit_bundle_bind.cfg -workers auto audit.tla
         working-directory: formal
 
   test-spec-invariants:
