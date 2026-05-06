@@ -213,10 +213,15 @@ Audit(k, q) ==
     THEN "FAILED"
 
     \* Workspace sig: claimed_fp (if present) must match signing_key_fp.
-    \* Skipped for KS_SIGSTORE (Sigstore is the trust anchor; ws_sig
-    \* is the issuer's redundant notarization, not a customer claim).
+    \* Skipped for both KS_SIGSTORE and KS_ORPHAN. KS_SIGSTORE: bundle
+    \* is the trust anchor; ws_sig is the issuer's redundant
+    \* notarization, not a customer claim. KS_ORPHAN: the row's
+    \* signing_key_fp is by definition not in the issuer's published
+    \* key set; the verifier surfaces this via the UNRESOLVED branch
+    \* without comparing claimed_fp / signing_key_fp metadata. The
+    \* workspace_fp pin check below still catches orphan + pin (V3).
     ELSE IF k.ws_sig # ABSENT
-         /\ k.ws_sig.key_source # KS_SIGSTORE
+         /\ k.ws_sig.key_source \notin {KS_SIGSTORE, KS_ORPHAN}
          /\ k.ws_sig.claimed_fp # NONE
          /\ k.ws_sig.claimed_fp # k.ws_sig.signing_key_fp
     THEN "FAILED"

@@ -370,12 +370,15 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig: claimed_fp (when present) must match signing_key_fp.
-    # Skipped for KS_SIGSTORE — sigstore is the trust anchor, ws_sig
-    # is the issuer's redundant notarization, not a customer claim.
+    # Skipped for both "sigstore" and "unverifiable_orphan". sigstore:
+    # bundle is the trust anchor; ws_sig is the issuer's redundant
+    # notarization, not a customer claim. orphan: signing_key_fp is by
+    # definition not in the issuer's published key set; the verifier
+    # surfaces UNRESOLVED without comparing claimed_fp/signing_key_fp.
     ws_key_source = ws_sig.get("key_source", "legacy") if ws_sig is not ABSENT else None
     if (
         ws_sig is not ABSENT
-        and ws_key_source != "sigstore"
+        and ws_key_source not in ("sigstore", "unverifiable_orphan")
         and ws_sig["claimed_fp"] is not None
         and ws_sig["claimed_fp"] != ws_sig["signing_key_fp"]
     ):
