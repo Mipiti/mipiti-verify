@@ -393,14 +393,25 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig: claimed_fp (when present) must match signing_key_fp.
+    # Skipped for both "sigstore" and "unverifiable_orphan". sigstore:
+    # bundle is the trust anchor; ws_sig is the issuer's redundant
+    # notarization, not a customer claim. orphan: signing_key_fp is by
+    # definition not in the issuer's published key set; the verifier
+    # surfaces UNRESOLVED without comparing claimed_fp/signing_key_fp.
+    ws_key_source = ws_sig.get("key_source", "legacy") if ws_sig is not ABSENT else None
     if (
         ws_sig is not ABSENT
+        and ws_key_source not in ("sigstore", "unverifiable_orphan")
         and ws_sig["claimed_fp"] is not None
         and ws_sig["claimed_fp"] != ws_sig["signing_key_fp"]
     ):
         return "FAILED"
 
     # Workspace sig + pin: signing_key_fp must match pinned fp.
+    # KS_ORPHAN rows have signing_key_fp not in published key set —
+    # workspace_fp pin against an orphan row falls through here when
+    # the fingerprint comparison fails (which it always will for
+    # orphan rows, since orphan_fp != any registered workspace_fp).
     if (
         ws_sig is not ABSENT
         and pins["workspace_fp"] is not None
@@ -409,7 +420,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig present but signature itself invalid.
-    if ws_sig is not ABSENT and not ws_sig["valid"]:
+    # Skipped for KS_SIGSTORE (the bundle is the trust anchor — the
+    # redundant ws_sig is not re-verified) and for KS_ORPHAN (the
+    # row's key was not in the issuer's published set, so
+    # ws_sig.valid is "unknown" rather than "invalid"; verdict
+    # relies on bundle path or falls to UNVERIFIED).
+    if (
+        ws_sig is not ABSENT
+        and ws_key_source not in ("sigstore", "unverifiable_orphan")
+        and not ws_sig["valid"]
+    ):
         return "FAILED"
 
     # Hash mismatch between claimed and canonical.
@@ -426,7 +446,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     # provenance_verified = False. Without this clause the spec would
     # diverge from the implementation in the no-pin + bundle-but-no-
     # results_hash case.
-    if (bundle is ABSENT or pkg["results_hash"] is None) and ws_sig is ABSENT:
+    #
+    # Refined for key_source: KS_SIGSTORE-tagged and KS_ORPHAN-tagged
+    # ws_sigs do not contribute to verifier confidence on their own
+    # (former is sigstore-skipped, latter is unverifiable). Treat
+    # them like ABSENT for this UNVERIFIED check.
+    ws_no_evidence = (
+        ws_sig is ABSENT
+        or ws_key_source in ("sigstore", "unverifiable_orphan")
+    )
+    if (bundle is ABSENT or pkg["results_hash"] is None) and ws_no_evidence:
         return "UNVERIFIED"
 
     return "VERIFIED"
@@ -474,6 +503,18 @@ def _materialise(tmp_path, pkg: dict) -> str:
             "key_fingerprint": ws_sig["claimed_fp"] or "",
             "public_key_pem": pub_pem,
         }
+        # Pass key_source through to the envelope so the verifier
+        # branches on it. Legacy rows omit the field (legacy issuer
+        # builds didn't emit it); explicit values exercise V1/V2/V3.
+        ks = ws_sig.get("key_source", "legacy")
+        if ks != "legacy":
+            ci["key_source"] = ks
+        if ks == "unverifiable_orphan":
+            # Orphan rows have no resolvable PEM by definition. The
+            # verifier branches on this state and surfaces UNRESOLVED
+            # rather than verifying against the embedded PEM.
+            ci["public_key_pem"] = ""
+            ci["unavailable_reason"] = "unresolved_fingerprint"
 
     # --- provenance (Sigstore bundle) ---
     provenance = None
@@ -576,7 +617,9 @@ def _all_packages(include_bundle_rows: bool):
         "results_canonical_hash": "h1",
     })
     # Workspace-signed packages with each (signing_key_fp, claimed_fp,
-    # valid) combination.
+    # valid) combination. key_source = "legacy" preserves the
+    # pre-discriminator semantics (ws_sig.valid required for VERIFIED)
+    # so the existing 7,200-row BFS coverage of I1-I13 is unchanged.
     for signing_fp in [FP_A, FP_B]:
         for claimed_fp in [NONE, FP_A, FP_B]:
             for valid in [True, False]:
@@ -588,6 +631,7 @@ def _all_packages(include_bundle_rows: bool):
                             "claimed_fp": claimed_fp,
                             "message_hash": results_hash,
                             "valid": valid,
+                            "key_source": "legacy",
                         },
                         "results_hash": results_hash,
                         "results_canonical_hash": "h1",
@@ -659,19 +703,54 @@ def _all_packages(include_bundle_rows: bool):
                 "results_hash": NONE,
                 "results_canonical_hash": "h1",
             })
+
+        # V1 / V2 / V3 coverage: rows where ws_sig.key_source is
+        # KS_SIGSTORE or KS_ORPHAN AND a real Sigstore bundle is
+        # present. These exercise the new key_source-aware Audit
+        # branches that admit ws_sig.valid=False (sigstore-skipped
+        # or orphan-unknown) when bundle drives the verdict.
+        for ks in ["sigstore", "unverifiable_orphan"]:
+            for ws_valid in [True, False]:
+                pkgs.append({
+                    "bundle": {
+                        "san": "<real_san>",
+                        "issuer": ISS_GH,
+                        "bound_hash": "h1",
+                        "predicate_model_id": M1,
+                        "predicate_commit_sha": C1,
+                        "valid": True,
+                    },
+                    "ws_sig": {
+                        "signing_key_fp": FP_A,
+                        "claimed_fp": NONE,
+                        "message_hash": "h1",
+                        "valid": ws_valid,
+                        "key_source": ks,
+                    },
+                    "results_hash": "h1",
+                    "results_canonical_hash": "h1",
+                })
     return pkgs
 
 
-def _all_pins(real_san: str | None):
+def _all_pins():
     """Full Pins cross-product over all five dimensions: SAN, issuer,
     workspace fingerprint, model_id, commit_sha. Expansion with
     model_id and commit_sha exercises I12 and I13 for every package
     shape (in particular, the no-bundle / no-results_hash / matched
     bundle rows). Local BFS row count is ~8000, runs in ~80s.
+
+    The "<real_san>" placeholder represents the workflow SAN of the
+    runtime CI run (resolved by `_resolve_pins_san()` at test-execution
+    time). Including it as a constant placeholder — rather than
+    inserting `_REAL_SAN` directly — keeps test-collection deterministic
+    across pytest-xdist workers (each worker may see a different
+    `_REAL_SAN` value or no value at all under transient mint failures;
+    using a placeholder de-couples collection from the network call).
+    Tests requiring the real SAN skip via `_resolve_pins_san()` when
+    `_REAL_SAN` is None at runtime.
     """
-    sans = [NONE, SAN_GH_A, SAN_GH_B, SAN_SELF]
-    if real_san:
-        sans.append(real_san)
+    sans = [NONE, SAN_GH_A, SAN_GH_B, SAN_SELF, "<real_san>"]
     pins_list = []
     for san in sans:
         for iss in [NONE, ISS_GH, ISS_SELF]:
@@ -695,14 +774,43 @@ def _all_pins(real_san: str | None):
     return pins_list
 
 
-# Lazily resolve the real SAN at module import. _ensure_real_bundles()
-# is what actually mints; if it succeeds, _REAL_SAN is populated.
-# We call it eagerly here so PACKAGES / PINS_LIST sizes are stable
-# across the test session (parametrised IDs are computed at collection
-# time and must not change between runs).
-_HAS_REAL_BUNDLES = _ensure_real_bundles()
-PACKAGES = _all_packages(include_bundle_rows=_HAS_REAL_BUNDLES)
-PINS_LIST = _all_pins(_REAL_SAN)
+# PACKAGES enumeration is *deterministic* — always includes bundle
+# rows regardless of whether real Fulcio bundles are available at
+# this moment. The runtime materialiser at _materialise() handles
+# the no-OIDC case via pytest.skip, so non-CI runs and fork-PR runs
+# emit the same test IDs but skip the bundle-row tests at execution
+# time.
+#
+# Critical for pytest-xdist correctness: every worker process imports
+# this module independently, and pytest-xdist requires every worker
+# to collect IDENTICAL test IDs. If the collection were gated by
+# `_ensure_real_bundles()` (which makes a network call to Fulcio
+# that can succeed for some workers and fail for others under
+# transient conditions or rate limits), workers would disagree on
+# PACKAGES and xdist would refuse to run with "Different tests were
+# collected between gw1 and gw2."
+#
+# `_REAL_SAN` is also computed pre-collection, but `_all_pins()`
+# tolerates None (it just doesn't add the real-SAN pin variant —
+# again, no test-ID divergence).
+_ensure_real_bundles()  # populate _REAL_SAN / _REAL_BUNDLES if available
+PACKAGES = _all_packages(include_bundle_rows=True)
+PINS_LIST = _all_pins()
+
+
+def _resolve_pins_san(pins: dict) -> dict:
+    """Replace the placeholder pin SAN with the real workflow SAN.
+
+    Returns the original pins dict if no resolution is needed. Skips
+    the test (via pytest.skip) if the placeholder is set but no real
+    SAN was minted — same skip-pattern as `_materialise()` uses for
+    bundle-present rows.
+    """
+    if pins.get("san") != "<real_san>":
+        return pins
+    if _REAL_SAN is None:
+        pytest.skip("Real-SAN pin needs Fulcio mint (CI OIDC required)")
+    return {**pins, "san": _REAL_SAN}
 
 
 def _resolve_bundle_san(pkg: dict) -> dict:
@@ -786,15 +894,16 @@ def test_implementation_matches_spec(tmp_path, pkg, pins):
     offending (pkg, pins) ID in the test name so it's actionable.
     """
     pkg_resolved = _resolve_bundle_san(pkg)
-    expected = audit_spec(pkg_resolved, pins)
+    pins_resolved = _resolve_pins_san(pins)
+    expected = audit_spec(pkg_resolved, pins_resolved)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
-    result = runner.invoke(main, ["audit", path] + _pin_args(pins))
+    result = runner.invoke(main, ["audit", path] + _pin_args(pins_resolved))
     actual = _classify(result)
     assert actual == expected, (
         f"Spec/impl divergence:\n"
         f"  pkg = {pkg_resolved}\n"
-        f"  pins = {pins}\n"
+        f"  pins = {pins_resolved}\n"
         f"  spec verdict = {expected}\n"
         f"  impl verdict = {actual}\n"
         f"  output:\n{result.output}"
@@ -812,6 +921,7 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     if test_implementation_matches_spec also fails for the same row.
     """
     pkg_resolved = _resolve_bundle_san(pkg)
+    pins = _resolve_pins_san(pins)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
     result = runner.invoke(main, ["audit", path] + _pin_args(pins))
@@ -914,9 +1024,16 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
 
-    # I9 — VERIFIED ⇒ every present signature is valid. Stronger than
-    # I5 (which only requires at least one valid). The implementation
-    # fails when any present signature fails; I9 captures that.
+    # I9 (refined) — VERIFIED ⇒ every present signature is valid,
+    # EXCEPT when the ws_sig carries key_source ∈ {sigstore,
+    # unverifiable_orphan}. Sigstore-tagged ws_sig is the issuer's
+    # redundant notarization (bundle is the trust anchor; the ws_sig
+    # signature is intentionally not re-verified). Orphan-tagged
+    # ws_sig has signing_key_fp by definition not in the issuer's
+    # published key set; ws_sig.valid is "unknown" rather than
+    # "invalid". For both, the verdict relies on the bundle path —
+    # which I9 still requires valid below. Mirrors the audit.tla
+    # I9_AllPresentSignaturesValid refinement.
     if verdict == "VERIFIED":
         if pkg_resolved["bundle"] is not ABSENT:
             assert pkg_resolved["bundle"]["valid"], (
@@ -924,10 +1041,13 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
                 f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
             )
         if pkg_resolved["ws_sig"] is not ABSENT:
-            assert pkg_resolved["ws_sig"]["valid"], (
-                f"I9 violated: VERIFIED with invalid ws_sig present\n"
-                f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-            )
+            ws_ks = pkg_resolved["ws_sig"].get("key_source", "legacy")
+            if ws_ks not in ("sigstore", "unverifiable_orphan"):
+                assert pkg_resolved["ws_sig"]["valid"], (
+                    f"I9 violated: VERIFIED with invalid ws_sig present "
+                    f"(key_source={ws_ks!r})\n"
+                    f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
+                )
 
     # I10 — bundle present + results_hash = NONE ⇒ not VERIFIED. The
     # bundle has no artifact to bind to and Sigstore verify_artifact

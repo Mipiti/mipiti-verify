@@ -30,7 +30,22 @@ CONSTANTS
     CommitShas,            \* finite set of possible commit SHAs
     SAN_PREFIX_REGISTRY,   \* function: Identities -> Issuers (partial)
     NONE,                  \* sentinel for "not present"
-    ABSENT                 \* sentinel for "evidence omitted from package"
+    ABSENT,                \* sentinel for "evidence omitted from package"
+
+    \* Audit-envelope key_source discriminator (added 2026-05-05).
+    \* Tells the verifier how to consume the content_integrity block.
+    \* See KeySourceResolver.tla in this directory for the issuer-side
+    \* contract producing these values.
+    KS_SIGSTORE,           \* Sigstore provenance is the trust anchor;
+                           \* ws_sig (if present) is redundant notarization
+                           \* and skipped during verification.
+    KS_PLATFORM,           \* server-notarized; ws_sig.valid required.
+    KS_WORKSPACE,          \* customer-uploaded ECDSA; ws_sig.valid required.
+    KS_ORPHAN,             \* fingerprint did not resolve in issuer's
+                           \* published key set; ws_sig.valid is unknown.
+    KS_LEGACY              \* envelope without key_source field
+                           \* (older issuer build) — ws_sig.valid required
+                           \* per pre-discriminator semantics.
 
 VARIABLES pkg, pins
 
@@ -68,11 +83,19 @@ Bundle == [
     valid                  : BOOLEAN
 ]
 
+KeySources == {KS_SIGSTORE, KS_PLATFORM, KS_WORKSPACE, KS_ORPHAN, KS_LEGACY}
+
 WSSig == [
     signing_key_fp : Fingerprints,
     claimed_fp     : Fingerprints \cup {NONE},
     message_hash   : Hashes,
-    valid          : BOOLEAN
+    valid          : BOOLEAN,
+    \* Issuer's key_source classification for this row. KS_LEGACY
+    \* models the existing envelope shape (no key_source field) so
+    \* the pre-discriminator BFS rows continue to validate against
+    \* the existing 13 invariants unchanged. KS_SIGSTORE and
+    \* KS_ORPHAN unlock the V1/V2/V3 invariants below.
+    key_source     : KeySources
 ]
 
 Package == [
@@ -215,17 +238,36 @@ Audit(k, q) ==
     THEN "FAILED"
 
     \* Workspace sig: claimed_fp (if present) must match signing_key_fp.
-    ELSE IF k.ws_sig # ABSENT /\ k.ws_sig.claimed_fp # NONE
+    \* Skipped for both KS_SIGSTORE and KS_ORPHAN. KS_SIGSTORE: bundle
+    \* is the trust anchor; ws_sig is the issuer's redundant
+    \* notarization, not a customer claim. KS_ORPHAN: the row's
+    \* signing_key_fp is by definition not in the issuer's published
+    \* key set; the verifier surfaces this via the UNRESOLVED branch
+    \* without comparing claimed_fp / signing_key_fp metadata. The
+    \* workspace_fp pin check below still catches orphan + pin (V3).
+    ELSE IF k.ws_sig # ABSENT
+         /\ k.ws_sig.key_source \notin {KS_SIGSTORE, KS_ORPHAN}
+         /\ k.ws_sig.claimed_fp # NONE
          /\ k.ws_sig.claimed_fp # k.ws_sig.signing_key_fp
     THEN "FAILED"
 
     \* Workspace sig: pin requires recomputed signing_key_fp match.
+    \* For KS_ORPHAN, the row's signing_key_fp is by definition not
+    \* in the issuer's published set, so a workspace-fp pin against
+    \* it cannot be satisfied — fall through to FAILED.
     ELSE IF k.ws_sig # ABSENT /\ q.workspace_fp # NONE
          /\ k.ws_sig.signing_key_fp # q.workspace_fp
     THEN "FAILED"
 
     \* Workspace sig present but invalid.
-    ELSE IF k.ws_sig # ABSENT /\ ~k.ws_sig.valid
+    \* Skipped for KS_SIGSTORE (the bundle path is the trust anchor —
+    \* the redundant ws_sig signature is not re-verified) and for
+    \* KS_ORPHAN (the row's key was not in the issuer's published
+    \* set, so ws_sig.valid is "unknown" rather than "invalid";
+    \* verdict relies on bundle path or falls to UNVERIFIED).
+    ELSE IF k.ws_sig # ABSENT
+         /\ k.ws_sig.key_source \notin {KS_SIGSTORE, KS_ORPHAN}
+         /\ ~k.ws_sig.valid
     THEN "FAILED"
 
     \* Hash mismatch: results_hash claim doesn't match canonical hash.
@@ -236,12 +278,15 @@ Audit(k, q) ==
     \* No cryptographic verification actually ran:
     \*   - the bundle is absent OR the bundle has no results_hash to
     \*     bind to (so verify_artifact never executed), AND
-    \*   - the workspace signature is absent.
+    \*   - the workspace signature is absent OR is sigstore-skipped /
+    \*     orphan-unknown (neither contributes to verifier confidence
+    \*     on its own).
     \* This prevents the corner case where a package carries an
     \* unverifiable bundle (results_hash = NONE) but no pin is set —
     \* the implementation correctly emits UNVERIFIED in that case.
     ELSE IF (k.bundle = ABSENT \/ k.results_hash = NONE)
-         /\ k.ws_sig = ABSENT
+         /\ (k.ws_sig = ABSENT
+             \/ k.ws_sig.key_source \in {KS_SIGSTORE, KS_ORPHAN})
     THEN "UNVERIFIED"
 
     \* Otherwise: VERIFIED.
@@ -360,10 +405,22 @@ I8_BundleBoundToResultsHash ==
 \* is valid, even if a co-located other signature is invalid. The
 \* implementation correctly fails when any present signature fails;
 \* I9 captures that property explicitly.
+\*
+\* Refined for the key_source discriminator: when the issuer marks
+\* a ws_sig as KS_SIGSTORE (its validity is redundant — Sigstore is
+\* the trust anchor) or KS_ORPHAN (its validity is not decidable —
+\* the key is not in the issuer's published set), ws_sig.valid is
+\* not part of the VERIFIED preconditions. For KS_PLATFORM,
+\* KS_WORKSPACE, and KS_LEGACY (older envelopes), ws_sig.valid
+\* IS required as before — preserving the original property's
+\* strength on every input shape it covered before.
 I9_AllPresentSignaturesValid ==
     (Audit(pkg, pins) = "VERIFIED")
     => /\ (pkg.bundle = ABSENT \/ pkg.bundle.valid)
-       /\ (pkg.ws_sig = ABSENT \/ pkg.ws_sig.valid)
+       /\ (pkg.ws_sig = ABSENT
+           \/ pkg.ws_sig.key_source = KS_SIGSTORE
+           \/ pkg.ws_sig.key_source = KS_ORPHAN
+           \/ pkg.ws_sig.valid)
 
 \* I10 — a bundle present without a results_hash to bind to cannot
 \* yield a positive verdict. With the strict malformed-bundle rule,
@@ -412,6 +469,69 @@ I13_BundleCommitShaMatchesPin ==
      /\ pins.commit_sha # NONE)
     => pkg.bundle.predicate_commit_sha = pins.commit_sha
 
+\* V1 — Sigstore-skip soundness. When the issuer marks a row's
+\* ws_sig with key_source = KS_SIGSTORE, the verifier MUST NOT FAIL
+\* the audit on ws_sig.valid alone (the sigstore bundle path is the
+\* trust anchor; the ws_sig is the issuer's redundant notarization
+\* and is intentionally skipped). VERIFIED in this case requires
+\* the bundle path to succeed, captured by I9's refined conjunction.
+\* The property captured here: if the only failing signature is a
+\* sigstore-tagged ws_sig, the audit DOES NOT FAIL.
+V1_SigstoreSkipSoundness ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_SIGSTORE
+     /\ ~pkg.ws_sig.valid
+     /\ pkg.bundle # ABSENT
+     /\ pkg.bundle.valid
+     /\ pkg.results_hash # NONE
+     /\ pkg.bundle.bound_hash = pkg.results_hash
+     /\ pkg.results_hash = pkg.results_canonical_hash
+     /\ pins.san = NONE
+     /\ pins.issuer_explicit = NONE
+     /\ pins.workspace_fp = NONE
+     /\ pins.model_id = NONE
+     /\ pins.commit_sha = NONE)
+    => Audit(pkg, pins) = "VERIFIED"
+
+\* V2 — Orphan-with-bundle still verifiable. When the issuer marks a
+\* row's ws_sig with key_source = KS_ORPHAN (fingerprint not in
+\* published key set) and a Sigstore bundle is also present and
+\* validly bound to the results, the verifier MUST still produce
+\* VERIFIED via the bundle path. The orphan ws_sig's validity is
+\* not consulted (mirrors V1's logic, but for the orphan case).
+V2_OrphanWithBundleVerified ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_ORPHAN
+     /\ pkg.bundle # ABSENT
+     /\ pkg.bundle.valid
+     /\ pkg.results_hash # NONE
+     /\ pkg.bundle.bound_hash = pkg.results_hash
+     /\ pkg.results_hash = pkg.results_canonical_hash
+     /\ pins.san = NONE
+     /\ pins.issuer_explicit = NONE
+     /\ pins.workspace_fp = NONE
+     /\ pins.model_id = NONE
+     /\ pins.commit_sha = NONE)
+    => Audit(pkg, pins) = "VERIFIED"
+
+\* V3 — Orphan + workspace pin = FAILED. When the issuer marks a
+\* row's ws_sig with key_source = KS_ORPHAN, a workspace_fp pin
+\* CANNOT be satisfied (the row's signing_key_fp is by definition
+\* not in the issuer's published key set, and the pin is checked
+\* against a fingerprint the verifier expects to find in that set).
+\* The audit MUST FAIL. Generalises I2 (workspace pin requires
+\* ws_sig present) to also reject ws_sig present-but-orphan when
+\* the pin's intent (workspace-keyed submission) cannot be served.
+V3_OrphanWithWorkspacePinFails ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_ORPHAN
+     /\ pkg.ws_sig.signing_key_fp # pins.workspace_fp
+     /\ pins.workspace_fp # NONE
+     /\ pins.san = NONE
+     /\ pins.model_id = NONE
+     /\ pins.commit_sha = NONE)
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
+
 \* Conjunction of all invariants — the property TLC checks.
 SecurityInvariants ==
     /\ I1_SanPinIsBinding
@@ -427,6 +547,9 @@ SecurityInvariants ==
     /\ I11_BundleSanMatchesPin
     /\ I12_BundleModelIdMatchesPin
     /\ I13_BundleCommitShaMatchesPin
+    /\ V1_SigstoreSkipSoundness
+    /\ V2_OrphanWithBundleVerified
+    /\ V3_OrphanWithWorkspacePinFails
 
 (***************************************************************************)
 (* Type invariant: every reachable state has well-typed pkg and pins.      *)
