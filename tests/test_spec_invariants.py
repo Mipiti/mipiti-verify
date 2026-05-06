@@ -1151,21 +1151,25 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
 
-    # I8 — VERIFIED|PARTIALLY with bundle ⇒ results_hash present and
-    # bundle.bound_hash matches it. Defense-in-depth check beyond
-    # Sigstore's verify_artifact.
+    # I8 — VERIFIED|PARTIALLY with bundle ⇒ bundle_bind_hash present
+    # and bundle.bound_hash matches it. Defense-in-depth check beyond
+    # Sigstore's verify_artifact: the envelope's explicit
+    # bundle_bind_hash is the value the bundle's in-toto Subject digest
+    # binds to. results_hash is independently recomputed downstream
+    # against the platform's content-integrity signature; it is not
+    # part of the bundle-bind check.
     if (
         verdict in {"VERIFIED", "PARTIALLY_VERIFIED"}
         and pkg_resolved["bundle"] is not ABSENT
     ):
-        assert pkg_resolved["results_hash"] is not None, (
-            f"I8 violated: positive verdict with bundle but no results_hash\n"
+        assert pkg_resolved.get("bundle_bind_hash") is not None, (
+            f"I8 violated: positive verdict with bundle but no bundle_bind_hash\n"
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
         assert (
-            pkg_resolved["bundle"]["bound_hash"] == pkg_resolved["results_hash"]
+            pkg_resolved["bundle"]["bound_hash"] == pkg_resolved["bundle_bind_hash"]
         ), (
-            f"I8 violated: positive verdict with bundle.bound_hash != results_hash\n"
+            f"I8 violated: positive verdict with bundle.bound_hash != bundle_bind_hash\n"
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
 
