@@ -2239,20 +2239,40 @@ def audit(
                     "  Signature:       [cyan]SKIPPED[/cyan] "
                     "(Sigstore provenance is the trust anchor for this row)"
                 )
-                # Pinning --expected-workspace-key on a sigstore-tagged
-                # row is contradictory: the row uses Sigstore, not a
-                # workspace ECDSA key, so the pin's intent (verify the
-                # submission is signed with the customer's specific
-                # workspace key) cannot be satisfied. Hard fail to
-                # avoid a green verdict that ignores the auditor's
-                # explicit constraint.
+                # Identity-pin enforcement still applies even for
+                # sigstore rows: if the auditor pinned
+                # --expected-workspace-key, we recompute the fingerprint
+                # from public_key_pem (when populated) and compare it
+                # to the pin. Match = pin satisfied; mismatch = forged-
+                # key attack or wrong pin. Without pub_pem we can't do
+                # the comparison cryptographically — fail explicitly.
                 if expected_workspace_key_fingerprint:
-                    console.print(
-                        "  [red]--expected-workspace-key was pinned but the row "
-                        "uses Sigstore (no workspace key signature to enforce "
-                        "against).[/red]"
-                    )
-                    has_failure = True
+                    if not pub_pem:
+                        console.print(
+                            "  [red]--expected-workspace-key was pinned but the "
+                            "package has no public_key_pem to recompute the "
+                            "fingerprint from.[/red]"
+                        )
+                        has_failure = True
+                    else:
+                        pub_key = serialization.load_pem_public_key(pub_pem.encode())
+                        der_bytes = pub_key.public_bytes(
+                            serialization.Encoding.DER,
+                            serialization.PublicFormat.SubjectPublicKeyInfo,
+                        )
+                        computed_fp = hashlib.sha256(der_bytes).hexdigest()
+                        if computed_fp == expected_workspace_key_fingerprint:
+                            console.print(
+                                f"  Identity pin:    [green]MATCHED[/green] "
+                                f"(workspace key = {expected_workspace_key_fingerprint!r})"
+                            )
+                        else:
+                            console.print(
+                                f"  Identity pin:    [red]MISMATCH[/red] "
+                                f"(expected {expected_workspace_key_fingerprint!r}, "
+                                f"got {computed_fp!r})."
+                            )
+                            has_failure = True
             elif pub_pem:
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])
