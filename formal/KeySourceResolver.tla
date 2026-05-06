@@ -2,62 +2,41 @@
 (*
  * Formal specification of the audit-envelope key-source resolver.
  *
- * Models `services.signing_key_resolver.resolve_key_source` — the
- * single function that, given a verification_run row's
- * (attestation_signature, attestation_key_fingerprint,
- * attestation_signed_hash, attestation, workspace_repo) inputs,
- * classifies the row's signing path and produces the descriptor that
- * `assertions_service.get_audit_package` and
- * `get_verification_audit` embed in the audit envelope's
- * `content_integrity` block.
+ * The audit envelope embedded in HTML and PDF reports carries a
+ * `content_integrity` block. When the issuer constructs that block,
+ * it classifies the row's signing path and stamps a `key_source`
+ * discriminator into it so the verifier (mipiti-verify) knows how to
+ * consume it. This module specifies the contract that classification
+ * must obey.
  *
- * Models the issuer side of the trust chain. Companion specs:
- *   - mipiti-verify/formal/audit.tla : verifier-side spec for how the
- *     audit envelope is consumed (13 invariants on verifier verdicts).
- *   - mipiti-verify/formal/VerificationPipeline.tla : Tier 1 / Tier 2
- *     assertion-state lifecycle.
+ * Models the issuer side of the audit-envelope trust chain.
+ * Companion specs in this directory:
+ *   - audit.tla              : verifier-side spec for how the audit
+ *                              envelope is consumed (13 invariants
+ *                              on verifier verdicts).
+ *   - VerificationPipeline.tla : Tier 1 / Tier 2 assertion-state
+ *                              lifecycle.
  *
- * Five resolver-side invariants pin issuer correctness:
+ * Eight resolver-side invariants pin issuer correctness; see the
+ * INVARIANTS section below for full statements. Summary:
  *
- *   R1 (Soundness of `key_source` declaration) — when the resolver
- *      emits `key_source = "platform" | "workspace"`, the embedded
- *      public_key_pem's fingerprint must equal the row's
- *      `attestation_key_fingerprint`. The verifier recomputes this
- *      and rejects mismatches; the issuer must not produce them.
+ *   R1   Soundness of `key_source` declaration
+ *   R2   Resolver totality
+ *   R3   Sigstore bundle precedence
+ *   R3a  Invalid-bundle non-precedence
+ *   R4   Backward-compat envelope
+ *   R5   Orphan honesty
+ *   R6   Fingerprint preservation
+ *   R10  Key-authority + retired_at correctness per platform sub-case
  *
- *   R2 (Resolver totality + uniqueness) — for every input tuple,
- *      exactly one `key_source` value is emitted. No fall-through
- *      gaps, no double-classification.
- *
- *   R3 (Bundle precedence) — when the row carries a valid Sigstore
- *      bundle, `key_source = "sigstore"` regardless of fingerprint
- *      resolution against the platform / workspace key sets. The
- *      bundle is the publicly-verifiable transparency-log path; it
- *      beats any server-side key lookup.
- *
- *   R4 (Backward-compat envelope) — for `key_source IN {"platform",
- *      "workspace"}`, the legacy fields (public_key_pem, signature,
- *      key_fingerprint, signed_hash) are populated so older
- *      mipiti-verify builds (without `key_source` awareness)
- *      continue to verify unchanged.
- *
- *   R5 (Orphan honesty) — `key_source = "unverifiable_orphan"`
- *      implies public_key_pem is empty AND unavailable_reason is
- *      populated with a public-safe enum value. The verifier must
- *      not crash on the empty PEM, and the auditor sees an honest
- *      "key not in issuer's published set" rather than a forged
- *      green verdict.
- *
- * The companion Python checker (check_key_source_resolver.py)
- * verifies that the real resolve_key_source() function matches this
- * spec for every input in the finite domain.
+ * A companion Python BFS in the issuer's repository drives the real
+ * resolver implementation against the same finite domain explored
+ * here, asserting both spec/implementation agreement and every
+ * invariant.
  *
  * Run via TLC:
  *     java -jar tla2tools.jar -config KeySourceResolver.cfg \
  *          KeySourceResolver.tla
- *
- * Run via Python (also cross-checks against the real implementation):
- *     python formal/check_key_source_resolver.py
  *)
 
 EXTENDS Naturals, FiniteSets, Sequences
@@ -66,15 +45,31 @@ CONSTANTS
     \* Key-source classification values emitted by the resolver.
     KSSigstore, KSPlatform, KSWorkspace, KSOrphan,
 
-    \* Key-authority sub-classification (for KSPlatform).
-    KAActive, KALegacyLocal, KALegacyRetired, KANone,
+    \* Key-authority sub-classification (for KSPlatform). Three slots
+    \* model the case where the issuer publishes more than one
+    \* platform key at a time — typically an active key plus a small
+    \* number of historical keys that signed older rows. The exact
+    \* labels are issuer-private; the spec only uses them as
+    \* opaque identifiers to model R10's correctness property.
+    KAActive, KAArchived, KAHistorical, KANone,
 
     \* Sentinel for "field absent / not populated".
     NULL,
 
-    \* Finite domain of fingerprints; one per key source plus an
-    \* orphan that matches none.
-    FP_ACTIVE, FP_LEGACY_CARRY, FP_RETIRED_DIR, FP_WORKSPACE,
+    \* Finite domain of fingerprints exercised by the spec. Each slot
+    \* represents a class of fingerprints the resolver might
+    \* encounter on an input row:
+    \*   FP_ACTIVE        — matches the issuer's currently-active
+    \*                      platform signing key.
+    \*   FP_PRIOR_PRIMARY — matches a previously-active platform key
+    \*                      preserved across a key rotation.
+    \*   FP_PRIOR_HISTORY — matches an even-older platform key from
+    \*                      the issuer's rotation history.
+    \*   FP_WORKSPACE     — matches a customer-uploaded workspace
+    \*                      ECDSA key.
+    \*   FP_ORPHAN        — does not match any published key source.
+    \*   FP_NONE          — no fingerprint present on the row.
+    FP_ACTIVE, FP_PRIOR_PRIMARY, FP_PRIOR_HISTORY, FP_WORKSPACE,
     FP_ORPHAN, FP_NONE,
 
     \* Valid / invalid bundle markers.
@@ -93,8 +88,8 @@ vars == <<inSignature, inFingerprint, inSignedHash, inBundle>>
 (* Domain definitions. *)
 
 KeySources == {KSSigstore, KSPlatform, KSWorkspace, KSOrphan}
-KeyAuthorities == {KAActive, KALegacyLocal, KALegacyRetired, KANone}
-Fingerprints == {FP_ACTIVE, FP_LEGACY_CARRY, FP_RETIRED_DIR,
+KeyAuthorities == {KAActive, KAArchived, KAHistorical, KANone}
+Fingerprints == {FP_ACTIVE, FP_PRIOR_PRIMARY, FP_PRIOR_HISTORY,
                  FP_WORKSPACE, FP_ORPHAN, FP_NONE}
 Bundles == {BUNDLE_VALID, BUNDLE_INVALID, BUNDLE_ABSENT}
 
@@ -126,8 +121,9 @@ ResolverOutput == [
 -----------------------------------------------------------------------------
 (* The Resolve operator — DESIGN INTENT.                                   *)
 (*                                                                         *)
-(* Walk order matches services/signing_key_resolver.py. Returns a          *)
-(* fully-populated ResolverOutput record for every input.                  *)
+(* Walk order: bundle → active → prior-primary → prior-history →          *)
+(* workspace → orphan. Returns a fully-populated ResolverOutput record     *)
+(* for every input.                                                        *)
 (***************************************************************************)
 Resolve(in) ==
     \* Step 1: bundle precedence (R3). Valid bundle wins regardless of fp.
@@ -172,11 +168,11 @@ Resolve(in) ==
         unavailable_reason |-> FALSE
     ]
 
-    \* Step 3: KMS-cutover legacy carry-forward.
-    ELSE IF in.fp = FP_LEGACY_CARRY
+    \* Step 3: prior-primary platform key (most recently retired).
+    ELSE IF in.fp = FP_PRIOR_PRIMARY
     THEN [
         key_source         |-> KSPlatform,
-        key_authority      |-> KALegacyLocal,
+        key_authority      |-> KAArchived,
         fingerprint        |-> in.fp,
         public_key_pem     |-> TRUE,
         signature_b64      |-> in.sig_present,
@@ -186,11 +182,11 @@ Resolve(in) ==
         unavailable_reason |-> FALSE
     ]
 
-    \* Step 4: on-disk retired-keys directory.
-    ELSE IF in.fp = FP_RETIRED_DIR
+    \* Step 4: deeper rotation history.
+    ELSE IF in.fp = FP_PRIOR_HISTORY
     THEN [
         key_source         |-> KSPlatform,
-        key_authority      |-> KALegacyRetired,
+        key_authority      |-> KAHistorical,
         fingerprint        |-> in.fp,
         public_key_pem     |-> TRUE,
         signature_b64      |-> in.sig_present,
@@ -200,7 +196,7 @@ Resolve(in) ==
         unavailable_reason |-> FALSE
     ]
 
-    \* Step 5: per-org workspace_verification_keys.
+    \* Step 5: customer-uploaded workspace ECDSA key.
     ELSE IF in.fp = FP_WORKSPACE
     THEN [
         key_source         |-> KSWorkspace,
@@ -322,20 +318,20 @@ R6_FingerprintPreservation ==
 \* R10 — Key-authority and retired_at correctness per platform
 \* sub-case. The resolver's choice of key_authority must match which
 \* key source the row's fingerprint actually came from:
-\*   FP_ACTIVE        => active key                  (retired_at=FALSE)
-\*   FP_LEGACY_CARRY  => legacy-local-pem carry-fwd  (retired_at=TRUE)
-\*   FP_RETIRED_DIR   => legacy-retired-pem (history)(retired_at=FALSE)
+\*   FP_ACTIVE        => active                      (retired_at=FALSE)
+\*   FP_PRIOR_PRIMARY => archived (most recent prior, retired_at=TRUE)
+\*   FP_PRIOR_HISTORY => historical (deeper rotation, retired_at=FALSE)
 \* Catches a future refactor that mislabels a row as retired when it
-\* came from the active key (or vice versa) — auditors rely on
+\* came from the active key (or vice versa). Auditors rely on
 \* key_authority + retired_at to reason about which keys are still
 \* trustworthy.
 R10_KeyAuthorityCorrectness ==
     LET out == CurrentOutput IN
-    /\ (out.key_source = KSPlatform /\ inFingerprint = FP_LEGACY_CARRY)
+    /\ (out.key_source = KSPlatform /\ inFingerprint = FP_PRIOR_PRIMARY)
        => out.retired_at = TRUE
     /\ (out.key_source = KSPlatform /\ inFingerprint = FP_ACTIVE)
        => out.retired_at = FALSE
-    /\ (out.key_source = KSPlatform /\ inFingerprint = FP_RETIRED_DIR)
+    /\ (out.key_source = KSPlatform /\ inFingerprint = FP_PRIOR_HISTORY)
        => out.retired_at = FALSE
 
 \* Conjunction of all invariants — the property TLC checks.
