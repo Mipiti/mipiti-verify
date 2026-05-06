@@ -1975,11 +1975,7 @@ def audit(
                                 "requires the issuer to populate this field "
                                 "alongside any Sigstore bundle so the "
                                 "verifier can bind the bundle to the "
-                                "envelope without canonicalisation. Older "
-                                "issuer builds that did not emit "
-                                "bundle_bind_hash are not supported by this "
-                                "verifier version — re-export the audit "
-                                "package from a current issuer."
+                                "envelope without canonicalisation."
                             )
                         expected_subject_digest = (
                             bundle_bind_hash_raw[len("sha256:"):]
