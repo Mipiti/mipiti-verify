@@ -192,15 +192,16 @@ or by reading the bundle's predicate out-of-band.
   the audit would not catch the discrepancy. The canonical-hash
   check is now hoisted to run whenever `results_hash` is claimed.
 - Usage error for pinning issuer alone (`I7`).
-- Bundle bound_hash matches results_hash on positive verdict (`I8`)
-  — defense-in-depth on top of Sigstore's verify_artifact.
+- Bundle bound_hash matches the envelope's `bundle_bind_hash` on
+  positive verdict (`I8`) — defense-in-depth on top of Sigstore's
+  verify_artifact.
 - All present signatures must be valid, not just one (`I9`).
   Strengthens `I5`: a VERIFIED package with a valid bundle and an
   invalid co-located workspace signature is not VERIFIED.
 - Unbindable bundle (no results_hash) cannot yield VERIFIED (`I10`).
-  Surfaced as a spec/impl divergence by the formal review: the
-  spec previously said VERIFIED for bundle-present + no-pin + no-
-  results_hash, but the implementation correctly emits UNVERIFIED.
+  A bundle present without the results_hash it was minted to bind
+  to is structurally malformed; the audit emits UNVERIFIED rather
+  than letting the bundle quietly drop from verification.
 - Bundle SAN matches the auditor pin on VERIFIED (`I11`) —
   symmetric counterpart of `I3` for SAN.
 - Bundle predicate `model_id` matches the auditor pin (`I12`) —
@@ -216,10 +217,10 @@ or by reading the bundle's predicate out-of-band.
   *directly* to the bundle's in-toto Subject digest — no
   canonicalisation, no rehashing on either side. When the envelope
   also carries `bundle_bind_signature`, the verifier checks it
-  against the platform public key embedded alongside it. Older
-  envelopes that omit `bundle_bind_hash` are rejected: a Sigstore
-  bundle without an explicit envelope-side binding cannot be
-  bound to the package the auditor was handed. Defends against:
+  against the platform public key embedded alongside it. A
+  Sigstore bundle present in the envelope without `bundle_bind_hash`
+  is rejected: an envelope-side binding is required to verify that
+  the bundle is bound to the package the auditor was handed. Defends against:
     - issuer-side regressions where the binding value is computed
       one way at signing and another way at verifying;
     - silent acceptance of a bundle whose Subject digest doesn't

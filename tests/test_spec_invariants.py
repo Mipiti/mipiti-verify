@@ -388,18 +388,11 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     if bundle is not ABSENT and pkg["results_hash"] is None:
         return "FAILED"
 
-    # Bundle present but doesn't bind to claimed results_hash.
-    # NB: in the BFS materialiser, pkg.results_hash carries the SAME
-    # token ("h1"/"h2") as bundle.bound_hash, so this check is a pure
-    # equality on the abstract token. The actual implementation
-    # checks the same property at the bytes level (bundle binds to
-    # content_integrity.results_hash via Subject digest).
-    if (
-        bundle is not ABSENT
-        and pkg["results_hash"] is not None
-        and bundle["bound_hash"] != pkg["results_hash"]
-    ):
-        return "FAILED"
+    # Bundle ↔ envelope binding is checked above against the
+    # explicit `bundle_bind_hash` field. `results_hash` is
+    # independently recomputed from verification_run.results and
+    # verified against the platform's content-integrity signature
+    # downstream; it is not part of the bundle-bind check.
 
     # Bundle present + model_id pin + predicate.model_id mismatch.
     if (

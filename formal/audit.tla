@@ -261,10 +261,10 @@ Audit(k, q) ==
     ELSE IF k.bundle # ABSENT /\ k.results_hash = NONE
     THEN "FAILED"
 
-    \* Bundle present but doesn't bind to package's claimed results_hash.
-    ELSE IF k.bundle # ABSENT /\ k.results_hash # NONE
-         /\ k.bundle.bound_hash # k.results_hash
-    THEN "FAILED"
+    \* Bundle ↔ envelope binding is checked above against the
+    \* explicit bundle_bind_hash field. results_hash is independently
+    \* recomputed downstream against the platform's content-integrity
+    \* signature; it is not part of the bundle-bind check.
 
     \* Bundle present + model_id pin + bundle predicate doesn't match.
     ELSE IF k.bundle # ABSENT /\ q.model_id # NONE
@@ -437,17 +437,16 @@ I7_SanRequiredForCoPins ==
     => Audit(pkg, pins) = "USAGE_ERROR"
 
 \* I8 — bundle present + positive verdict ⇒ bundle's bound_hash
-\* equals the package's claimed results_hash. Defense-in-depth on
-\* top of Sigstore's verify_artifact, which raises when the bundle's
-\* Subject digest doesn't equal sha256(input_). With the malformed-
-\* bundle (no results_hash) case now an unconditional FAILED in the
-\* Audit operator, this invariant holds without an ws_sig=ABSENT
-\* exception.
-I8_BundleBoundToResultsHash ==
+\* equals the explicit envelope bundle_bind_hash field. results_hash
+\* is independently recomputed downstream against the platform's
+\* content-integrity signature; it is not part of the bundle-bind
+\* check. A malformed envelope where a bundle is present without a
+\* bundle_bind_hash is unconditionally FAILED by the Audit operator.
+I8_BundleBoundToBundleBindHash ==
     (Audit(pkg, pins) \in {"VERIFIED", "PARTIALLY_VERIFIED"}
      /\ pkg.bundle # ABSENT)
-    => /\ pkg.results_hash # NONE
-       /\ pkg.bundle.bound_hash = pkg.results_hash
+    => /\ pkg.bundle_bind_hash # NONE
+       /\ pkg.bundle.bound_hash = pkg.bundle_bind_hash
 
 \* I9 — VERIFIED requires every present signature to verify, not just
 \* one. I5 alone is too weak: it allows VERIFIED when ANY signature
@@ -552,7 +551,6 @@ V1_SigstoreSkipSoundness ==
      /\ pkg.bundle # ABSENT
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
-     /\ pkg.bundle.bound_hash = pkg.results_hash
      /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
      /\ pkg.bundle_bind_signature # FALSE
      /\ pkg.results_hash = pkg.results_canonical_hash
@@ -575,7 +573,6 @@ V2_OrphanWithBundleVerified ==
      /\ pkg.bundle # ABSENT
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
-     /\ pkg.bundle.bound_hash = pkg.results_hash
      /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
      /\ pkg.bundle_bind_signature # FALSE
      /\ pkg.results_hash = pkg.results_canonical_hash
@@ -617,7 +614,7 @@ SecurityInvariants ==
     /\ I5_VerifiedImpliesEvidence
     /\ I6_ContentHashBoundToResults
     /\ I7_SanRequiredForCoPins
-    /\ I8_BundleBoundToResultsHash
+    /\ I8_BundleBoundToBundleBindHash
     /\ I9_AllPresentSignaturesValid
     /\ I10_UnboundBundleNotVerified
     /\ I11_BundleSanMatchesPin
