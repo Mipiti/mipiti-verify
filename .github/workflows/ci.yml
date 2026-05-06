@@ -82,7 +82,9 @@ jobs:
         # bundle_bind to its canonical matching representative and
         # verifies I1-I7, I9-I13, V3, plus a machine-checked
         # composition lemma proving the pinning is precision-
-        # preserving. Runs in parallel with Config 2 below.
+        # preserving. Runs sequentially before Config 2. (Config 2 is
+        # small enough that parallelizing across separate jobs would
+        # lose time to VM startup overhead.)
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
           java $JAVA_OPTS -jar tla2tools.jar -config audit_main.cfg -workers auto audit.tla
