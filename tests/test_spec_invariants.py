@@ -407,11 +407,20 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     ):
         return "FAILED"
 
+    # Workspace sig + pin: KS_ORPHAN with any workspace_fp pin =
+    # FAILED unconditionally. Orphan = no resolvable public key,
+    # cannot verify cryptographically; metadata-level fingerprint
+    # match isn't a cryptographic guarantee. Mirrors V3 in audit.tla
+    # and the implementation's orphan branch (which fails uniformly
+    # on pin set).
+    if (
+        ws_sig is not ABSENT
+        and ws_key_source == "unverifiable_orphan"
+        and pins["workspace_fp"] is not None
+    ):
+        return "FAILED"
+
     # Workspace sig + pin: signing_key_fp must match pinned fp.
-    # KS_ORPHAN rows have signing_key_fp not in published key set —
-    # workspace_fp pin against an orphan row falls through here when
-    # the fingerprint comparison fails (which it always will for
-    # orphan rows, since orphan_fp != any registered workspace_fp).
     if (
         ws_sig is not ABSENT
         and pins["workspace_fp"] is not None

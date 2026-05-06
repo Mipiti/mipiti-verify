@@ -251,10 +251,20 @@ Audit(k, q) ==
          /\ k.ws_sig.claimed_fp # k.ws_sig.signing_key_fp
     THEN "FAILED"
 
+    \* Workspace sig: --expected-workspace-key pinned against an
+    \* orphan-tagged row = FAILED unconditionally, regardless of
+    \* whether the envelope's claimed signing_key_fp happens to match
+    \* the pin. Orphan means the verifier has no resolvable public
+    \* key to verify the signature cryptographically; a metadata-
+    \* level fingerprint match is not a cryptographic guarantee, so
+    \* admitting it as "pin satisfied" would give the auditor a false
+    \* sense of verification. The implementation's orphan branch
+    \* fails uniformly on pin set; this branch keeps the spec aligned.
+    ELSE IF k.ws_sig # ABSENT /\ q.workspace_fp # NONE
+         /\ k.ws_sig.key_source = KS_ORPHAN
+    THEN "FAILED"
+
     \* Workspace sig: pin requires recomputed signing_key_fp match.
-    \* For KS_ORPHAN, the row's signing_key_fp is by definition not
-    \* in the issuer's published set, so a workspace-fp pin against
-    \* it cannot be satisfied — fall through to FAILED.
     ELSE IF k.ws_sig # ABSENT /\ q.workspace_fp # NONE
          /\ k.ws_sig.signing_key_fp # q.workspace_fp
     THEN "FAILED"
@@ -514,18 +524,22 @@ V2_OrphanWithBundleVerified ==
      /\ pins.commit_sha = NONE)
     => Audit(pkg, pins) = "VERIFIED"
 
-\* V3 — Orphan + workspace pin = FAILED. When the issuer marks a
-\* row's ws_sig with key_source = KS_ORPHAN, a workspace_fp pin
-\* CANNOT be satisfied (the row's signing_key_fp is by definition
-\* not in the issuer's published key set, and the pin is checked
-\* against a fingerprint the verifier expects to find in that set).
-\* The audit MUST FAIL. Generalises I2 (workspace pin requires
-\* ws_sig present) to also reject ws_sig present-but-orphan when
-\* the pin's intent (workspace-keyed submission) cannot be served.
+\* V3 — Orphan + workspace pin = FAILED, unconditionally. When the
+\* issuer marks a row's ws_sig with key_source = KS_ORPHAN, the
+\* verifier has no resolvable public key to verify the signature
+\* against. A metadata-level fingerprint match between the
+\* envelope's claimed signing_key_fp and the auditor's pin is NOT
+\* a cryptographic guarantee — admitting it as "pin satisfied"
+\* would let a forger set claimed_fp = customer's pinned fp without
+\* actually signing with the customer's key. So the audit MUST FAIL
+\* whenever the auditor pinned workspace_fp on an orphan row,
+\* regardless of fingerprint match. Generalises I2 (workspace pin
+\* requires ws_sig present) to also reject ws_sig present-but-
+\* orphan when the pin's intent (cryptographic verification against
+\* a known workspace key) cannot be served.
 V3_OrphanWithWorkspacePinFails ==
     (pkg.ws_sig # ABSENT
      /\ pkg.ws_sig.key_source = KS_ORPHAN
-     /\ pkg.ws_sig.signing_key_fp # pins.workspace_fp
      /\ pins.workspace_fp # NONE
      /\ pins.san = NONE
      /\ pins.model_id = NONE
