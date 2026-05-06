@@ -2239,6 +2239,20 @@ def audit(
                     "  Signature:       [cyan]SKIPPED[/cyan] "
                     "(Sigstore provenance is the trust anchor for this row)"
                 )
+                # Pinning --expected-workspace-key on a sigstore-tagged
+                # row is contradictory: the row uses Sigstore, not a
+                # workspace ECDSA key, so the pin's intent (verify the
+                # submission is signed with the customer's specific
+                # workspace key) cannot be satisfied. Hard fail to
+                # avoid a green verdict that ignores the auditor's
+                # explicit constraint.
+                if expected_workspace_key_fingerprint:
+                    console.print(
+                        "  [red]--expected-workspace-key was pinned but the row "
+                        "uses Sigstore (no workspace key signature to enforce "
+                        "against).[/red]"
+                    )
+                    has_failure = True
             elif pub_pem:
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])

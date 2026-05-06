@@ -962,9 +962,16 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
 
-    # I9 — VERIFIED ⇒ every present signature is valid. Stronger than
-    # I5 (which only requires at least one valid). The implementation
-    # fails when any present signature fails; I9 captures that.
+    # I9 (refined) — VERIFIED ⇒ every present signature is valid,
+    # EXCEPT when the ws_sig carries key_source ∈ {sigstore,
+    # unverifiable_orphan}. Sigstore-tagged ws_sig is the issuer's
+    # redundant notarization (bundle is the trust anchor; the ws_sig
+    # signature is intentionally not re-verified). Orphan-tagged
+    # ws_sig has signing_key_fp by definition not in the issuer's
+    # published key set; ws_sig.valid is "unknown" rather than
+    # "invalid". For both, the verdict relies on the bundle path —
+    # which I9 still requires valid below. Mirrors the audit.tla
+    # I9_AllPresentSignaturesValid refinement.
     if verdict == "VERIFIED":
         if pkg_resolved["bundle"] is not ABSENT:
             assert pkg_resolved["bundle"]["valid"], (
@@ -972,10 +979,13 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
                 f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
             )
         if pkg_resolved["ws_sig"] is not ABSENT:
-            assert pkg_resolved["ws_sig"]["valid"], (
-                f"I9 violated: VERIFIED with invalid ws_sig present\n"
-                f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-            )
+            ws_ks = pkg_resolved["ws_sig"].get("key_source", "legacy")
+            if ws_ks not in ("sigstore", "unverifiable_orphan"):
+                assert pkg_resolved["ws_sig"]["valid"], (
+                    f"I9 violated: VERIFIED with invalid ws_sig present "
+                    f"(key_source={ws_ks!r})\n"
+                    f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
+                )
 
     # I10 — bundle present + results_hash = NONE ⇒ not VERIFIED. The
     # bundle has no artifact to bind to and Sigstore verify_artifact
