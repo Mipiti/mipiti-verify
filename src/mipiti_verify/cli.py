@@ -2365,6 +2365,28 @@ def audit(
                                 f"got {computed_fp!r})."
                             )
                             has_failure = True
+            elif key_source == "unverifiable_orphan":
+                # Key-source-aware paths take precedence over the
+                # legacy fingerprint-blind PEM verification below. The
+                # envelope's public_key_pem may still be populated on
+                # an orphan row (e.g. when the platform attached its
+                # own key for the bundle-bind signature), but its
+                # presence is unrelated to the row's signing identity.
+                # Branch handler is below.
+                fp = ci.get("key_fingerprint", "")
+                console.print(
+                    f"  Signature:       [yellow]UNRESOLVED[/yellow] — "
+                    f"issuer's published key set has no entry for this row's "
+                    f"fingerprint ({fp[:16]}…). When Sigstore provenance is "
+                    "present (above), that is the canonical trust anchor and "
+                    "the report remains verified."
+                )
+                if expected_workspace_key_fingerprint:
+                    console.print(
+                        "  [red]--expected-workspace-key was pinned but the "
+                        "row's fingerprint did not resolve to any known key.[/red]"
+                    )
+                    has_failure = True
             elif pub_pem:
                 pub_key = serialization.load_pem_public_key(pub_pem.encode())
                 sig = base64.b64decode(ci["signature"])
@@ -2424,30 +2446,6 @@ def audit(
                         "  Identity pin:    [yellow]SKIPPED[/yellow] "
                         "(no --expected-workspace-key pinned)"
                     )
-            elif key_source == "unverifiable_orphan":
-                # The issuer's published key set has no entry for this
-                # row's fingerprint, so the local signature can't be
-                # cryptographically verified here. When the row carries
-                # Sigstore provenance (verified above), that is the
-                # canonical trust anchor and the report remains
-                # verified — surfaced as a yellow note rather than a
-                # hard fail. When the auditor pinned
-                # --expected-workspace-key the pin's intent cannot be
-                # satisfied without a resolvable key, so fail.
-                fp = ci.get("key_fingerprint", "")
-                console.print(
-                    f"  Signature:       [yellow]UNRESOLVED[/yellow] — "
-                    f"issuer's published key set has no entry for this row's "
-                    f"fingerprint ({fp[:16]}…). When Sigstore provenance is "
-                    "present (above), that is the canonical trust anchor and "
-                    "the report remains verified."
-                )
-                if expected_workspace_key_fingerprint:
-                    console.print(
-                        "  [red]--expected-workspace-key was pinned but the "
-                        "row's fingerprint did not resolve to any known key.[/red]"
-                    )
-                    has_failure = True
             else:
                 console.print("  [yellow]No public key in package — cannot verify signature[/yellow]")
                 if expected_workspace_key_fingerprint:
