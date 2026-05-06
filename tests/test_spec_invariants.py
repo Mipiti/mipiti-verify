@@ -353,16 +353,28 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     if bundle is not ABSENT and not bundle["valid"]:
         return "FAILED"
 
-    # Bundle present but doesn't bind to claimed results_hash.
-    # NB: in the BFS materialiser, pkg.results_hash carries the SAME
-    # token ("h1"/"h2") as bundle.bound_hash, so this check is a pure
-    # equality on the abstract token. The actual implementation
-    # checks the same property at the bytes level (bundle binds to
-    # content_integrity.results_hash via Subject digest).
+    # Bundle present but the envelope's explicit bundle_bind_hash is
+    # missing or doesn't equal bundle.bound_hash. Mirrors the cli.py
+    # branch that reads bundle_bind_hash off content_integrity and
+    # compares directly to the bundle's Subject digest with no
+    # canonicalisation. Older envelopes without bundle_bind_hash are
+    # not supported by the post-cutover verifier.
+    if bundle is not ABSENT and pkg.get("bundle_bind_hash") is None:
+        return "FAILED"
     if (
         bundle is not ABSENT
-        and pkg["results_hash"] is not None
-        and bundle["bound_hash"] != pkg["results_hash"]
+        and pkg.get("bundle_bind_hash") is not None
+        and bundle["bound_hash"] != pkg["bundle_bind_hash"]
+    ):
+        return "FAILED"
+
+    # Bundle present + bundle_bind_signature populated but invalid.
+    # The platform signature over bundle_bind_hash gives the auditor
+    # tamper-evidence on the binding claim itself. None means absent
+    # (permitted); False means present-but-invalid (hard fail).
+    if (
+        bundle is not ABSENT
+        and pkg.get("bundle_bind_signature") is False
     ):
         return "FAILED"
 
@@ -374,6 +386,19 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     # auditor from seeing "VERIFIED — content intact" while a
     # Sigstore bundle in the package was effectively ignored.
     if bundle is not ABSENT and pkg["results_hash"] is None:
+        return "FAILED"
+
+    # Bundle present but doesn't bind to claimed results_hash.
+    # NB: in the BFS materialiser, pkg.results_hash carries the SAME
+    # token ("h1"/"h2") as bundle.bound_hash, so this check is a pure
+    # equality on the abstract token. The actual implementation
+    # checks the same property at the bytes level (bundle binds to
+    # content_integrity.results_hash via Subject digest).
+    if (
+        bundle is not ABSENT
+        and pkg["results_hash"] is not None
+        and bundle["bound_hash"] != pkg["results_hash"]
+    ):
         return "FAILED"
 
     # Bundle present + model_id pin + predicate.model_id mismatch.
@@ -566,6 +591,56 @@ def _materialise(tmp_path, pkg: dict) -> str:
                     _CANONICAL_H1 if pkg["results_hash"] == "h1" else _CANONICAL_H2
                 ),
             }
+        # Populate the explicit bundle_bind_hash / bundle_bind_signature
+        # fields the post-cutover verifier reads. The bundle's Subject
+        # digest is sha256(content_hash_bytes) per _mint_real_bundle;
+        # the verifier compares bundle.Subject.digest.sha256 directly
+        # to bundle_bind_hash with no rehashing. To exercise the
+        # verifier's mismatch branch, the BFS sets bundle_bind_hash
+        # from the abstract pkg.bundle_bind_hash field — which may or
+        # may not equal the bundle's actual Subject digest.
+        bb_token = pkg.get("bundle_bind_hash")
+        if bb_token is not None and ci is not None:
+            # Map the abstract token ("h1"/"h2"/"missing") to the
+            # concrete sha256-of-content_hash hex the bundle was
+            # minted over.
+            if bb_token == "h1":
+                content_hash_for_bind = _CANONICAL_H1
+            elif bb_token == "h2":
+                content_hash_for_bind = _CANONICAL_H2
+            else:
+                content_hash_for_bind = "sha256:" + ("ff" * 32)
+            bind_hex = hashlib.sha256(
+                content_hash_for_bind.encode("utf-8")
+            ).hexdigest()
+            ci["bundle_bind_hash"] = bind_hex
+            # Sign with KEY_A as the platform key abstraction. The
+            # materialiser already signed `stored_hash` for ws_sig
+            # under signing_key (KEY_A or KEY_B); for bundle_bind we
+            # always use KEY_A and embed its PEM as public_key_pem
+            # so the verifier can find a key to check the bind sig
+            # against. When ws_sig is absent we set public_key_pem
+            # here too. When ws_sig is present, this overwrites it
+            # with KEY_A — fine because none of the BFS rows that
+            # exercise both use KEY_B.
+            bb_sig_state = pkg.get("bundle_bind_signature")
+            if bb_sig_state is not None:
+                if "public_key_pem" not in ci or not ci.get("public_key_pem"):
+                    ci["public_key_pem"] = KEY_A.public_key().public_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    ).decode()
+                if bb_sig_state is True:
+                    bb_sig = KEY_A.sign(
+                        bind_hex.encode("utf-8"),
+                        ec.ECDSA(hashes.SHA256()),
+                    )
+                else:
+                    bb_sig = KEY_A.sign(
+                        b"junk-bind-sig",
+                        ec.ECDSA(hashes.SHA256()),
+                    )
+                ci["bundle_bind_signature"] = base64.b64encode(bb_sig).decode()
 
     payload = {
         "model": {"id": "m1", "title": "t"},
@@ -624,6 +699,8 @@ def _all_packages(include_bundle_rows: bool):
         "ws_sig": ABSENT,
         "results_hash": NONE,
         "results_canonical_hash": "h1",
+        "bundle_bind_hash": None,
+        "bundle_bind_signature": None,
     })
     # Workspace-signed packages with each (signing_key_fp, claimed_fp,
     # valid) combination. key_source = "legacy" preserves the
@@ -644,6 +721,8 @@ def _all_packages(include_bundle_rows: bool):
                         },
                         "results_hash": results_hash,
                         "results_canonical_hash": "h1",
+                        "bundle_bind_hash": None,
+                        "bundle_bind_signature": None,
                     })
     # Real-Fulcio-bundle packages (only enumerated when CI provides
     # OIDC; otherwise these rows aren't generated). The bundle's SAN
@@ -655,6 +734,10 @@ def _all_packages(include_bundle_rows: bool):
         # and I13 are exercised against real Fulcio bundles. Each
         # (bound_hash, model_id, commit_sha) combo must be present in
         # _REAL_BUNDLES (minted by _ensure_real_bundles).
+        # Default for existing rows: bundle_bind_hash matches
+        # bundle.bound_hash and bundle_bind_signature is valid (True).
+        # I14-specific variations are added as a separate row block
+        # below to keep the I1–I13 coverage unchanged.
         for bound_hash in ["h1", "h2"]:
             for pred_mid, pred_csha in _BFS_PREDICATE_COMBOS:
                 for valid in [True, False]:
@@ -670,6 +753,8 @@ def _all_packages(include_bundle_rows: bool):
                         "ws_sig": ABSENT,
                         "results_hash": bound_hash,
                         "results_canonical_hash": "h1",
+                        "bundle_bind_hash": bound_hash,
+                        "bundle_bind_signature": True,
                     })
         # I8 / step-#8 coverage: bundle bound to one hash, package
         # claims another. Sigstore's verify_artifact fails because
@@ -696,6 +781,8 @@ def _all_packages(include_bundle_rows: bool):
                     "ws_sig": ABSENT,
                     "results_hash": claimed_hash,
                     "results_canonical_hash": "h1",
+                    "bundle_bind_hash": bound_hash,
+                    "bundle_bind_signature": True,
                 })
         # I10 corner case: bundle present but results_hash is NONE.
         for valid in [True, False]:
@@ -711,6 +798,8 @@ def _all_packages(include_bundle_rows: bool):
                 "ws_sig": ABSENT,
                 "results_hash": NONE,
                 "results_canonical_hash": "h1",
+                "bundle_bind_hash": "h1",
+                "bundle_bind_signature": True,
             })
 
         # V1 / V2 / V3 coverage: rows where ws_sig.key_source is
@@ -738,7 +827,49 @@ def _all_packages(include_bundle_rows: bool):
                     },
                     "results_hash": "h1",
                     "results_canonical_hash": "h1",
+                    "bundle_bind_hash": "h1",
+                    "bundle_bind_signature": True,
                 })
+
+        # I14 — explicit bundle_bind variations. Each row has a valid
+        # Sigstore bundle bound to h1 and matching results_hash; only
+        # the envelope's bundle_bind_hash / bundle_bind_signature
+        # fields vary. The verifier's branch order guarantees the
+        # bundle-bind check fires before signature, results_hash, and
+        # ws_sig branches, so these rows isolate the I14 property.
+        # Mismatching bundle_bind_hash is modelled as the abstract
+        # token "h2" (the materialiser maps it to a digest the bundle
+        # was NOT signed over). Missing bundle_bind_hash is modelled
+        # by setting the field to None; missing signature by setting
+        # bundle_bind_signature to None (NOT False, which means
+        # present-but-invalid).
+        for bb_hash, bb_sig in [
+            ("h2", True),    # mismatched hash, valid sig over the
+                             # mismatched value: hash check fires first.
+            (None, True),    # missing hash on a bundle-bearing
+                             # envelope: hard fail.
+            (None, None),    # missing both (legacy envelope shape):
+                             # hard fail under the post-cutover rule.
+            ("h1", False),   # matching hash, invalid signature:
+                             # signature check fires.
+            ("h1", None),    # matching hash, no signature: VERIFIED
+                             # is permitted (sig is optional).
+        ]:
+            pkgs.append({
+                "bundle": {
+                    "san": "<real_san>",
+                    "issuer": ISS_GH,
+                    "bound_hash": "h1",
+                    "predicate_model_id": M1,
+                    "predicate_commit_sha": C1,
+                    "valid": True,
+                },
+                "ws_sig": ABSENT,
+                "results_hash": "h1",
+                "results_canonical_hash": "h1",
+                "bundle_bind_hash": bb_hash,
+                "bundle_bind_signature": bb_sig,
+            })
     return pkgs
 
 
@@ -864,7 +995,19 @@ def _pkg_id(pkg: dict) -> str:
     else:
         w = pkg["ws_sig"]
         ws = f"ws({w['signing_key_fp'][:4]},c={w['claimed_fp'][:4] if w['claimed_fp'] else 'N'},v={int(w['valid'])})"
-    return f"{bundle}:{ws}:rh={pkg['results_hash'] or 'N'}"
+    bb_hash = pkg.get("bundle_bind_hash")
+    bb_sig = pkg.get("bundle_bind_signature")
+    bb_hash_id = "N" if bb_hash is None else bb_hash
+    if bb_sig is None:
+        bb_sig_id = "N"
+    elif bb_sig is True:
+        bb_sig_id = "1"
+    else:
+        bb_sig_id = "0"
+    return (
+        f"{bundle}:{ws}:rh={pkg['results_hash'] or 'N'}:"
+        f"bb={bb_hash_id}/{bb_sig_id}"
+    )
 
 
 def _pins_id(pins: dict) -> str:
@@ -1113,4 +1256,31 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"I13 violated: VERIFIED with predicate.commit_sha != "
             f"pin.commit_sha\n  pkg={pkg_resolved}, pins={pins}\n"
             f"{result.output}"
+        )
+
+    # I14 — VERIFIED + bundle present ⇒ bundle_bind_hash equals the
+    # bundle's Subject digest AND, when bundle_bind_signature is
+    # populated, the signature is valid. The verifier reads
+    # bundle_bind_hash off the envelope and compares directly with no
+    # canonicalisation; older envelopes that omit the field cannot
+    # earn VERIFIED.
+    if (
+        verdict == "VERIFIED"
+        and pkg_resolved["bundle"] is not ABSENT
+    ):
+        assert pkg_resolved.get("bundle_bind_hash") is not None, (
+            f"I14 violated: VERIFIED with bundle but no bundle_bind_hash\n"
+            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
+        )
+        assert (
+            pkg_resolved["bundle"]["bound_hash"]
+            == pkg_resolved["bundle_bind_hash"]
+        ), (
+            f"I14 violated: VERIFIED with bundle.bound_hash != "
+            f"bundle_bind_hash\n  pkg={pkg_resolved}, pins={pins}\n"
+            f"{result.output}"
+        )
+        assert pkg_resolved.get("bundle_bind_signature") is not False, (
+            f"I14 violated: VERIFIED with invalid bundle_bind_signature\n"
+            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )

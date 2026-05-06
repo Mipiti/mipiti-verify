@@ -74,6 +74,8 @@ mipiti-verify audit audit-package.json
 
 Independently verifies ECDSA document signatures on exported HTML reports and JSON audit packages. Validates OIDC provenance, content integrity, and per-assertion reasoning.
 
+**Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
+
 ## API Key Scopes
 
 | Prefix | Scope | Use |
