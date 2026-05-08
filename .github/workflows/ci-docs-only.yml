@@ -2,14 +2,15 @@ name: CI
 
 # Twin of ci.yml for docs-only PRs.
 #
-# ci.yml skips markdown-only changes via paths-ignore to save CI minutes. The
-# `main` branch ruleset requires a status check named `test`. Without this
-# twin, docs-only PRs never produce that check and are permanently blocked
-# from merge. This workflow fires on the inverse path filter and posts a
-# trivial passing `test` job so the required check is satisfied.
+# ci.yml skips markdown-only changes via paths-ignore to save CI
+# minutes. This workflow fires on the inverse path filter and posts
+# trivial passing jobs under names that match ci.yml's, so the same
+# set of check contexts reports on docs-only PRs as on every other
+# PR. That keeps any branch-protection rule that treats those
+# contexts as required from blocking docs-only merges.
 #
-# Both files use workflow name "CI" and job name "test" so they report the
-# same check context; exactly one of them runs per PR.
+# Both files use workflow name "CI" and matching job names so they
+# report the same check contexts; exactly one of them runs per PR.
 
 on:
   pull_request:
@@ -23,3 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "Docs-only PR, skipping tests"
+
+  test-spec-invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Docs-only PR, skipping spec-invariants"
