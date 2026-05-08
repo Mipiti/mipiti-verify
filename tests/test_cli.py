@@ -1560,6 +1560,170 @@ class TestBundleBindKeyResolution:
         assert "no platform public key is in scope" not in out_flat
 
 
+class TestWindowsSymlinkPrivilegeRemediation:
+    """The `_windows_symlink_privilege_remediation` helper translates
+    a TUF-refresh failure caused by Windows's symlink-privilege
+    requirement (WinError 1314) into a structured message naming the
+    three sanctioned remediation paths. Other errors pass through
+    unchanged.
+    """
+
+    def _winerror_1314(self) -> OSError:
+        """Construct an OSError that mimics the actual TUF-refresh
+        failure observed on Windows without symlink privilege:
+        OSError with `winerror=1314`. Constructing via OSError(*args)
+        sets `winerror`/`strerror`/`filename` correctly on Windows
+        Python; on non-Windows we fall back to setting the attribute
+        directly so the test runs cross-platform."""
+        try:
+            raise OSError(
+                1314, "A required privilege is not held by the client",
+                "root_history\\14.root.json",
+            )
+        except OSError as e:
+            if getattr(e, "winerror", None) != 1314:
+                e.winerror = 1314  # cross-platform test
+            return e
+
+    def test_direct_winerror_1314_returns_remediation(self):
+        from mipiti_verify.cli import (
+            _windows_symlink_privilege_remediation,
+        )
+
+        msg = _windows_symlink_privilege_remediation(self._winerror_1314())
+        assert msg is not None
+        assert "WinError 1314" in msg
+        assert "Developer Mode" in msg
+        assert "Administrator terminal" in msg
+        assert "--sigstore-trust-config" in msg
+
+    def test_chained_via_cause_returns_remediation(self):
+        """The actual production failure shape: TUFError raised by
+        the Sigstore client, with OSError(winerror=1314) chained as
+        the underlying cause. The helper walks `__cause__` so the
+        wrapped error is recognised."""
+        from mipiti_verify.cli import (
+            _windows_symlink_privilege_remediation,
+        )
+
+        try:
+            try:
+                raise self._winerror_1314()
+            except OSError as inner:
+                raise RuntimeError("Failed to refresh TUF metadata") from inner
+        except RuntimeError as outer:
+            msg = _windows_symlink_privilege_remediation(outer)
+
+        assert msg is not None
+        assert "Developer Mode" in msg
+
+    def test_chained_via_context_returns_remediation(self):
+        """Implicit chaining (`__context__`, set when an exception
+        propagates through a `try/except` block without an explicit
+        `raise from`) is also walked."""
+        from mipiti_verify.cli import (
+            _windows_symlink_privilege_remediation,
+        )
+
+        try:
+            try:
+                raise self._winerror_1314()
+            except OSError:
+                raise RuntimeError("Failed to refresh TUF metadata")
+        except RuntimeError as outer:
+            msg = _windows_symlink_privilege_remediation(outer)
+
+        assert msg is not None
+
+    def test_unrelated_error_returns_none(self):
+        from mipiti_verify.cli import (
+            _windows_symlink_privilege_remediation,
+        )
+
+        assert _windows_symlink_privilege_remediation(
+            ValueError("unrelated")
+        ) is None
+        assert _windows_symlink_privilege_remediation(
+            OSError("EACCES — different errno"),
+        ) is None
+
+    def test_cycle_in_cause_chain_terminates(self):
+        """A pathological `__cause__` cycle (shouldn't happen in
+        practice but possible if someone constructs exceptions
+        manually) must not infinite-loop."""
+        from mipiti_verify.cli import (
+            _windows_symlink_privilege_remediation,
+        )
+
+        a = ValueError("a")
+        b = ValueError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+        # Should return None without hanging.
+        assert _windows_symlink_privilege_remediation(a) is None
+
+
+class TestSigstoreVerifierConstruction:
+    """`_build_sigstore_verifier` honours sigstore-python 4.x's
+    actual `Verifier(trusted_root=...)` API. The previous
+    implementation called `Verifier._from_trust_config(...)` which
+    does not exist in sigstore 4.x — the trust-config-pinned and
+    custom-TUF-URL paths could not be honoured at all."""
+
+    def test_trust_config_path_uses_4x_api(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from mipiti_verify.cli import _build_sigstore_verifier
+
+        config_path = tmp_path / "trust-config.json"
+        config_path.write_text("{\"placeholder\": true}", encoding="utf-8")
+
+        fake_tc = MagicMock()
+        fake_tc.trusted_root = MagicMock(name="trusted_root_object")
+        fake_verifier = MagicMock(name="verifier_instance")
+
+        with patch(
+            "sigstore.models.ClientTrustConfig.from_json",
+            return_value=fake_tc,
+        ) as from_json, patch(
+            "sigstore.verify.Verifier",
+            return_value=fake_verifier,
+        ) as Verifier:
+            result = _build_sigstore_verifier(
+                sigstore_trust_config_path=str(config_path),
+                sigstore_tuf_url=None,
+            )
+
+        from_json.assert_called_once()
+        Verifier.assert_called_once_with(trusted_root=fake_tc.trusted_root)
+        assert result is fake_verifier
+
+    def test_tuf_url_uses_4x_api(self):
+        from unittest.mock import MagicMock, patch
+        from mipiti_verify.cli import _build_sigstore_verifier
+
+        fake_tc = MagicMock()
+        fake_tc.trusted_root = MagicMock(name="trusted_root_object")
+        fake_verifier = MagicMock(name="verifier_instance")
+
+        with patch(
+            "sigstore.models.ClientTrustConfig.from_tuf",
+            return_value=fake_tc,
+        ) as from_tuf, patch(
+            "sigstore.verify.Verifier",
+            return_value=fake_verifier,
+        ) as Verifier:
+            result = _build_sigstore_verifier(
+                sigstore_trust_config_path=None,
+                sigstore_tuf_url="https://example.test/tuf",
+            )
+
+        from_tuf.assert_called_once_with(
+            "https://example.test/tuf", offline=False,
+        )
+        Verifier.assert_called_once_with(trusted_root=fake_tc.trusted_root)
+        assert result is fake_verifier
+
+
 class TestInferIssuer:
     """`_infer_issuer` helper: SAN-prefix registry only.
 

@@ -85,6 +85,56 @@ def _derive_ci_identity_from_env() -> str | None:
 console = Console()
 
 
+def _windows_symlink_privilege_remediation(exc: BaseException) -> str | None:
+    """If `exc` (or any cause in its chain) is a Windows symlink-
+    privilege failure raised during TUF refresh, return a structured
+    remediation message naming the three sanctioned ways an auditor
+    can grant the privilege. Return None when the error is anything
+    else.
+
+    python-tuf's `Updater._update_root_symlink` calls `os.symlink`
+    unconditionally to maintain a current-root pointer, and Windows
+    requires `SeCreateSymbolicLinkPrivilege` (which standard user
+    accounts lack) to create symlinks. The underlying OSError carries
+    `winerror=1314`. The error is wrapped in `TUFError("Failed to
+    refresh TUF metadata")` by the time it reaches the audit, so the
+    surface error message is opaque without translation.
+    """
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        winerror = getattr(cur, "winerror", None)
+        if winerror == 1314:
+            return (
+                "Sigstore TUF refresh requires symbolic-link "
+                "creation, which is a privileged operation on "
+                "Windows by default (the underlying TUF client uses "
+                "os.symlink to maintain a current-root pointer; "
+                "WinError 1314 — A required privilege is not held by "
+                "the client). Choose one:\n"
+                "\n"
+                "  (1) One-time setting (recommended for individual "
+                "auditors): enable Developer Mode under "
+                "Settings -> Privacy & Security -> For developers -> "
+                "Developer Mode. This grants symlink privilege to "
+                "your normal user account; no admin terminal needed "
+                "for subsequent runs.\n"
+                "\n"
+                "  (2) Per-run elevation: re-run from an "
+                "Administrator terminal (Start -> cmd -> Run as "
+                "administrator).\n"
+                "\n"
+                "  (3) Offline-friendly (recommended for "
+                "corporate-locked-down machines and CI): pre-fetch a "
+                "Sigstore trust-config snapshot once on a privileged "
+                "machine and pass --sigstore-trust-config <path> to "
+                "skip live TUF refresh entirely."
+            )
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _call_with_tuf_retry(fn):
     """Call `fn()` with up to 3 attempts (2s/4s backoff) on transient
     TUF refresh failures. Public Sigstore TUF mirrors occasionally
@@ -115,6 +165,15 @@ def _build_sigstore_verifier(
     options. The live-TUF path retries via `_call_with_tuf_retry`;
     pinned-config and custom-TUF paths are deterministic (filesystem
     read or single-shot fetch) and don't retry.
+
+    sigstore-python 4.x's `Verifier` constructor takes
+    ``trusted_root=`` as a keyword argument; the trusted root is
+    obtained by constructing a ``ClientTrustConfig`` (via
+    ``from_json`` for a pinned config, ``from_tuf`` for a custom TUF
+    URL, or ``ClientTrustConfig.production`` for the default Sigstore
+    trust root) and reading its ``trusted_root`` attribute. The
+    live-TUF default path goes through ``Verifier.production`` so the
+    public-Sigstore retry behavior is unchanged.
     """
     from sigstore.models import ClientTrustConfig
     from sigstore.verify import Verifier
@@ -122,12 +181,11 @@ def _build_sigstore_verifier(
     if sigstore_trust_config_path:
         with open(sigstore_trust_config_path, "r") as f:
             tc = ClientTrustConfig.from_json(f.read())
-        return Verifier._from_trust_config(tc)
+        return Verifier(trusted_root=tc.trusted_root)
 
     if sigstore_tuf_url:
-        from sigstore._internal.tuf import TrustUpdater
-        tu = TrustUpdater(sigstore_tuf_url, offline=False)
-        return Verifier._from_trust_config(tu.get_trust_config())
+        tc = ClientTrustConfig.from_tuf(sigstore_tuf_url, offline=False)
+        return Verifier(trusted_root=tc.trusted_root)
 
     return _call_with_tuf_retry(Verifier.production)
 
@@ -2274,7 +2332,18 @@ def audit(
                                 )
                                 has_failure = True
                     except Exception as verr:
-                        console.print(f"  Bundle signature: [red]FAILED — {verr}[/red]")
+                        remediation = _windows_symlink_privilege_remediation(verr)
+                        if remediation is not None:
+                            console.print(
+                                "  Bundle signature: [red]FAILED — "
+                                "Sigstore trust-root refresh blocked "
+                                "by Windows symlink privilege.[/red]"
+                            )
+                            console.print()
+                            console.print(remediation)
+                            console.print()
+                        else:
+                            console.print(f"  Bundle signature: [red]FAILED — {verr}[/red]")
                         has_failure = True
             else:
                 console.print("  [yellow]No content_hash in package — cannot cryptographically verify[/yellow]")
@@ -2355,7 +2424,18 @@ def audit(
             except Exception:
                 pass
         except Exception as e:
-            console.print(f"  Bundle:           [red]INVALID — {e}[/red]")
+            remediation = _windows_symlink_privilege_remediation(e)
+            if remediation is not None:
+                console.print(
+                    "  Bundle:           [red]INVALID — Sigstore "
+                    "trust-root refresh blocked by Windows symlink "
+                    "privilege.[/red]"
+                )
+                console.print()
+                console.print(remediation)
+                console.print()
+            else:
+                console.print(f"  Bundle:           [red]INVALID — {e}[/red]")
             has_failure = True
     else:
         console.print("  [yellow]No Sigstore provenance in package[/yellow]")
