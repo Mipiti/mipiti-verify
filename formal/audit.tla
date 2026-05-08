@@ -394,6 +394,21 @@ InitBase ==
     /\ (pkg.bundle = ABSENT
         => /\ pkg.bundle_bind_hash = NONE
            /\ pkg.bundle_bind_signature = NONE)
+    \* Producer-side classification constraint (R3a in the issuer's
+    \* KeySourceResolver BFS): a row whose Sigstore bundle failed
+    \* trust-chain validation is NEVER classified as
+    \* `key_source = KS_SIGSTORE` by the issuer — invalid bundles
+    \* fall through to the next resolver step and end up as platform
+    \* / workspace / orphan, never sigstore. The audit operator's
+    \* type system independently allows the tuple
+    \* `(bundle.valid = FALSE, ws_sig.key_source = KS_SIGSTORE)`,
+    \* so without this Init pin the BFS would explore states the
+    \* producer cannot emit — wasting state-space budget and
+    \* obscuring real coverage. Pinning here imports the producer's
+    \* constraint into the consumer-side spec; matches the
+    \* end-to-end composition the deployed pipeline guarantees.
+    /\ (pkg.bundle # ABSENT /\ ~pkg.bundle.valid /\ pkg.ws_sig # ABSENT
+        => pkg.ws_sig.key_source # KS_SIGSTORE)
     \* When the bundle-bind branch will FAIL early — either because
     \* bundle_bind_hash is NONE (malformed envelope) or because it
     \* doesn't equal bundle.bound_hash (mismatched bind) — the
