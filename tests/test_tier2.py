@@ -49,6 +49,44 @@ class TestParseResponse:
         passed, _ = _parse_response("INCOHERENT\nBad match.")
         assert passed is False
 
+    def test_unverified_first_line_does_not_pass(self):
+        """`UNVERIFIED` contains the substring `VERIFIED` and the
+        previous fallback returned (True, ...) for it. Must now
+        treat this as ambiguous (False) — a verdict can't be flipped
+        from FAIL to PASS by a substring collision."""
+        passed, reasoning = _parse_response(
+            "UNVERIFIED\nThe function does not exist."
+        )
+        assert passed is False
+        assert "Ambiguous" in reasoning
+
+    def test_no_substring_fallback_for_positive_tokens(self):
+        """First line containing a positive token as a substring (not
+        as a word-anchored prefix) must not pass. Cases: nested in
+        another word; embedded mid-sentence."""
+        for line in (
+            "PASSPORT_RECORDS_PROCESSED",        # contains PASS
+            "Could not be VERIFIED",              # contains VERIFIED but not anchored
+            "PROBABLY YES, but",                  # contains YES mid-sentence
+        ):
+            passed, _ = _parse_response(line + "\nreasoning")
+            assert passed is False, f"{line!r} must not pass"
+
+    def test_no_substring_fallback_for_negative_tokens(self):
+        """Symmetric: negative-token substring matches must also not
+        decide. The strict regex above catches `NO`/`FAIL`/etc as
+        word-anchored prefixes; embedded substrings fall through to
+        ambiguous (which is itself fail-safe, but the path is what
+        we're pinning here — no silent classification on substring
+        collision)."""
+        for line in (
+            "NORMAL_OPERATION",      # contains NO
+            "Some FAILSAFE behavior",  # contains FAIL mid-sentence
+        ):
+            passed, reasoning = _parse_response(line + "\nreasoning")
+            assert passed is False
+            assert "Ambiguous" in reasoning
+
 
 class TestBuildMessage:
     def test_with_source_code(self):

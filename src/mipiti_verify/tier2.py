@@ -147,11 +147,5 @@ def _parse_response(text: str) -> Tuple[bool, str]:
     if "INJECTION_DETECTED" in first_line:
         return False, "Prompt injection detected in assertion content."
 
-    # Fallback: look for keywords anywhere in first line
-    if any(w in first_line for w in ("YES", "PASS", "VERIFIED", "SUFFICIENT")):
-        return True, reasoning
-    if any(w in first_line for w in ("NO", "FAIL", "NOT", "INSUFFICIENT")):
-        return False, reasoning
-
     # Ambiguous — fail safe
     return False, f"Ambiguous response: {text[:200]}"
