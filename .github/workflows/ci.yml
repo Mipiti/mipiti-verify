@@ -105,6 +105,16 @@ jobs:
     # that assume their absence. Forks don't get OIDC tokens (GitHub
     # security model), so fork-PR runs of this job detect the
     # absence at runtime and skip the bundle rows rather than fail.
+    #
+    # Skipped on automated version-bump PRs (head branch
+    # `release/v*`, title `chore: release v*`). Those PRs only edit
+    # pyproject.toml's version string — they don't touch the spec,
+    # the implementation, or any code path the BFS exercises. The
+    # heavy Fulcio-OIDC-minting run adds no signal there. Required-
+    # check satisfaction is preserved: a job skipped via job-level
+    # `if:` reports `conclusion: skipped`, which satisfies a
+    # required status check.
+    if: ${{ !startsWith(github.head_ref, 'release/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
