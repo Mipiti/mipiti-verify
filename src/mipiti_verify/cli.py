@@ -85,6 +85,32 @@ def _derive_ci_identity_from_env() -> str | None:
 console = Console()
 
 
+def _capture_stderr(call):
+    """Run ``call()`` with ``sys.stderr`` redirected to an in-memory
+    buffer.
+
+    Returns ``(result, captured_stderr_text)``. Used to relocate
+    sigstore-python's library-level warnings into the structured
+    verifier output where they can be framed alongside the line that
+    explains why the warning fired in the first place.
+
+    Captures Python-level writes (``sys.stderr``) only — adequate
+    for sigstore-python, whose ``UnsafeNoOp`` warning goes through
+    ``print(..., file=sys.stderr)``. Direct file-descriptor-level
+    writes to fd 2 are not captured; if a future sigstore-python
+    release routes the warning through stdlib ``logging`` configured
+    with a stderr handler, those still hit ``sys.stderr`` and are
+    captured here. C-extensions writing to raw fd 2 are out of scope.
+    """
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        result = call()
+    return result, buf.getvalue()
+
+
 def _windows_symlink_privilege_remediation(exc: BaseException) -> str | None:
     """If `exc` (or any cause in its chain) is a Windows symlink-
     privilege failure raised during TUF refresh, return a structured
@@ -1449,8 +1475,16 @@ def _audit_pdf_report(
         "Sigstore bundle in the audit package. Defends against the 'compromised "
         "Mipiti' scenario: a fabricated report containing a Sigstore bundle bound "
         "to an attacker-controlled Fulcio identity will fail verification because "
-        "its SAN will not match the customer's known CI identity. Example: "
+        "its SAN will not match the customer's known CI identity. "
+        "Format: "
+        "'https://<provider-host>/<org>/<repo>/.github/workflows/<file>.yml@<git-ref>' "
+        "for GitHub Actions; analogous for GitLab CI. Worked example: "
         "'https://github.com/Customer/repo/.github/workflows/verify.yml@refs/heads/main'. "
+        "Sourcing: the right value comes from the auditor's OUT-OF-BAND "
+        "knowledge of the customer's release process (their security policy / "
+        "release docs state which workflow signs official artefacts). Do NOT "
+        "copy the SAN the bundle itself claims — pinning to a value the bundle "
+        "self-attests provides no compromised-platform defense. "
         "Reads MIPITI_VERIFY_CI_IDENTITY env var when omitted — convenient for "
         "audit-running CI workflows that pin to a different generator workflow. "
         "See --ci-identity-from-env for auto-derivation in single-workflow setups."
@@ -2004,14 +2038,14 @@ def audit(
                 # auditor's chosen security guarantee with the public
                 # one without telling them.
                 if sigstore_trust_config_path or sigstore_tuf_url:
-                    if not hasattr(Verifier, "_from_trust_config"):
-                        raise RuntimeError(
-                            "this build of sigstore-python does not expose "
-                            "Verifier._from_trust_config; --sigstore-tuf-url "
-                            "and --sigstore-trust-config cannot be honored. "
-                            "Upgrade sigstore-python or remove the flag to "
-                            "use the public Sigstore trust root."
-                        )
+                    # sigstore-python 4.x's `Verifier` constructor takes
+                    # ``trusted_root=`` as a keyword argument; the trusted
+                    # root is obtained by constructing a
+                    # ``ClientTrustConfig`` (via ``from_json`` for a pinned
+                    # config or ``from_tuf`` for a custom URL) and reading
+                    # its ``trusted_root`` attribute. Mirrors
+                    # ``_build_sigstore_verifier`` so both code paths
+                    # construct verifiers identically.
                     if sigstore_trust_config_path:
                         from pathlib import Path
                         data = Path(sigstore_trust_config_path).read_text(
@@ -2022,7 +2056,7 @@ def audit(
                         trust_config = ClientTrustConfig.from_tuf(
                             sigstore_tuf_url, offline=False
                         )
-                    verifier = Verifier._from_trust_config(trust_config)
+                    verifier = Verifier(trusted_root=trust_config.trusted_root)
                 else:
                     verifier = _call_with_tuf_retry(Verifier.production)
                 # Identity policy: when the auditor pinned an expected
@@ -2054,13 +2088,29 @@ def audit(
                     has_failure = True
                 else:
                     try:
-                        if expected_ci_identity and resolved_issuer:
-                            sig_policy = policy.Identity(
-                                identity=expected_ci_identity,
-                                issuer=resolved_issuer,
-                            )
-                        else:
-                            sig_policy = policy.UnsafeNoOp()
+                        # Construct the identity policy under stderr
+                        # capture: sigstore-python's `UnsafeNoOp`
+                        # prints "unsafe (no-op) verification policy
+                        # used! no verification performed!" to stderr
+                        # at INSTANTIATION time, not at verify_dsse
+                        # call time. Without capture the warning
+                        # prints between our "Provenance (Sigstore)"
+                        # header and our own status lines, breaking
+                        # the visual flow and contradicting the
+                        # SKIPPED line we'll emit a few lines below.
+                        # The capture lets us frame both as one
+                        # coherent message in the SKIPPED block.
+                        def _build_policy():
+                            if expected_ci_identity and resolved_issuer:
+                                return policy.Identity(
+                                    identity=expected_ci_identity,
+                                    issuer=resolved_issuer,
+                                )
+                            return policy.UnsafeNoOp()
+
+                        sig_policy, _captured_unsafe_noop = _capture_stderr(
+                            _build_policy
+                        )
                         # Use verify_dsse instead of verify_artifact so
                         # we can extract the in-toto Statement and check
                         # the auditor's pins on its predicate fields
@@ -2278,9 +2328,69 @@ def audit(
                                 f"(SAN={expected_ci_identity!r}, issuer={resolved_issuer!r}){issuer_note}"
                             )
                         else:
+                            # Cohesive SKIPPED block: explains what
+                            # was checked vs. not, surfaces the
+                            # bundle's claimed SAN for visibility
+                            # (without inviting the auditor to copy
+                            # it as a pin — that's a circular
+                            # not-a-defense), and points at the
+                            # remedy. sigstore-python's "unsafe
+                            # (no-op) verification policy used!"
+                            # warning was captured around verify_dsse
+                            # so it doesn't print ahead of this
+                            # section; if anything was captured,
+                            # we acknowledge it inline so the auditor
+                            # sees one coherent message instead of
+                            # two contradictory ones.
                             console.print(
                                 "  Identity policy:  [yellow]SKIPPED[/yellow] "
                                 "(no --expected-ci-identity pinned)"
+                            )
+                            # Surface the bundle's claimed SAN. This
+                            # is observational, not a defense — a
+                            # forger sets it to whatever they want.
+                            # The auditor compares this against their
+                            # out-of-band knowledge of the customer's
+                            # CI workflow and pins explicitly via
+                            # --expected-ci-identity to enforce.
+                            try:
+                                from cryptography.x509 import (
+                                    SubjectAlternativeName,
+                                    UniformResourceIdentifier,
+                                )
+                                ext = cert.extensions.get_extension_for_class(
+                                    SubjectAlternativeName
+                                )
+                                claimed_sans = ext.value.get_values_for_type(
+                                    UniformResourceIdentifier
+                                )
+                            except Exception:
+                                claimed_sans = []
+                            if claimed_sans:
+                                claimed_san_display = (
+                                    claimed_sans[0]
+                                    if len(claimed_sans) == 1
+                                    else ", ".join(repr(s) for s in claimed_sans)
+                                )
+                                console.print(
+                                    f"                    Bundle's claimed SAN: "
+                                    f"{claimed_san_display}"
+                                )
+                            console.print(
+                                "                    Cryptographic chain "
+                                "(Fulcio root, Rekor inclusion, DSSE "
+                                "signature) was verified above; only the "
+                                "identity (SAN/issuer) match was no-op'd."
+                            )
+                            console.print(
+                                "                    To enforce identity "
+                                "pinning, re-run with "
+                                "[bold]--expected-ci-identity '<expected-SAN>'[/bold] "
+                                "(the SAN your CI workflow signs as, "
+                                "from out-of-band knowledge — never blindly "
+                                "copy the value above) or "
+                                "[bold]--ci-identity-from-env[/bold] when "
+                                "auditing inside CI."
                             )
 
                         # Extract predicate fields and check
