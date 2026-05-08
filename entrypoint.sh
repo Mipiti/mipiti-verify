@@ -51,4 +51,8 @@ if [ -n "$INPUT_SIGNING_PREFER" ] && [ "$INPUT_SIGNING_PREFER" != "sigstore" ]; 
   ARGS+=("--signing-prefer" "$INPUT_SIGNING_PREFER")
 fi
 
+if [ "$INPUT_REQUIRE_ATTESTATION" = "true" ]; then
+  ARGS+=("--require-attestation")
+fi
+
 exec mipiti-verify "${ARGS[@]}"

@@ -64,6 +64,10 @@ inputs:
     description: "When both an OIDC token and a workspace key are available, prefer this signer ('sigstore' or 'workspace'). Default: sigstore."
     required: false
     default: "sigstore"
+  require-attestation:
+    description: "Fail the run when no attestation is produced (Sigstore or workspace-ECDSA). Default behaviour is to log a warning and submit unsigned when both signers are unavailable; with this flag, the runner exits non-zero. Set to 'true' for security-sensitive CI gates."
+    required: false
+    default: "false"
 
 outputs:
   content-hash:
@@ -89,3 +93,4 @@ runs:
     INPUT_SIGSTORE_TRUST_CONFIG: ${{ inputs.sigstore-trust-config }}
     INPUT_WORKSPACE_SIGNING_KEY: ${{ inputs.workspace-signing-key }}
     INPUT_SIGNING_PREFER: ${{ inputs.signing-prefer }}
+    INPUT_REQUIRE_ATTESTATION: ${{ inputs.require-attestation }}

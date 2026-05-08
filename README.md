@@ -76,6 +76,82 @@ Independently verifies ECDSA document signatures on exported HTML reports and JS
 
 **Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
 
+## Audit Envelope Contract
+
+What an auditor running `mipiti-verify audit <report>` actually verifies, and what each check does (or doesn't) defend against. The contract is what makes the verifier defensible without trusting the platform: every claim the audit reports is anchored in either a public-anchor cryptographic chain or an auditor-supplied pin.
+
+### What's inside the envelope
+
+A signed audit package (PDF or JSON) carries the following per-row evidence:
+
+| Field | What it is | Trust source |
+|-------|-----------|--------------|
+| `provenance.bundle` | Sigstore bundle from the customer's CI run (Fulcio cert + DSSE signature + Rekor inclusion proof) | Public Sigstore TUF root + Rekor transparency log |
+| `content_integrity.results_hash` | SHA-256 over the canonical `verification_run.results` payload | Bound to the bundle's in-toto Subject digest via `bundle_bind_hash` |
+| `content_integrity.bundle_bind_hash` | Explicit hash the verifier compares to the bundle's Subject digest (no rehashing on either side) | Pinned by `bundle_bind_signature` (platform key) |
+| `content_integrity.bundle_bind_signature` | Platform ECDSA signature over `bundle_bind_hash` | Platform JWKS key (verifies independently of bundle) |
+| `content_integrity.signature` + `public_key_pem` | Workspace-ECDSA signature over the row's content (when key_source is `workspace`) | Customer's workspace ECDSA key |
+| `content_integrity.key_source` | One of `sigstore` / `platform` / `workspace` / `unverifiable_orphan` / `legacy` | Tells the verifier which trust anchor to use for this row |
+
+### Each check the verifier runs
+
+| Check | Anchor | Fails when | What it defends against |
+|-------|--------|-----------|------------------------|
+| **Document signature** (PDF/HTML) | JWKS-published platform key (`/.well-known/jwks`) or Rekor anchor / snapshot | PDF body bytes were modified after signing | Tampering with the rendered report |
+| **Bundle signature** (Sigstore) | Fulcio root via Sigstore TUF | DSSE signature invalid or cert chain broken | Forgery of the customer-CI-side evidence |
+| **Rekor inclusion proof** | Rekor public log Merkle root | Inclusion proof can't be reconstructed | Off-log signing (impersonation outside the public transparency log) |
+| **Bundle bind** | `bundle_bind_hash` ↔ bundle in-toto Subject digest (compared directly, no rehashing) | Subject digest doesn't equal `bundle_bind_hash` | Bundle/envelope swap (a real bundle paired with a different envelope's content) |
+| **Bundle-bind signature** | Platform JWKS key (resolved via PDF outer-sig pubkey, `--platform-pubkey`, or envelope `public_key_pem`) | Signature invalid or no key resolvable | Tampering with `bundle_bind_hash` after the platform signed it |
+| **Content-integrity signature** | Workspace ECDSA key embedded in envelope `public_key_pem` | Signature doesn't verify against embedded key | Tampering with `verification_run.results` for workspace-keyed rows |
+| **Identity policy** (when pinned via `--expected-ci-identity`) | Auditor's out-of-band knowledge of the customer's CI workflow | Bundle's Fulcio SAN doesn't equal the pin (or issuer doesn't equal `--expected-issuer`) | Compromised-Mipiti forgery: a real bundle minted under an attacker's CI identity passes Sigstore but fails the pin |
+| **Workspace key pin** (when `--expected-workspace-key`) | Auditor's out-of-band knowledge of the customer's workspace key | Recomputed fingerprint of the public key actually used for verification doesn't match the pin | Forged-key attack: an attacker-held key with `claimed_fp` set to the customer's known fp |
+| **Predicate pins** (when `--expected-model-id` / `--expected-commit-sha`) | Bundle's signed in-toto predicate | Predicate fields don't equal the pins | Replay of an older verification run; cross-model substitution |
+
+### What's signed vs. what's only present
+
+- **Signed by Fulcio** (provable identity): bundle DSSE payload (per-tier verification statement, including assertion specs and verdicts).
+- **Signed by platform JWKS key**: `bundle_bind_signature` (platform's attestation that this `bundle_bind_hash` came out of an authorized Mipiti instance).
+- **Signed by workspace key**: `content_integrity.signature` over `results_hash` for workspace-keyed rows.
+- **Recorded in Rekor**: every Sigstore bundle (publicly auditable, immutable transparency log).
+- **Not signed**: the package's outer JSON metadata (`generated_at`, `model.title`, etc.) — those are unsigned and forgeable. The verifier never reads pin-relevant values from outer metadata.
+
+### Auditor pins and what each one buys
+
+Pins are **out-of-band knowledge** the auditor brings to the verification: they're what closes the gap between "this bundle is internally consistent" and "this bundle came from the customer's actual release process." Without pins, the verifier can confirm cryptographic integrity but not identity.
+
+- `--expected-ci-identity '<SAN>'` — pin the workflow identity. SAN format: `https://github.com/Org/Repo/.github/workflows/<file>.yml@<git-ref>`. Source the value from the customer's release docs / security policy, never from the bundle itself.
+- `--ci-identity-from-env` — auto-derive from `GITHUB_WORKFLOW_REF` when running `audit` inside CI for the same workflow that generated the report.
+- `--expected-issuer` — pin the OIDC issuer. Required for self-hosted GitHub Enterprise / GitLab; auto-derived from SAN prefix for github.com / gitlab.com.
+- `--expected-workspace-key '<fp>'` — pin the workspace ECDSA key fingerprint (SHA-256 hex of DER SubjectPublicKeyInfo).
+- `--expected-model-id`, `--expected-commit-sha` — pin predicate fields signed inside the bundle.
+
+The verifier emits a "Trust contract" summary block at the end of each audit listing which pins were enforced and which were skipped, so an auditor can see at a glance what their command actually checked.
+
+### Failure modes (every check fails closed)
+
+The verifier exits non-zero on any of:
+
+- Cryptographic check fails (bundle signature, Rekor proof, bundle-bind, content-integrity sig).
+- Identity pin set but bundle's SAN/issuer doesn't match.
+- Workspace key pin set but the recomputed fingerprint doesn't match.
+- Predicate pin set but the bundle's predicate field doesn't match.
+- Bundle-bind signature present but no platform key resolvable (would be silent skip otherwise).
+- Document signature on the PDF/HTML body is missing or invalid.
+- Pinning flags supplied to a format that can't honour them (e.g. identity pins on an HTML report — fails-closed instead of silently dropping the pin).
+
+There is no `--allow-unsigned`, no soft-fail, and no fallback that treats a missing signature as "good." When the auditor needs to enforce attestation on the producer side too (CI runner), use `--require-attestation` on `mipiti-verify run` to make missing/failed signing a non-zero exit.
+
+### Independent re-verification
+
+Every published audit can be re-checked offline using only:
+
+- The Sigstore TUF root (cacheable; pinnable via `--sigstore-trust-config <path>`).
+- The Mipiti instance's JWKS (`/.well-known/jwks`; pinnable via `--platform-pubkey <pem>` for fully offline runs).
+- The customer's workspace key fingerprint (auditor's out-of-band knowledge).
+- The customer's CI workflow identity (auditor's out-of-band knowledge).
+
+No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
+
 ## API Key Scopes
 
 | Prefix | Scope | Use |
@@ -164,6 +240,9 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 | `base-url` | No | `https://api.mipiti.io` | API base URL |
 | `sigstore-tuf-url` | No | `""` | Custom Sigstore TUF root URL for private deployments (default public `sigstore.dev`) |
 | `sigstore-trust-config` | No | `""` | Path to a pre-downloaded Sigstore ClientTrustConfig JSON for fully air-gapped CI (skips all TUF fetches) |
+| `workspace-signing-key` | No | `""` | PEM ECDSA P-256 private key for workspace-attested submission. Used when no OIDC token is available (Jenkins, Buildkite, self-managed GitLab without ID tokens) or when `signing-prefer=workspace` |
+| `signing-prefer` | No | `sigstore` | When both an OIDC token and a workspace key are available, prefer this signer (`sigstore` or `workspace`) |
+| `require-attestation` | No | `false` | Fail the run when no attestation is produced. Default behaviour is to log a warning and submit unsigned when both Sigstore and workspace-ECDSA signing are unavailable; set to `true` for security-sensitive CI gates that should fail-close on missing attestation |
 
 ### Action Output
 

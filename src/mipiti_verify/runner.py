@@ -21,6 +21,19 @@ from .workspace_key_signer import WorkspaceKeySigner
 console = Console(stderr=True)
 
 
+class AttestationRequiredError(RuntimeError):
+    """Raised when ``--require-attestation`` is set and no signer
+    produced a usable attestation for the run.
+
+    The runner's default behaviour on missing/failed signing is to
+    log a warning and submit unsigned; that's appropriate for
+    operator-friendly defaults but is not what a security-sensitive
+    CI gate wants. ``--require-attestation`` flips the failure mode
+    to fail-closed: the run exits non-zero rather than submitting
+    a result the audit-tool side cannot pin to a signing identity.
+    """
+
+
 def compute_content_hash(
     all_assertions: list[dict[str, Any]],
     results: list[dict[str, Any]],
@@ -64,6 +77,7 @@ class Runner:
         sigstore_trust_config_path: str | None = None,
         workspace_signing_key_path: str | None = None,
         signing_prefer: str = "sigstore",
+        require_attestation: bool = False,
         dry_run: bool = False,
         reverify: bool = True,
         verbose: bool = False,
@@ -122,6 +136,7 @@ class Runner:
                 f"(got {signing_prefer!r})"
             )
         self.signing_prefer = prefer
+        self.require_attestation = bool(require_attestation)
 
         self.dry_run = dry_run
         self._developer_key = client.key_scope == "developer"
@@ -190,6 +205,18 @@ class Runner:
                 if self.verbose:
                     console.print(f"  [dim]Tier {tier} attestation: workspace-ecdsa[/dim]")
                 return "", signature, signed_hash
+
+        if self.require_attestation:
+            raise AttestationRequiredError(
+                "No attestation available for this run "
+                f"(tier {tier}) and --require-attestation is set. "
+                "Configure either an OIDC token (CI environment with "
+                "id-token: write) for Sigstore signing, or "
+                "--workspace-signing-key (env: "
+                "MIPITI_WORKSPACE_SIGNING_KEY) for workspace-ECDSA "
+                "signing. Both signers attempted; both unavailable or "
+                "failed."
+            )
 
         if self.verbose:
             console.print(f"  [dim]Tier {tier} attestation: none (submitting unsigned)[/dim]")

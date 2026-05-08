@@ -677,6 +677,69 @@ class TestChooseAttestation:
                 signing_prefer="bogus",
             )
 
+    def test_require_attestation_raises_when_no_signer(self) -> None:
+        """No OIDC, no workspace key, --require-attestation set: raise
+        AttestationRequiredError so the run exits non-zero rather than
+        submitting unsigned."""
+        from mipiti_verify.runner import AttestationRequiredError
+
+        runner = self._runner(oidc_token=None, require_attestation=True)
+        with pytest.raises(AttestationRequiredError, match="No attestation available"):
+            runner._choose_attestation(**self._call_kwargs())
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_require_attestation_raises_when_both_signers_fail(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        """OIDC + workspace key both configured, both fail at sign time,
+        --require-attestation set: raise rather than fall through to
+        unsigned."""
+        from mipiti_verify.runner import AttestationRequiredError
+
+        mock_sign.side_effect = RuntimeError("Fulcio unreachable")
+        # Construct a workspace signer whose sign() also fails.
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
+            require_attestation=True,
+        )
+        runner.workspace_signer.sign = MagicMock(
+            side_effect=RuntimeError("workspace signing failed"),
+        )
+        with pytest.raises(AttestationRequiredError, match="No attestation available"):
+            runner._choose_attestation(**self._call_kwargs())
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_require_attestation_lets_successful_signing_pass(
+        self, mock_sign: MagicMock
+    ) -> None:
+        """--require-attestation must NOT change behaviour when signing
+        succeeds. Sigstore returns a bundle → run continues normally."""
+        mock_sign.return_value = '{"mediaType":"sigstore-bundle"}'
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            require_attestation=True,
+        )
+        bundle, signature, signed_hash = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        assert bundle == '{"mediaType":"sigstore-bundle"}'
+        assert signature == ""
+        assert signed_hash == ""
+
+    def test_require_attestation_default_off_preserves_unsigned_path(
+        self,
+    ) -> None:
+        """Default behaviour (require_attestation=False) is preserved:
+        no signer available → return all-empty (submit unsigned)
+        rather than raise."""
+        runner = self._runner(oidc_token=None)
+        # No exception raised; tuple of empties returned.
+        bundle, signature, signed_hash = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        assert (bundle, signature, signed_hash) == ("", "", "")
+
     def test_bad_workspace_key_path_raises(self, tmp_path: Path) -> None:
         bad = tmp_path / "bad.pem"
         bad.write_bytes(b"not a PEM")

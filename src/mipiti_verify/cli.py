@@ -266,6 +266,22 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--require-attestation",
+    is_flag=True,
+    default=False,
+    envvar="MIPITI_REQUIRE_ATTESTATION",
+    help=(
+        "Fail the run when no attestation is produced. Default behaviour "
+        "is to log a warning and submit unsigned when both Sigstore "
+        "(OIDC token) and workspace-ECDSA (key file) signing are "
+        "unavailable or fail; that's appropriate for operator-friendly "
+        "defaults but is not what a security-sensitive CI gate wants. "
+        "With this flag, the runner exits non-zero rather than submitting "
+        "a result the audit-tool side cannot pin to a signing identity. "
+        "Reads MIPITI_REQUIRE_ATTESTATION env var when omitted."
+    ),
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json", "github"], case_sensitive=False),
@@ -306,6 +322,7 @@ def run(
     sigstore_trust_config_path: str | None,
     workspace_signing_key_path: str | None,
     signing_prefer: str,
+    require_attestation: bool,
     output_format: str,
     dry_run: bool,
     reverify: bool,
@@ -373,6 +390,7 @@ def run(
             sigstore_trust_config_path=sigstore_trust_config_path,
             workspace_signing_key_path=workspace_signing_key_path,
             signing_prefer=signing_prefer,
+            require_attestation=require_attestation,
             dry_run=dry_run,
             reverify=reverify,
             verbose=verbose,
@@ -390,11 +408,19 @@ def run(
     has_failures = False
     all_reports: list[dict] = []
 
+    from .runner import AttestationRequiredError
+
     for mid in model_ids:
         if run_all:
             console.print(f"\n[bold]--- {mid} ---[/bold]")
         try:
             report = runner.run(mid)
+        except AttestationRequiredError as e:
+            console.print(
+                f"[red]Attestation required:[/red] {e}"
+            )
+            has_failures = True
+            continue
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")
             has_failures = True
@@ -1999,6 +2025,7 @@ def audit(
     provenance_verified = False  # Bundle verify_artifact succeeded.
     content_verified = False  # content_integrity signature verify succeeded.
 
+
     # --- Provenance ---
     console.print("\n[bold]Provenance (Sigstore)[/bold]")
     prov_raw = pkg.get("provenance")
@@ -2940,6 +2967,64 @@ def audit(
                 console.print(f"      {suff_details}")
         else:
             console.print(f"    Sufficiency: [yellow]{suff_status}[/yellow]")
+
+    # --- Trust contract summary ---
+    console.print()
+    console.print("[bold]Trust contract[/bold]")
+    if provenance_verified:
+        console.print(
+            "  Cryptographic chain:    [green]VERIFIED[/green] "
+            "(Sigstore bundle + Rekor inclusion + bundle-bind)"
+        )
+    elif bundle_json:
+        console.print(
+            "  Cryptographic chain:    [red]FAILED[/red] "
+            "(bundle present but did not verify cleanly)"
+        )
+    else:
+        console.print(
+            "  Cryptographic chain:    [yellow]ABSENT[/yellow] "
+            "(no Sigstore bundle in package)"
+        )
+    if content_verified:
+        console.print(
+            "  Content-integrity sig:  [green]VERIFIED[/green]"
+        )
+    elif ci and ci.get("signature"):
+        console.print(
+            "  Content-integrity sig:  [red]FAILED[/red] "
+            "(signature present but did not verify)"
+        )
+    elif provenance_verified:
+        console.print(
+            "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
+            "(Sigstore provenance is the trust anchor for this row)"
+        )
+    else:
+        console.print(
+            "  Content-integrity sig:  [yellow]ABSENT[/yellow]"
+        )
+    # Auditor pin enforcement.
+    pin_lines = [
+        ("Identity (SAN/issuer):  ", expected_ci_identity, "--expected-ci-identity"),
+        ("Workspace key:          ", expected_workspace_key_fingerprint, "--expected-workspace-key"),
+        ("Model ID:               ", expected_model_id, "--expected-model-id"),
+        ("Commit SHA:             ", expected_commit_sha, "--expected-commit-sha"),
+    ]
+    for label, pin_value, flag_name in pin_lines:
+        if pin_value:
+            # Pinned. Outcome (matched / mismatched / failed) is
+            # already reported in the per-section output above; the
+            # summary states only that the pin was active.
+            console.print(
+                f"  {label}[green]ENFORCED[/green] "
+                f"({flag_name} = {pin_value!r})"
+            )
+        else:
+            console.print(
+                f"  {label}[yellow]not enforced[/yellow] "
+                f"(supply {flag_name} to gate on this)"
+            )
 
     # --- Verdict ---
     # Emit a verdict that accurately describes what was actually

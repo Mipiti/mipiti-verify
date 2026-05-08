@@ -1841,8 +1841,16 @@ class TestIdentityPolicySkippedBlock:
 
         out = result.output
         assert "MATCHED" in out
+        # SKIPPED-block-specific output must not fire when identity is
+        # pinned — the SAN-observation line and the
+        # "cryptographic-chain-vs-identity" explainer belong only to the
+        # unpinned path. The standalone Trust contract summary block
+        # below still prints "Cryptographic chain: VERIFIED" in both
+        # modes, so anchor on the SKIPPED-block phrasing instead.
         assert "Bundle's claimed SAN:" not in out
-        assert "Cryptographic chain" not in out
+        assert (
+            "only the identity (SAN/issuer) match was no-op'd" not in out
+        )
 
 
 class TestSigstoreVerifierConstruction:
