@@ -1231,7 +1231,7 @@ def _audit_pdf_report(
     key_url: str,
     pre_resolved=None,
     snapshot_resolver=None,
-) -> None:
+):
     """Verify a signed PDF report (byte-range scheme).
 
     Trust model is the same as `_audit_html_report`: extract the embedded
@@ -1240,6 +1240,11 @@ def _audit_pdf_report(
     URL-based independent-of-JWKS verification, or via the
     `snapshot_resolver` callable for offline directory-based resolution),
     recompute SHA-256 over the bytes outside the payload, ECDSA-verify.
+
+    Returns the resolved (public_key, fingerprint) tuple so callers that
+    fall through to JSON-envelope verification can reuse the same trust
+    anchor for downstream signature checks (e.g. bundle_bind_signature)
+    without a second JWKS round-trip or a second user-supplied key.
     """
     import base64
     import hashlib
@@ -1314,6 +1319,7 @@ def _audit_pdf_report(
         raise SystemExit(1)
 
     console.print("\n[green bold]Report integrity verified.[/green bold]\n")
+    return pub_key, fingerprint
 
 
 @main.command()
@@ -1444,6 +1450,25 @@ def _audit_pdf_report(
     ),
 )
 @click.option(
+    "--platform-pubkey",
+    "platform_pubkey_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Path to a PEM-encoded platform ECDSA public key. Used to verify "
+        "the envelope-level bundle_bind_signature (the platform's signature "
+        "over each row's bundle-bind hash) when the envelope itself does "
+        "not embed a public key — the case for rows whose key_source is "
+        "Sigstore, where the embedded `public_key_pem` is intentionally "
+        "empty because the row's trust anchor is the Sigstore bundle, not "
+        "an envelope-resident PEM. PDF audits resolve this key automatically "
+        "from the document signature; raw JSON audit archives need this "
+        "flag (or an air-gap-friendly equivalent) for offline verification "
+        "of bundle-bind. Mutually compatible with --rekor-anchor and "
+        "--rekor-entry-snapshot-dir; explicit pin wins over both."
+    ),
+)
+@click.option(
     "--rekor-anchor",
     "rekor_anchor_url",
     default=None,
@@ -1513,6 +1538,7 @@ def audit(
     ci_identity_from_env: bool,
     expected_issuer: str | None,
     expected_workspace_key_fingerprint: str | None,
+    platform_pubkey_path: str | None,
     rekor_anchor_url: str | None,
     expected_anchor_identity: str | None,
     expected_anchor_issuer: str | None,
@@ -1708,6 +1734,27 @@ def audit(
             sigstore_trust_config_path,
         )
 
+    # Load the explicitly-pinned platform public key, if supplied.
+    # Used for envelope-level bundle_bind_signature checks on rows whose
+    # `public_key_pem` is empty (the Sigstore key-source case). The
+    # PDF outer-signature path can resolve this key automatically; raw
+    # JSON audit archives (no PDF wrapper) need this flag.
+    explicit_platform_pubkey = None
+    if platform_pubkey_path:
+        from cryptography.hazmat.primitives import serialization as _pp_ser
+        try:
+            with open(platform_pubkey_path, "rb") as _pp_f:
+                explicit_platform_pubkey = _pp_ser.load_pem_public_key(
+                    _pp_f.read()
+                )
+        except Exception as _pp_err:
+            console.print(
+                f"[red]Error:[/red] --platform-pubkey at "
+                f"{platform_pubkey_path!r} is not a valid PEM-encoded "
+                f"public key: {_pp_err}"
+            )
+            raise SystemExit(2)
+
     import hashlib
     import base64
 
@@ -1740,12 +1787,22 @@ def audit(
     # bundles, workspace-ECDSA signatures, content_integrity payload),
     # we ALSO dispatch through the JSON audit code path so identity-
     # pinning flags work end-to-end.
+    # Tracks the platform pubkey resolved by the PDF outer-signature
+    # path. When the PDF also carries an audit envelope, the bundle-bind
+    # signature on sigstore-keyed rows is signed by the same platform
+    # key — reusing what was already verified avoids re-resolving it
+    # from JWKS (or losing it entirely for sigstore rows whose envelope
+    # `public_key_pem` is empty by design). Stays None on non-PDF
+    # inputs and on PDFs without an embedded envelope.
+    pdf_resolved_pubkey = None
+    pdf_resolved_fingerprint: str | None = None
+
     with open(package_file, "rb") as f:
         head = f.read(8)
     if head.startswith(b"%PDF-"):
         with open(package_file, "rb") as f:
             pdf_bytes = f.read()
-        _audit_pdf_report(
+        pdf_resolved_pubkey, pdf_resolved_fingerprint = _audit_pdf_report(
             pdf_bytes, key_url,
             pre_resolved=anchor_pre_resolved,
             snapshot_resolver=snapshot_resolver,
@@ -2023,14 +2080,49 @@ def audit(
                                 "than the envelope claims."
                             )
                         # Platform tamper-detection on bundle_bind_hash.
-                        # When the envelope carries a signature over the
-                        # binding value, verify it against the platform
-                        # public key already embedded in the envelope.
+                        # The bundle-bind signature is the platform's
+                        # signature over the row's bundle-bind hash; it
+                        # binds the bundle to the envelope so a swapped
+                        # bundle plus a hand-edited bundle_bind_hash
+                        # cannot pass verification. The signature is
+                        # produced by the same platform key that signs
+                        # the outer document signature on PDFs and HTML
+                        # reports — i.e. the JWKS-published instance key.
+                        #
                         # Fail-closed: an invalid or malformed signature
                         # is a fail, not a soft warning. A missing
                         # signature is permitted (see the comment block
                         # above) — only the issuer-side surface decides
                         # whether to populate it.
+                        #
+                        # Three-tier key resolution, in priority order:
+                        #
+                        #   1. --platform-pubkey explicit pin (offline,
+                        #      auditor-controlled — wins over everything;
+                        #      same precedence model as --rekor-anchor
+                        #      vs JWKS for the outer signature).
+                        #
+                        #   2. The platform key already resolved by the
+                        #      PDF outer-signature path. The outer sig
+                        #      and the bundle-bind sig are produced by
+                        #      the same key; reusing what we already
+                        #      verified avoids a second JWKS round-trip
+                        #      and is the only resolution path available
+                        #      for rows whose envelope-embedded public
+                        #      key is empty (e.g. Sigstore key source,
+                        #      where the trust anchor is the bundle, not
+                        #      an envelope-resident PEM).
+                        #
+                        #   3. The envelope's own `public_key_pem`,
+                        #      retained for backward compatibility with
+                        #      envelopes whose key source embeds a PEM
+                        #      directly (workspace ECDSA / non-Sigstore
+                        #      platform-keyed rows).
+                        #
+                        # If none of the three apply, the verifier fails
+                        # loudly with a remediation pointer rather than
+                        # silently skipping the check or accepting an
+                        # unverified bundle binding.
                         if bundle_bind_signature:
                             from cryptography.hazmat.primitives import (
                                 hashes as _bb_hashes,
@@ -2039,17 +2131,61 @@ def audit(
                             from cryptography.hazmat.primitives.asymmetric import (
                                 ec as _bb_ec,
                             )
-                            pub_pem_for_bind = ci.get("public_key_pem", "")
-                            if not pub_pem_for_bind:
+                            bb_pub = None
+                            bb_pub_source = ""
+                            if explicit_platform_pubkey is not None:
+                                bb_pub = explicit_platform_pubkey
+                                bb_pub_source = "--platform-pubkey"
+                            elif pdf_resolved_pubkey is not None:
+                                bb_pub = pdf_resolved_pubkey
+                                bb_pub_source = (
+                                    "PDF document signature "
+                                    f"({pdf_resolved_fingerprint[:16]}...)"
+                                    if pdf_resolved_fingerprint
+                                    else "PDF document signature"
+                                )
+                            else:
+                                pub_pem_for_bind = ci.get(
+                                    "public_key_pem", ""
+                                )
+                                if pub_pem_for_bind:
+                                    try:
+                                        bb_pub = (
+                                            _bb_serialization
+                                            .load_pem_public_key(
+                                                pub_pem_for_bind.encode()
+                                            )
+                                        )
+                                        bb_pub_source = (
+                                            "envelope public_key_pem"
+                                        )
+                                    except Exception as bb_load_err:
+                                        raise ValueError(
+                                            f"envelope public_key_pem is "
+                                            f"present but malformed: "
+                                            f"{bb_load_err}"
+                                        )
+                            if bb_pub is None:
                                 raise ValueError(
                                     "bundle_bind_signature is present but "
-                                    "the envelope has no public_key_pem to "
-                                    "verify it against."
+                                    "no platform public key is in scope "
+                                    "to verify it against. The envelope "
+                                    "embeds no public_key_pem (expected "
+                                    "for Sigstore key-source rows where "
+                                    "the bundle is the trust anchor), no "
+                                    "PDF outer-signature pubkey was "
+                                    "resolved (raw JSON audit archive), "
+                                    "and no --platform-pubkey was "
+                                    "supplied. Pass --platform-pubkey "
+                                    "<pem> with the instance's signing "
+                                    "public key (the same key published "
+                                    "at /.well-known/jwks) to verify the "
+                                    "bundle binding offline, or run the "
+                                    "audit against the signed PDF "
+                                    "report instead so the verifier can "
+                                    "reuse the document-signature key."
                                 )
                             try:
-                                bb_pub = _bb_serialization.load_pem_public_key(
-                                    pub_pem_for_bind.encode()
-                                )
                                 bb_sig_bytes = base64.b64decode(
                                     bundle_bind_signature
                                 )
@@ -2060,7 +2196,9 @@ def audit(
                                 )
                             except Exception as bb_err:
                                 raise ValueError(
-                                    f"bundle_bind_signature INVALID — {bb_err}"
+                                    f"bundle_bind_signature INVALID "
+                                    f"(verified against {bb_pub_source}) "
+                                    f"— {bb_err}"
                                 )
                         provenance_verified = True
                         console.print("  Bundle signature: [green]VERIFIED[/green]")

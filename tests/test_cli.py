@@ -1145,6 +1145,421 @@ class TestBundleBindExplicit:
         assert "Bundle Subject digest does not match" in out_flat
 
 
+class TestBundleBindKeyResolution:
+    """Bundle-bind-signature platform-key resolution paths.
+
+    The bundle_bind_signature is signed by the platform key — the same
+    key that signs the outer document signature on PDFs and HTML
+    reports. Three resolution tiers are supported, in priority order:
+
+      1. --platform-pubkey: explicit auditor-supplied PEM (offline).
+      2. PDF outer-signature pubkey: when the input is a signed PDF,
+         the document-signature path resolves the platform key from
+         JWKS (or from a Rekor anchor); the bundle-bind path reuses
+         it without a second resolution round-trip.
+      3. envelope public_key_pem: legacy / non-Sigstore key-source
+         rows that embed a PEM directly in the envelope.
+
+    When none of the three apply, the verifier fails-loud with a
+    remediation pointer rather than skipping the bundle-bind check.
+    """
+
+    def _build_pkg_with_separate_platform(
+        self, tmp_path, *, bundle_bind_hash, subject_digest,
+        platform_key, embed_platform_pem=False, valid_platform_sig=True,
+    ):
+        """Build a JSON audit package where the bundle-bind signature
+        is produced by `platform_key`, and the envelope's
+        public_key_pem either embeds that platform key (legacy /
+        Tier 3) or is intentionally empty (sigstore key-source row,
+        the case Tiers 1 and 2 exist to cover).
+        """
+        import base64 as _b64
+        import hashlib as _h
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        results_hash = (
+            "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+        )
+
+        if embed_platform_pem:
+            pub_pem = platform_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode()
+        else:
+            pub_pem = ""
+
+        msg = (
+            bundle_bind_hash.encode("utf-8")
+            if valid_platform_sig
+            else b"forgery-attempt"
+        )
+        bb_sig = platform_key.sign(msg, ec.ECDSA(hashes.SHA256()))
+
+        ci = {
+            "results_hash": results_hash,
+            "public_key_pem": pub_pem,
+            "bundle_bind_hash": bundle_bind_hash,
+            "bundle_bind_signature": _b64.b64encode(bb_sig).decode(),
+        }
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": ci,
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "t", "digest": {"sha256": subject_digest}}
+            ],
+            "predicateType": (
+                "https://mipiti.io/attestations/v1/verification-run"
+            ),
+            "predicate": {
+                "model_id": "m1", "pipeline": {"commit_sha": "abc"}
+            },
+        }
+        return str(path), statement
+
+    def _patch_sigstore(self, statement):
+        import json as _j
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_cert.not_valid_after_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_log = MagicMock()
+        fake_log.log_index = 1
+        fake_log.integrated_time = 0
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+        fake_bundle.log_entry = fake_log
+
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/vnd.in-toto+json",
+            _j.dumps(statement).encode("utf-8"),
+        )
+        return (
+            patch(
+                "sigstore.models.Bundle.from_json",
+                return_value=fake_bundle,
+            ),
+            patch(
+                "sigstore.verify.Verifier.production",
+                return_value=fake_verifier,
+            ),
+        )
+
+    def test_tier3_envelope_pem_legacy_path_verifies(self, tmp_path):
+        """Legacy / non-Sigstore key-source rows embed the platform PEM
+        directly in the envelope. The bundle-bind verification falls
+        back to that PEM when no higher-priority key is in scope, and
+        succeeds when the signature is valid."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "11" * 32
+        path, statement = self._build_pkg_with_separate_platform(
+            tmp_path,
+            bundle_bind_hash=bind_hex,
+            subject_digest=bind_hex,
+            platform_key=platform_key,
+            embed_platform_pem=True,
+            valid_platform_sig=True,
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        out_flat = " ".join(result.output.split())
+        assert "Bundle bind:" in out_flat
+        assert "VERIFIED" in out_flat
+
+    def test_json_archive_no_pubkey_fails_loud(self, tmp_path):
+        """Sigstore key-source row (envelope public_key_pem empty) +
+        plain JSON archive (no PDF outer signature in scope) +
+        no --platform-pubkey: the verifier must fail with a clear
+        remediation pointer rather than silently skipping the
+        bundle-bind check or crashing."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "22" * 32
+        path, statement = self._build_pkg_with_separate_platform(
+            tmp_path,
+            bundle_bind_hash=bind_hex,
+            subject_digest=bind_hex,
+            platform_key=platform_key,
+            embed_platform_pem=False,  # the gap state
+            valid_platform_sig=True,
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "no platform public key is in scope" in out_flat
+        assert "--platform-pubkey" in out_flat
+        # Clean failure, no traceback.
+        assert "Traceback" not in result.output
+
+    def test_json_archive_with_platform_pubkey_flag_verifies(
+        self, tmp_path
+    ):
+        """Sigstore key-source row + --platform-pubkey supplied: the
+        verifier loads the auditor-pinned PEM and uses it for the
+        bundle-bind check. Highest-precedence resolution tier."""
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "33" * 32
+        path, statement = self._build_pkg_with_separate_platform(
+            tmp_path,
+            bundle_bind_hash=bind_hex,
+            subject_digest=bind_hex,
+            platform_key=platform_key,
+            embed_platform_pem=False,
+            valid_platform_sig=True,
+        )
+        platform_pem_path = tmp_path / "platform.pem"
+        platform_pem_path.write_bytes(
+            platform_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--platform-pubkey", str(platform_pem_path),
+            ])
+        out_flat = " ".join(result.output.split())
+        assert "Bundle bind:" in out_flat
+        assert "VERIFIED" in out_flat
+
+    def test_json_archive_platform_pubkey_signature_mismatch_fails(
+        self, tmp_path
+    ):
+        """--platform-pubkey supplied but the envelope's bind signature
+        was produced by a different key: the ECDSA verify call rejects
+        the signature, and the audit FAILs with an INVALID diagnostic
+        (not the KEY_UNRESOLVABLE branch)."""
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        attacker_key = ec.generate_private_key(ec.SECP256R1())
+        unrelated_key = ec.generate_private_key(ec.SECP256R1())
+        bind_hex = "44" * 32
+        path, statement = self._build_pkg_with_separate_platform(
+            tmp_path,
+            bundle_bind_hash=bind_hex,
+            subject_digest=bind_hex,
+            platform_key=attacker_key,
+            embed_platform_pem=False,
+            valid_platform_sig=True,
+        )
+        # Pin to a key the envelope was NOT signed by.
+        wrong_pem_path = tmp_path / "wrong-platform.pem"
+        wrong_pem_path.write_bytes(
+            unrelated_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        bp, vp = self._patch_sigstore(statement)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--platform-pubkey", str(wrong_pem_path),
+            ])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "bundle_bind_signature INVALID" in out_flat
+        # The diagnostic should name the resolution source so an
+        # auditor sees which key was used.
+        assert "--platform-pubkey" in out_flat
+
+    def test_pdf_outer_sig_pubkey_reused_for_bundle_bind(self, tmp_path):
+        """PDF input with an embedded audit envelope: the platform
+        public key resolved by the document-signature path must be
+        reused for the bundle-bind check on rows whose envelope
+        public_key_pem is empty (Sigstore key-source production
+        case). End-to-end: the PDF signs over its own content with
+        platform_key, JWKS resolves platform_key, the embedded
+        envelope's bundle is sigstore-keyed (empty public_key_pem)
+        and carries a bundle_bind_signature also produced by
+        platform_key. The verifier threads the resolved key from
+        the outer pass into the inner bundle-bind check without a
+        second JWKS round-trip and without requiring
+        --platform-pubkey from the auditor."""
+        import base64
+        import gzip
+        import hashlib
+        import json as _j
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from mipiti_verify.cli import (
+            _PDF_SIG_START, _PDF_SIG_END, _PDF_SIG_PAYLOAD_LEN,
+            _PDF_AUDIT_START, _PDF_AUDIT_END,
+        )
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        der = platform_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        fingerprint = hashlib.sha256(der).hexdigest()
+
+        # Embedded envelope: empty public_key_pem (sigstore
+        # key-source row) plus a bundle_bind_signature signed by
+        # platform_key.
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        results_hash = (
+            "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        )
+        bind_hex = "5e" * 32
+        bb_sig = platform_key.sign(
+            bind_hex.encode("utf-8"), ec.ECDSA(hashes.SHA256())
+        )
+        envelope = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": {
+                "results_hash": results_hash,
+                "public_key_pem": "",
+                "bundle_bind_hash": bind_hex,
+                "bundle_bind_signature": base64.b64encode(bb_sig).decode(),
+                "key_source": "sigstore",
+            },
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+
+        envelope_json = _j.dumps(envelope).encode("utf-8")
+        envelope_b64 = base64.b64encode(gzip.compress(envelope_json))
+
+        pdf_body = b"%PDF-1.7\nfake body\n%%EOF\n"
+        pdf_with_audit = (
+            pdf_body + _PDF_AUDIT_START + envelope_b64 + _PDF_AUDIT_END
+        )
+
+        # Outer document signature mirrors _audit_pdf_report's
+        # covered-byte selection: (everything outside the payload).
+        covered = pdf_with_audit + _PDF_SIG_START + _PDF_SIG_END
+        digest = hashlib.sha256(covered).digest()
+        outer_sig = platform_key.sign(digest, ec.ECDSA(hashes.SHA256()))
+        outer_sig_b64 = base64.b64encode(outer_sig).decode()
+        sig_payload = f"{fingerprint}:{outer_sig_b64}".encode()
+        sig_payload = sig_payload + b" " * (
+            _PDF_SIG_PAYLOAD_LEN - len(sig_payload)
+        )
+        pdf_full = (
+            pdf_with_audit + _PDF_SIG_START + sig_payload + _PDF_SIG_END
+        )
+        pdf_path = tmp_path / "report.pdf"
+        pdf_path.write_bytes(pdf_full)
+
+        # JWK that JWKS will return for the outer-sig fingerprint.
+        nums = platform_key.public_key().public_numbers()
+        x_b64 = base64.urlsafe_b64encode(
+            nums.x.to_bytes(32, "big")
+        ).rstrip(b"=").decode()
+        y_b64 = base64.urlsafe_b64encode(
+            nums.y.to_bytes(32, "big")
+        ).rstrip(b"=").decode()
+        jwk = {
+            "kty": "EC", "crv": "P-256", "kid": fingerprint,
+            "x": x_b64, "y": y_b64,
+        }
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json = MagicMock(return_value={"keys": [jwk]})
+
+        # Mocked Sigstore returns a statement whose Subject digest
+        # matches bind_hex so the bundle-bind hash check passes.
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "t", "digest": {"sha256": bind_hex}}
+            ],
+            "predicateType": (
+                "https://mipiti.io/attestations/v1/verification-run"
+            ),
+            "predicate": {
+                "model_id": "m1", "pipeline": {"commit_sha": "abc"}
+            },
+        }
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_cert.not_valid_after_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_log = MagicMock()
+        fake_log.log_index = 1
+        fake_log.integrated_time = 0
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+        fake_bundle.log_entry = fake_log
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/vnd.in-toto+json",
+            _j.dumps(statement).encode("utf-8"),
+        )
+
+        with patch("httpx.get", return_value=mock_resp), \
+                patch(
+                    "sigstore.models.Bundle.from_json",
+                    return_value=fake_bundle,
+                ), \
+                patch(
+                    "sigstore.verify.Verifier.production",
+                    return_value=fake_verifier,
+                ):
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", str(pdf_path),
+                "--key-url", "https://example.test/jwks",
+            ])
+        out_flat = " ".join(result.output.split())
+        # The outer document signature must verify (Tier 2 reuse
+        # depends on this succeeding).
+        assert "Signature: VALID" in out_flat
+        # The bundle-bind check uses the threaded outer-sig key, not
+        # the empty envelope public_key_pem.
+        assert "Bundle bind: VERIFIED" in out_flat
+        assert "no platform public key is in scope" not in out_flat
+
+
 class TestInferIssuer:
     """`_infer_issuer` helper: SAN-prefix registry only.
 

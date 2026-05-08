@@ -368,13 +368,18 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     ):
         return "FAILED"
 
-    # Bundle present + bundle_bind_signature populated but invalid.
-    # The platform signature over bundle_bind_hash gives the auditor
-    # tamper-evidence on the binding claim itself. None means absent
-    # (permitted); False means present-but-invalid (hard fail).
+    # Bundle present + bundle_bind_signature populated and the
+    # verifier could not return VALID. Two failure modes are folded
+    # together by the abstract Audit operator (and by this spec
+    # mirror): "INVALID" means the signature was checked against a
+    # resolved key and ECDSA failed; "KEY_UNRESOLVABLE" means the
+    # signature is present but no platform key was resolvable from
+    # any tier (envelope public_key_pem, PDF outer-signature key,
+    # or auditor-supplied --platform-pubkey). None means absent
+    # (permitted); only present-and-non-VALID fails.
     if (
         bundle is not ABSENT
-        and pkg.get("bundle_bind_signature") is False
+        and pkg.get("bundle_bind_signature") in ("INVALID", "KEY_UNRESOLVABLE")
     ):
         return "FAILED"
 
@@ -607,30 +612,74 @@ def _materialise(tmp_path, pkg: dict) -> str:
                 content_hash_for_bind.encode("utf-8")
             ).hexdigest()
             ci["bundle_bind_hash"] = bind_hex
-            # Sign with KEY_A as the platform key abstraction. The
-            # materialiser already signed `stored_hash` for ws_sig
-            # under signing_key (KEY_A or KEY_B); for bundle_bind we
-            # always use KEY_A and embed its PEM as public_key_pem
-            # so the verifier can find a key to check the bind sig
-            # against. When ws_sig is absent we set public_key_pem
-            # here too. When ws_sig is present, this overwrites it
-            # with KEY_A — fine because none of the BFS rows that
-            # exercise both use KEY_B.
+            # Sign with KEY_A as the platform-key abstraction. The
+            # ws_sig branch above signs `stored_hash` under signing_key
+            # (KEY_A or KEY_B); the bundle-bind signature is signed by
+            # KEY_A throughout, modelling the platform's signing key
+            # (which in production is the same key for all rows).
+            #
+            # The abstract `bundle_bind_signature` field carries the
+            # verifier-side outcome enum, not a raw boolean:
+            #
+            #   "VALID"            — sign correctly; embed public_key_pem
+            #                        in the envelope so the verifier can
+            #                        evaluate the signature against an
+            #                        envelope-resident key.
+            #   "INVALID"          — sign over junk; embed public_key_pem
+            #                        so the verifier reaches the ECDSA
+            #                        check and fails on bad bytes.
+            #   "KEY_UNRESOLVABLE" — sign correctly, but DO NOT embed
+            #                        public_key_pem. Models the
+            #                        production case where a row's
+            #                        envelope intentionally omits the
+            #                        platform key (e.g. Sigstore /
+            #                        orphan key-source rows whose trust
+            #                        anchor is the bundle, not an
+            #                        envelope-resident PEM). The
+            #                        verifier must fail-loud rather
+            #                        than silently skip the check.
+            #
+            # No more "patch in public_key_pem if missing": the previous
+            # auto-patch made the KEY_UNRESOLVABLE state unreachable in
+            # BFS by construction, even though production can ship it.
             bb_sig_state = pkg.get("bundle_bind_signature")
             if bb_sig_state is not None:
-                if "public_key_pem" not in ci or not ci.get("public_key_pem"):
-                    ci["public_key_pem"] = KEY_A.public_key().public_bytes(
-                        serialization.Encoding.PEM,
-                        serialization.PublicFormat.SubjectPublicKeyInfo,
-                    ).decode()
-                if bb_sig_state is True:
+                if bb_sig_state in ("VALID", "INVALID"):
+                    if "public_key_pem" not in ci or not ci.get("public_key_pem"):
+                        ci["public_key_pem"] = KEY_A.public_key().public_bytes(
+                            serialization.Encoding.PEM,
+                            serialization.PublicFormat.SubjectPublicKeyInfo,
+                        ).decode()
+                elif bb_sig_state == "KEY_UNRESOLVABLE":
+                    # Force the envelope's public_key_pem empty so the
+                    # verifier's V4 branch is reachable. The abstract
+                    # KEY_UNRESOLVABLE state names the production case
+                    # where the row's envelope intentionally omits the
+                    # platform key (Sigstore key-source rows whose
+                    # trust anchor is the bundle); the ws_sig branch
+                    # above may have populated public_key_pem from the
+                    # workspace key, which is fine for V1/V2/V3 but
+                    # would let the verifier's Tier 3 (envelope-PEM)
+                    # resolution path fire and return VERIFIED — the
+                    # opposite of what the abstract state pins.
+                    ci["public_key_pem"] = ""
+                if bb_sig_state == "VALID":
                     bb_sig = KEY_A.sign(
                         bind_hex.encode("utf-8"),
                         ec.ECDSA(hashes.SHA256()),
                     )
-                else:
+                elif bb_sig_state == "INVALID":
                     bb_sig = KEY_A.sign(
                         b"junk-bind-sig",
+                        ec.ECDSA(hashes.SHA256()),
+                    )
+                else:
+                    # "KEY_UNRESOLVABLE" — sign correctly so the
+                    # verifier's failure is unambiguously about key
+                    # resolution, not crypto. The verifier should
+                    # fail before reaching the ECDSA verify call.
+                    bb_sig = KEY_A.sign(
+                        bind_hex.encode("utf-8"),
                         ec.ECDSA(hashes.SHA256()),
                     )
                 ci["bundle_bind_signature"] = base64.b64encode(bb_sig).decode()
@@ -747,7 +796,7 @@ def _all_packages(include_bundle_rows: bool):
                         "results_hash": bound_hash,
                         "results_canonical_hash": "h1",
                         "bundle_bind_hash": bound_hash,
-                        "bundle_bind_signature": True,
+                        "bundle_bind_signature": "VALID",
                     })
         # I8 / step-#8 coverage: bundle bound to one hash, package
         # claims another. Sigstore's verify_artifact fails because
@@ -775,7 +824,7 @@ def _all_packages(include_bundle_rows: bool):
                     "results_hash": claimed_hash,
                     "results_canonical_hash": "h1",
                     "bundle_bind_hash": bound_hash,
-                    "bundle_bind_signature": True,
+                    "bundle_bind_signature": "VALID",
                 })
         # I10 corner case: bundle present but results_hash is NONE.
         for valid in [True, False]:
@@ -792,7 +841,7 @@ def _all_packages(include_bundle_rows: bool):
                 "results_hash": NONE,
                 "results_canonical_hash": "h1",
                 "bundle_bind_hash": "h1",
-                "bundle_bind_signature": True,
+                "bundle_bind_signature": "VALID",
             })
 
         # V1 / V2 / V3 coverage: rows where ws_sig.key_source is
@@ -821,7 +870,7 @@ def _all_packages(include_bundle_rows: bool):
                     "results_hash": "h1",
                     "results_canonical_hash": "h1",
                     "bundle_bind_hash": "h1",
-                    "bundle_bind_signature": True,
+                    "bundle_bind_signature": "VALID",
                 })
 
         # I14 — explicit bundle_bind variations. Each row has a valid
@@ -834,19 +883,19 @@ def _all_packages(include_bundle_rows: bool):
         # token "h2" (the materialiser maps it to a digest the bundle
         # was NOT signed over). Missing bundle_bind_hash is modelled
         # by setting the field to None; missing signature by setting
-        # bundle_bind_signature to None (NOT False, which means
+        # bundle_bind_signature to None (NOT "INVALID", which means
         # present-but-invalid).
         for bb_hash, bb_sig in [
-            ("h2", True),    # mismatched hash, valid sig over the
-                             # mismatched value: hash check fires first.
-            (None, True),    # missing hash on a bundle-bearing
-                             # envelope: hard fail.
-            (None, None),    # missing both (legacy envelope shape):
-                             # hard fail under the post-cutover rule.
-            ("h1", False),   # matching hash, invalid signature:
-                             # signature check fires.
-            ("h1", None),    # matching hash, no signature: VERIFIED
-                             # is permitted (sig is optional).
+            ("h2", "VALID"),    # mismatched hash, valid sig over the
+                                # mismatched value: hash check fires first.
+            (None, "VALID"),    # missing hash on a bundle-bearing
+                                # envelope: hard fail.
+            (None, None),       # missing both (legacy envelope shape):
+                                # hard fail under the post-cutover rule.
+            ("h1", "INVALID"),  # matching hash, invalid signature:
+                                # signature check fires.
+            ("h1", None),       # matching hash, no signature: VERIFIED
+                                # is permitted (sig is optional).
         ]:
             pkgs.append({
                 "bundle": {
@@ -863,6 +912,73 @@ def _all_packages(include_bundle_rows: bool):
                 "bundle_bind_hash": bb_hash,
                 "bundle_bind_signature": bb_sig,
             })
+
+        # V4 — bundle_bind_signature is present but the envelope has no
+        # platform key for the verifier to evaluate it against. This
+        # state is reachable in production for envelope rows whose
+        # public_key_pem is intentionally empty (e.g. Sigstore-keyed
+        # rows whose trust anchor is the bundle, not an envelope-
+        # resident PEM). The previous BFS materialiser auto-patched
+        # public_key_pem in whenever bundle_bind_signature was
+        # populated, making the gap state impossible-by-construction;
+        # the materialiser no longer does that, and this row exercises
+        # the V4 "fail-loud on KEY_UNRESOLVABLE" branch.
+        #
+        # The row is wired through ws_sig.key_source = "sigstore" so
+        # the materialiser leaves public_key_pem empty (the production
+        # invariant for Sigstore-keyed rows), and the verifier's V4
+        # branch fires when the envelope has no key in scope and no
+        # PDF outer-signature key (BFS calls audit() against a JSON
+        # archive, not a PDF) and no --platform-pubkey was supplied.
+        pkgs.append({
+            "bundle": {
+                "san": "<real_san>",
+                "issuer": ISS_GH,
+                "bound_hash": "h1",
+                "predicate_model_id": M1,
+                "predicate_commit_sha": C1,
+                "valid": True,
+            },
+            "ws_sig": {
+                "signing_key_fp": FP_A,
+                "claimed_fp": NONE,
+                "message_hash": "h1",
+                "valid": True,
+                "key_source": "sigstore",
+            },
+            "results_hash": "h1",
+            "results_canonical_hash": "h1",
+            "bundle_bind_hash": "h1",
+            "bundle_bind_signature": "KEY_UNRESOLVABLE",
+        })
+
+        # V4 — same gap state via the orphan key-source row. Orphan
+        # rows have empty public_key_pem in production (the issuer
+        # could not resolve the fingerprint to a published key). When
+        # the row also carries a populated bundle_bind_signature, the
+        # verifier hits the same V4 branch — no key in envelope, no
+        # PDF outer signature in scope, no --platform-pubkey: FAILED.
+        pkgs.append({
+            "bundle": {
+                "san": "<real_san>",
+                "issuer": ISS_GH,
+                "bound_hash": "h1",
+                "predicate_model_id": M1,
+                "predicate_commit_sha": C1,
+                "valid": True,
+            },
+            "ws_sig": {
+                "signing_key_fp": FP_A,
+                "claimed_fp": NONE,
+                "message_hash": "h1",
+                "valid": True,
+                "key_source": "unverifiable_orphan",
+            },
+            "results_hash": "h1",
+            "results_canonical_hash": "h1",
+            "bundle_bind_hash": "h1",
+            "bundle_bind_signature": "KEY_UNRESOLVABLE",
+        })
     return pkgs
 
 
@@ -993,10 +1109,12 @@ def _pkg_id(pkg: dict) -> str:
     bb_hash_id = "N" if bb_hash is None else bb_hash
     if bb_sig is None:
         bb_sig_id = "N"
-    elif bb_sig is True:
-        bb_sig_id = "1"
-    else:
-        bb_sig_id = "0"
+    elif bb_sig == "VALID":
+        bb_sig_id = "V"
+    elif bb_sig == "INVALID":
+        bb_sig_id = "X"
+    else:  # "KEY_UNRESOLVABLE"
+        bb_sig_id = "U"
     return (
         f"{bundle}:{ws}:rh={pkg['results_hash'] or 'N'}:"
         f"bb={bb_hash_id}/{bb_sig_id}"
@@ -1277,7 +1395,9 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"bundle_bind_hash\n  pkg={pkg_resolved}, pins={pins}\n"
             f"{result.output}"
         )
-        assert pkg_resolved.get("bundle_bind_signature") is not False, (
-            f"I14 violated: VERIFIED with invalid bundle_bind_signature\n"
+        assert pkg_resolved.get("bundle_bind_signature") not in (
+            "INVALID", "KEY_UNRESOLVABLE"
+        ), (
+            f"I14 violated: VERIFIED with non-VALID bundle_bind_signature\n"
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
