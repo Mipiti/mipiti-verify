@@ -98,6 +98,29 @@ WSSig == [
     key_source     : KeySources
 ]
 
+\* bundle_bind_signature outcomes — the verifier-side resolution and
+\* signature check, modeled as a discriminated outcome rather than a
+\* single BOOLEAN. The previous BOOLEAN form's comment claimed the
+\* platform public key was "already embedded in the envelope"; that
+\* precondition was asserted by the abstraction rather than checked,
+\* and conflated two distinct verifier code paths into one bit:
+\*
+\*   1. signature was checked against a resolved key, ECDSA failed;
+\*   2. signature could not be checked because no key was resolvable.
+\*
+\* Both produced the same FAILED verdict, but the second path is real
+\* in production for envelope rows whose embedded public_key_pem is
+\* intentionally empty (e.g. Sigstore key-source rows whose trust
+\* anchor is the bundle, not an envelope-resident PEM). The verifier
+\* now resolves the platform key from up to three sources, in order:
+\* an explicit auditor-supplied --platform-pubkey; the platform key
+\* already resolved by the PDF outer-signature path; the envelope's
+\* own public_key_pem. KEY_UNRESOLVABLE captures the case where none
+\* of the three apply — the signature is present but the verifier
+\* has no key to evaluate it against, and FAILS rather than silently
+\* skipping the check.
+BundleBindSigOutcomes == {"VALID", "INVALID", "KEY_UNRESOLVABLE"}
+
 Package == [
     bundle                 : (Bundle \cup {ABSENT}),
     ws_sig                 : (WSSig \cup {ABSENT}),
@@ -110,14 +133,12 @@ Package == [
     \* omitted the field — accepted only when the envelope carries no
     \* bundle (post-cutover envelopes always pair the two).
     \*
-    \* bundle_bind_signature: BOOLEAN abstraction of "the platform
-    \* signature over bundle_bind_hash verifies against the platform
-    \* public key already embedded in the envelope." TRUE means the
-    \* signature is present and valid; FALSE means present but
-    \* invalid (or missing public key); ABSENT (modelled as NONE
-    \* below) means the envelope omitted the signature entirely.
+    \* bundle_bind_signature: discriminated outcome of the verifier's
+    \* bundle-bind-signature check (VALID / INVALID / KEY_UNRESOLVABLE)
+    \* or NONE when the envelope omitted the signature entirely. See
+    \* BundleBindSigOutcomes above for the meaning of each value.
     bundle_bind_hash       : (Hashes \cup {NONE}),
-    bundle_bind_signature  : (BOOLEAN \cup {NONE})
+    bundle_bind_signature  : (BundleBindSigOutcomes \cup {NONE})
 ]
 
 Pins == [
@@ -242,13 +263,17 @@ Audit(k, q) ==
          /\ k.bundle.bound_hash # k.bundle_bind_hash
     THEN "FAILED"
 
-    \* Bundle present + bundle_bind_signature populated but invalid.
-    \* The platform signature over bundle_bind_hash gives the auditor
-    \* tamper-evidence on the binding claim itself; an invalid
-    \* signature is a hard fail. NONE means the envelope omitted the
-    \* signature — that's permitted; only present-but-invalid fails.
+    \* Bundle present + bundle_bind_signature populated and either
+    \* cryptographically invalid OR not evaluable because no platform
+    \* public key was resolvable. The platform signature over
+    \* bundle_bind_hash gives the auditor tamper-evidence on the
+    \* binding claim itself; an invalid signature is a hard fail, and
+    \* a present-but-unverifiable signature is also a hard fail
+    \* (silent skip would let an attacker drop the bind by spoofing
+    \* the empty-key state). NONE means the envelope omitted the
+    \* signature — that's permitted; only present-and-non-VALID fails.
     ELSE IF k.bundle # ABSENT
-         /\ k.bundle_bind_signature = FALSE
+         /\ k.bundle_bind_signature \in {"INVALID", "KEY_UNRESOLVABLE"}
     THEN "FAILED"
 
     \* Bundle present but no results_hash to bind the canonical hash
@@ -384,7 +409,7 @@ InitBase ==
 \*
 \* Pins bundle_bind to the canonical "matching, valid" representative:
 \*   - bundle present  ⇒ bundle_bind_hash = bundle.bound_hash AND
-\*                       bundle_bind_signature = TRUE
+\*                       bundle_bind_signature = "VALID"
 \*   - bundle absent   ⇒ already pinned to NONE/NONE by InitBase
 \*
 \* Composition argument (formal/COMPOSITION.md): every invariant in
@@ -396,7 +421,7 @@ Init_main ==
     /\ InitBase
     /\ (pkg.bundle # ABSENT
         => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
-           /\ pkg.bundle_bind_signature = TRUE)
+           /\ pkg.bundle_bind_signature = "VALID")
 
 \* Init_bind — Config 2 init for audit_bundle_bind.cfg.
 \*
@@ -601,7 +626,7 @@ I14_BundleBindExplicit ==
      /\ pkg.bundle # ABSENT)
     => /\ pkg.bundle_bind_hash # NONE
        /\ pkg.bundle.bound_hash = pkg.bundle_bind_hash
-       /\ pkg.bundle_bind_signature # FALSE
+       /\ pkg.bundle_bind_signature \notin {"INVALID", "KEY_UNRESOLVABLE"}
 
 \* V1 — Sigstore-skip soundness. When the issuer marks a row's
 \* ws_sig with key_source = KS_SIGSTORE, the verifier MUST NOT FAIL
@@ -619,7 +644,7 @@ V1_SigstoreSkipSoundness ==
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
      /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
-     /\ pkg.bundle_bind_signature # FALSE
+     /\ pkg.bundle_bind_signature \notin {"INVALID", "KEY_UNRESOLVABLE"}
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
      /\ pins.issuer_explicit = NONE
@@ -641,7 +666,7 @@ V2_OrphanWithBundleVerified ==
      /\ pkg.bundle.valid
      /\ pkg.results_hash # NONE
      /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
-     /\ pkg.bundle_bind_signature # FALSE
+     /\ pkg.bundle_bind_signature \notin {"INVALID", "KEY_UNRESOLVABLE"}
      /\ pkg.results_hash = pkg.results_canonical_hash
      /\ pins.san = NONE
      /\ pins.issuer_explicit = NONE
@@ -670,6 +695,29 @@ V3_OrphanWithWorkspacePinFails ==
      /\ pins.san = NONE
      /\ pins.model_id = NONE
      /\ pins.commit_sha = NONE)
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
+
+\* V4 — Bundle-bind-signature key resolution must be explicit.
+\*
+\* When the envelope carries a bundle and the bundle-bind signature
+\* is present, the verifier MUST evaluate the signature against a
+\* resolved platform public key. If no key is resolvable from any
+\* tier (auditor-supplied --platform-pubkey, PDF outer-signature
+\* pubkey, or envelope-embedded public_key_pem), the verifier MUST
+\* fail the audit rather than silently skipping the check.
+\*
+\* This invariant exists to close a class of bug where a previous
+\* BOOLEAN abstraction of bundle_bind_signature conflated "the
+\* signature failed crypto" with "the verifier had no key to check
+\* against." Both produced the same FAILED verdict in Audit, but the
+\* implementation could enter the second state at runtime and either
+\* silently skip the check or crash with a confusing error. The
+\* discriminated outcome (KEY_UNRESOLVABLE) makes the gap state
+\* observable to TLC and to the BFS bridge, and pins the verifier
+\* to fail-loud with a remediation message.
+V4_BundleBindSigKeyResolutionExplicit ==
+    (pkg.bundle # ABSENT
+     /\ pkg.bundle_bind_signature = "KEY_UNRESOLVABLE")
     => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* C1 — Composition lemma for Config 1.
@@ -701,7 +749,7 @@ ConfigMainCompositionLemma ==
     \* have bundle_bind already pinned to NONE/NONE in InitBase.
     pkg.bundle # ABSENT =>
       \A bb_hash \in (Hashes \cup {NONE}) :
-        \A bb_sig \in (BOOLEAN \cup {NONE}) :
+        \A bb_sig \in (BundleBindSigOutcomes \cup {NONE}) :
           LET pkg_alt == [pkg EXCEPT
                             !.bundle_bind_hash = bb_hash,
                             !.bundle_bind_signature = bb_sig]
@@ -733,6 +781,7 @@ SecurityInvariants ==
     /\ V1_SigstoreSkipSoundness
     /\ V2_OrphanWithBundleVerified
     /\ V3_OrphanWithWorkspacePinFails
+    /\ V4_BundleBindSigKeyResolutionExplicit
 
 \* Config 1's invariant set: the subset of SecurityInvariants whose
 \* truth value is independent of bundle_bind on the pinned-matching
@@ -763,6 +812,7 @@ ConfigBindInvariants ==
     /\ I14_BundleBindExplicit
     /\ V1_SigstoreSkipSoundness
     /\ V2_OrphanWithBundleVerified
+    /\ V4_BundleBindSigKeyResolutionExplicit
 
 (***************************************************************************)
 (* Type invariant: every reachable state has well-typed pkg and pins.      *)
