@@ -650,6 +650,19 @@ def _materialise(tmp_path, pkg: dict) -> str:
                             serialization.Encoding.PEM,
                             serialization.PublicFormat.SubjectPublicKeyInfo,
                         ).decode()
+                elif bb_sig_state == "KEY_UNRESOLVABLE":
+                    # Force the envelope's public_key_pem empty so the
+                    # verifier's V4 branch is reachable. The abstract
+                    # KEY_UNRESOLVABLE state names the production case
+                    # where the row's envelope intentionally omits the
+                    # platform key (Sigstore key-source rows whose
+                    # trust anchor is the bundle); the ws_sig branch
+                    # above may have populated public_key_pem from the
+                    # workspace key, which is fine for V1/V2/V3 but
+                    # would let the verifier's Tier 3 (envelope-PEM)
+                    # resolution path fire and return VERIFIED — the
+                    # opposite of what the abstract state pins.
+                    ci["public_key_pem"] = ""
                 if bb_sig_state == "VALID":
                     bb_sig = KEY_A.sign(
                         bind_hex.encode("utf-8"),
