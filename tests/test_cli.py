@@ -1663,6 +1663,188 @@ class TestWindowsSymlinkPrivilegeRemediation:
         assert _windows_symlink_privilege_remediation(a) is None
 
 
+class TestIdentityPolicySkippedBlock:
+    """When no `--expected-ci-identity` is supplied, the verifier
+    builds a `policy.UnsafeNoOp()` policy. sigstore-python's
+    `UnsafeNoOp.__init__` prints "unsafe (no-op) verification policy
+    used! no verification performed!" to stderr at construction time.
+    That stderr line is misleading (cryptographic verification DID
+    happen — only identity matching was no-op'd) and visually
+    appears before mipiti-verify's own status lines, contradicting
+    the SKIPPED line we emit a few lines below.
+
+    The fix: capture sigstore's stderr at policy construction so the
+    warning doesn't print ahead of our section, and emit a cohesive
+    SKIPPED block that explains what was checked, surfaces the
+    bundle's claimed SAN for visibility, and points at the
+    `--expected-ci-identity` remedy.
+    """
+
+    def _build_pkg(self, tmp_path):
+        """Bundle-bearing JSON audit package with a content-integrity
+        block; the bundle contents are mocked downstream."""
+        import base64 as _b64
+        import hashlib as _h
+        import json as _j
+
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        results_hash = "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+        bind_hex = "ab" * 32
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": {
+                "results_hash": results_hash,
+                "bundle_bind_hash": bind_hex,
+            },
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "t", "digest": {"sha256": bind_hex}}
+            ],
+            "predicateType": (
+                "https://mipiti.io/attestations/v1/verification-run"
+            ),
+            "predicate": {
+                "model_id": "m1", "pipeline": {"commit_sha": "abc"},
+            },
+        }
+        return str(path), statement
+
+    def _patch_sigstore(self, statement, claimed_san):
+        """Same shape as TestPredicatePins / TestBundleBindExplicit
+        but configures the cert mock to expose a SAN extension via
+        the `cryptography.x509` extension API."""
+        import json as _j
+        import sys as _sys
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+
+        # Build a SAN extension whose
+        # `get_values_for_type(UniformResourceIdentifier)` returns
+        # `[claimed_san]`. The extension's class identity must be
+        # `SubjectAlternativeName` so `get_extension_for_class` finds
+        # it.
+        from cryptography.x509 import (
+            SubjectAlternativeName,
+            UniformResourceIdentifier,
+        )
+
+        san_ext = MagicMock()
+        san_ext.value.get_values_for_type.side_effect = (
+            lambda type_: [claimed_san]
+            if type_ is UniformResourceIdentifier
+            else []
+        )
+
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_cert.not_valid_after_utc = datetime(
+            2026, 5, 1, tzinfo=timezone.utc
+        )
+        fake_cert.extensions.get_extension_for_class.side_effect = (
+            lambda cls: san_ext
+            if cls is SubjectAlternativeName
+            else (_ for _ in ()).throw(
+                Exception("unexpected extension class")
+            )
+        )
+
+        fake_log = MagicMock()
+        fake_log.log_index = 1
+        fake_log.integrated_time = 0
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+        fake_bundle.log_entry = fake_log
+
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/vnd.in-toto+json",
+            _j.dumps(statement).encode("utf-8"),
+        )
+        return (
+            patch(
+                "sigstore.models.Bundle.from_json",
+                return_value=fake_bundle,
+            ),
+            patch(
+                "sigstore.verify.Verifier.production",
+                return_value=fake_verifier,
+            ),
+        )
+
+    def test_skipped_block_surfaces_san_and_explains(self, tmp_path):
+        """Without `--expected-ci-identity`:
+          - SKIPPED line emitted
+          - Bundle's claimed SAN surfaced (observational)
+          - Cryptographic-chain-vs-identity distinction explained
+          - Pointer to `--expected-ci-identity` / `--ci-identity-from-env`
+        And the misleading raw "unsafe (no-op) verification policy
+        used!" stderr line is captured (does not appear in the
+        Provenance section header).
+        """
+        path, statement = self._build_pkg(tmp_path)
+        claimed_san = (
+            "https://github.com/Acme/repo/.github/workflows/ci.yml"
+            "@refs/heads/main"
+        )
+        bp, vp = self._patch_sigstore(statement, claimed_san)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+
+        # Collapse whitespace so Rich's line-wrapping doesn't break
+        # substring assertions when the SAN or one of the long
+        # explainer lines wraps in narrow terminals.
+        out_flat = " ".join(result.output.split())
+        assert "Identity policy:" in out_flat
+        assert "SKIPPED" in out_flat
+        assert f"Bundle's claimed SAN: {claimed_san}" in out_flat
+        assert "Cryptographic chain" in out_flat
+        assert "only the identity (SAN/issuer) match was no-op'd" in out_flat
+        assert "--expected-ci-identity" in out_flat
+        assert "--ci-identity-from-env" in out_flat
+        # The raw "unsafe (no-op) verification policy used!" line
+        # produced by sigstore-python at policy-construction time
+        # should NOT appear ahead of our Provenance section header.
+        # CliRunner's `result.output` captures stdout only by
+        # default; sigstore's stderr was captured by our helper so
+        # it shouldn't surface here either.
+        assert "unsafe (no-op) verification policy used!" not in out_flat
+
+    def test_pinned_identity_skips_san_block(self, tmp_path):
+        """When `--expected-ci-identity` IS supplied, the SKIPPED
+        block must not fire — we emit the MATCHED line and skip the
+        observational SAN-surfacing path."""
+        path, statement = self._build_pkg(tmp_path)
+        claimed_san = (
+            "https://github.com/Acme/repo/.github/workflows/ci.yml"
+            "@refs/heads/main"
+        )
+        bp, vp = self._patch_sigstore(statement, claimed_san)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--expected-ci-identity", claimed_san,
+            ])
+
+        out = result.output
+        assert "MATCHED" in out
+        assert "Bundle's claimed SAN:" not in out
+        assert "Cryptographic chain" not in out
+
+
 class TestSigstoreVerifierConstruction:
     """`_build_sigstore_verifier` honours sigstore-python 4.x's
     actual `Verifier(trusted_root=...)` API. The previous
