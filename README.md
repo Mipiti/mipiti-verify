@@ -188,7 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: Mipiti/mipiti-verify@c8fd321a0afe6b7cc80c5a70193d9a4567f53913 # v0.42.1
+      - uses: Mipiti/mipiti-verify@7e41e681580a4ac205a895dd611de0d56dbbabb2 # v0.43.0
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}
