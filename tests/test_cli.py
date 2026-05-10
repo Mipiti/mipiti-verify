@@ -2126,6 +2126,84 @@ class TestAuditPdfReport:
         assert "VALID" in result.output
         assert "Report integrity verified" in result.output
 
+    def test_pdf_no_envelope_emits_model_only_verdict(self, tmp_path):
+        """A PDF with no audit envelope (legacy export, or model-only export
+        from a Mipiti instance that ships pre-envelope-shape) is a valid
+        artefact but contains no CI verification evidence. The CLI must
+        say so explicitly — silently exiting 0 with only "Report integrity
+        verified" lets an auditor mistake a never-CI-verified report for
+        a fully-audited one."""
+        pdf_bytes, jwk = self._mint_signed_pdf()  # no envelope
+        path = tmp_path / "report.pdf"
+        path.write_bytes(pdf_bytes)
+        runner = CliRunner()
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+            ])
+        assert result.exit_code == 0, result.output
+        # Document signature still passes.
+        assert "Report integrity verified" in result.output
+        # Scope verdict is loud and unambiguous.
+        out_flat = " ".join(result.output.split())
+        assert "MODEL ONLY" in result.output
+        assert "Audit envelope: NOT PRESENT" in out_flat
+        assert "CI verification: NONE" in out_flat
+        assert "no CI runs yet" in result.output or "No control has" in result.output
+
+    def test_pdf_with_scope_model_only_envelope_emits_verdict(self, tmp_path):
+        """The current backend's shape for a never-CI-verified export:
+        explicit envelope with ``scope: "model_only"`` and no
+        provenance / content_integrity. CLI must recognise the scope
+        marker and emit the MODEL ONLY verdict (not fall through to
+        JSON dispatch and silently pass)."""
+        import base64, gzip, json
+        from mipiti_verify.cli import _PDF_AUDIT_START, _PDF_AUDIT_END
+        envelope = {
+            "scope": "model_only",
+            "verification_runs": [],
+            "reason": "no CI verification runs yet",
+        }
+        pdf_body = b"%PDF-1.7\nfake body\n%%EOF\n"
+        encoded = base64.b64encode(gzip.compress(json.dumps(envelope).encode())).decode()
+        pdf_with_envelope = pdf_body + _PDF_AUDIT_START + encoded.encode() + _PDF_AUDIT_END
+        # Then sign over the whole thing as the exporter does.
+        pdf_bytes, jwk = self._mint_signed_pdf(pdf_body=pdf_with_envelope)
+        path = tmp_path / "report.pdf"
+        path.write_bytes(pdf_bytes)
+        runner = CliRunner()
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "MODEL ONLY" in result.output
+        out_flat = " ".join(result.output.split())
+        assert "Audit envelope: MODEL ONLY" in out_flat
+        assert "CI verification: NONE" in out_flat
+        # Reason from the envelope is surfaced.
+        assert "no CI verification runs yet" in result.output
+
+    def test_pdf_no_envelope_with_require_verification_fails_closed(self, tmp_path):
+        """CI gates that must reject pre-verification reports use
+        ``--require-verification`` to flip the silent-pass to a hard
+        fail with a distinct exit code."""
+        pdf_bytes, jwk = self._mint_signed_pdf()  # no envelope
+        path = tmp_path / "report.pdf"
+        path.write_bytes(pdf_bytes)
+        runner = CliRunner()
+        with self._patch_jwks(jwk):
+            result = runner.invoke(main, [
+                "audit", str(path),
+                "--key-url", "https://example.test/jwks",
+                "--require-verification",
+            ])
+        assert result.exit_code == 3, result.output
+        assert "MODEL ONLY" in result.output
+        assert "--require-verification" in result.output
+
     def test_tampered_pdf_body_fails(self, tmp_path):
         pdf_bytes, jwk = self._mint_signed_pdf()
         # Flip a byte in the body before the sentinel.
@@ -2194,7 +2272,7 @@ class TestAuditPdfReport:
         assert result.exit_code == 2, result.output
         out_flat = " ".join(result.output.split())
         assert "identity-pinning flags" in out_flat
-        assert "audit envelope embedded in the PDF" in out_flat
+        assert "audit envelope with CI verification evidence" in out_flat
 
     def test_pdf_with_envelope_and_no_pin_flags_passes(self, tmp_path):
         """A PDF carrying a minimal audit envelope (no provenance, no
