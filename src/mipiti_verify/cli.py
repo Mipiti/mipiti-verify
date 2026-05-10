@@ -2979,9 +2979,9 @@ def audit(
         assumptions_map = assumptions_raw
     else:
         assumptions_map = {}
-    # Flat lookup maps emitted by the post-fix audit envelope. Fall
-    # back to walking the rich nested lists when these are absent
-    # (legacy envelopes from a pre-fix backend).
+    # Flat lookup maps from the audit envelope. Fall back to walking
+    # the rich nested lists when these are absent (older envelope
+    # shapes that didn't include the flat maps).
     assertions_by_ctrl_raw = pkg.get("assertions_by_control")
     assertions_by_ctrl = assertions_by_ctrl_raw if isinstance(assertions_by_ctrl_raw, dict) else {}
     assertions_by_asm_raw = pkg.get("assertions_by_assumption")
@@ -3001,10 +3001,9 @@ def audit(
 
     # Group results by parent identity (control or assumption).
     # Resolution order:
-    #   1. Per-result denorm fields (control_id / assumption_id) — set
-    #      at submission time by post-fix backends; primary path because
-    #      it survives lookup-table staleness from soft-deletes /
-    #      multi-version drift.
+    #   1. Per-result denorm fields (control_id / assumption_id) when
+    #      present in the envelope; primary path because it survives
+    #      lookup-table staleness from soft-deletes / multi-version drift.
     #   2. Flat lookup maps (assertions_by_control / assertions_by_assumption).
     #   3. Rich nested lists (controls[].assertions, assumptions[].assertions).
     #   4. Truly orphaned — bucket separately so the auditor can flag
@@ -3168,10 +3167,10 @@ def audit(
         )
         for r in unmapped_results:
             _render_assertion_result(r)
-        # Cross-reference the backend's explicit orphan list when the
-        # envelope provides one (post-fix backends emit it). When they
-        # agree we don't need to escalate; when they disagree something
-        # is off in either the envelope build or the CLI parse.
+        # Cross-reference the envelope's explicit orphan list when
+        # provided. When that list and our cross-reference agree we
+        # don't need to escalate; when they disagree something is off
+        # in either the envelope build or the CLI parse.
         backend_orphans = vr.get("orphan_result_assertion_ids")
         if isinstance(backend_orphans, list) and backend_orphans:
             console.print(

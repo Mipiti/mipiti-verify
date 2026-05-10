@@ -1148,14 +1148,14 @@ class TestBundleBindExplicit:
 class TestAuditPackageComprehensive:
     """End-to-end CLI coverage of the comprehensive audit-envelope shape.
 
-    Covers consumption of every key the post-fix backend emits:
-    ``assumptions: [...]``, flat ``assertions_by_assumption`` map,
-    per-result denormalised ``control_id`` / ``assumption_id``,
-    soft-delete markers, and ``orphan_result_assertion_ids``.
+    Covers every key the envelope can carry: ``assumptions: [...]``,
+    flat ``assertions_by_assumption`` map, per-result denormalised
+    ``control_id`` / ``assumption_id``, soft-delete markers, and
+    ``orphan_result_assertion_ids``.
 
-    Each test pins one CLI behaviour the auditor relies on; together
-    they make the fix end-to-end (the backend produces the shape;
-    these tests prove the CLI consumes it correctly)."""
+    Each test pins one CLI behaviour the auditor relies on. The CLI
+    is forwards- and backwards-compatible: it consumes envelopes that
+    carry these keys and falls through gracefully when they're absent."""
 
     def _build_pkg(
         self,
@@ -1190,13 +1190,10 @@ class TestAuditPackageComprehensive:
         return str(path)
 
     def test_assumption_bound_assertion_renders_under_assumptions_section(self, tmp_path):
-        """Pre-fix: an assertion bound to an assumption (not a control)
-        had nowhere to render. It fell into "<unmapped>" with a generic
-        header.
-
-        Post-fix: assumption-bound results get their own section with
-        the assumption's description and an explicit note that
-        sufficiency doesn't apply."""
+        """An assertion bound to an assumption (not a control) renders
+        under its own ``Assumptions`` section with the assumption's
+        description and an explicit note that sufficiency doesn't apply
+        (sufficiency is a control-level concept)."""
         pkg_path = self._build_pkg(
             tmp_path,
             assumptions=[{"id": "AS1", "description": "External auth provider enforces MFA",
@@ -1218,12 +1215,10 @@ class TestAuditPackageComprehensive:
         assert "1/1 assumption assertions pass" in out_flat
 
     def test_denormalised_control_id_drives_grouping_when_lookup_tables_empty(self, tmp_path):
-        """Pre-fix: with no flat lookup tables AND no rich nested
-        assertions, the CLI fell into "<unmapped>".
-
-        Post-fix: the per-result ``control_id`` denorm field is the
-        primary grouping signal. Even without lookup tables present,
-        results group correctly under their parent control."""
+        """The per-result ``control_id`` denorm field is the primary
+        grouping signal. Even without flat lookup tables OR rich nested
+        assertion lists in the envelope, results group correctly under
+        their parent control via the denorm field alone."""
         pkg_path = self._build_pkg(
             tmp_path,
             controls=[{"id": "CTRL-1", "description": "Encrypt at rest",
@@ -1242,7 +1237,7 @@ class TestAuditPackageComprehensive:
         assert "Unmapped" not in out_flat
 
     def test_legacy_envelope_without_denorm_falls_back_to_assertions_by_control(self, tmp_path):
-        """Pre-fix backends produced envelopes without the per-result
+        """Older envelope shapes without the per-result
         denorm fields and without ``assertions_by_assumption``. The CLI
         must still group correctly using whatever lookup tables are
         present, including the rich nested ``controls[].assertions``
