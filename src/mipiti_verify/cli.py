@@ -1661,6 +1661,24 @@ def _audit_pdf_report(
         "reports as not-yet-shippable."
     ),
 )
+@click.option(
+    "--allow-orphan-results",
+    "allow_orphan_results",
+    is_flag=True,
+    default=False,
+    help=(
+        "Override the fail-closed default for packages containing results "
+        "whose assertion_id doesn't appear in either the controls or "
+        "assumptions blocks. By default this is FAILED (the package is "
+        "internally inconsistent: the cryptographic chain may be intact "
+        "but at least one verdict floats free of any controlled or "
+        "assumed property, so the audit cannot be trusted holistically). "
+        "Use this flag when an auditor has manually reviewed the orphan "
+        "list and determined the inconsistency is benign (e.g., a known "
+        "data-migration race during the run). Same fail-closed default "
+        "pattern as Sigstore bundle missing / signature INVALID."
+    ),
+)
 def audit(
     package_file: str,
     key_url: str,
@@ -1678,6 +1696,7 @@ def audit(
     expected_anchor_issuer: str | None,
     rekor_entry_snapshot_dir: str | None,
     require_verification: bool,
+    allow_orphan_results: bool,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
 
@@ -3249,14 +3268,52 @@ def audit(
         return ", ".join(parts)
 
     console.print()
+    # Orphans are a package-integrity failure, not a sufficiency or
+    # cryptographic-chain issue. Default fail-closed (same precedent as
+    # bundle signature INVALID and the --require-verification flag): a
+    # single verdict floating free of any control or assumption means
+    # the auditor can't verify CONSISTENCY of the package, and
+    # consistency is a precondition for trusting any other check.
+    # ``--allow-orphan-results`` lets an auditor who's manually
+    # reviewed the orphans (e.g., known-benign data-migration race)
+    # downgrade the verdict to PARTIALLY VERIFIED.
+    if unmapped_results and not allow_orphan_results:
+        has_failure = True
+
     if has_failure or total_fail > 0:
-        console.print(f"[red bold]Verdict: FAILED[/red bold] — {_assertion_breakdown()}")
+        if unmapped_results and not allow_orphan_results and total_fail == 0:
+            # Specific framing for the orphan-fail case so the auditor
+            # immediately understands this is an integrity issue, not a
+            # cryptographic-chain failure or assertion verdict failure.
+            verified_parts = []
+            if provenance_verified:
+                verified_parts.append("provenance authentic")
+            if content_verified or content_anchored_in_sigstore:
+                verified_parts.append("content intact")
+            chain_state = ", ".join(verified_parts) if verified_parts else "no cryptographic chain"
+            console.print(
+                f"[red bold]Verdict: FAILED[/red bold] — package contains "
+                f"{len(unmapped_results)} unmappable result(s); refusing to "
+                f"certify an internally-inconsistent audit."
+            )
+            console.print(
+                f"  Cryptographic chain itself is INTACT ({chain_state})."
+            )
+            console.print(
+                "  Each unmappable result's assertion_id appears nowhere in "
+                "the controls or\n  assumptions blocks. Possible causes: "
+                "assertion hard-deleted after this run;\n  envelope tampered "
+                "post-signing; verification run attached to wrong model.\n"
+                "  To override after manual review of the orphan list above:\n"
+                "  [bold]mipiti-verify audit ... --allow-orphan-results[/bold]"
+            )
+        else:
+            console.print(f"[red bold]Verdict: FAILED[/red bold] — {_assertion_breakdown()}")
     elif unmapped_results:
-        # Any orphan result demotes the verdict — the auditor can't
-        # reach a clean "VERIFIED" when the package itself is internally
-        # inconsistent (results referencing assertions that don't exist
-        # in either bucket). Render as PARTIALLY VERIFIED rather than
-        # FAILED because the cryptographic chain may still be intact.
+        # ``--allow-orphan-results`` was supplied. Render as PARTIALLY
+        # VERIFIED with the orphan count so the verdict line still
+        # reflects the package's known inconsistency — overriding the
+        # fail-close shouldn't make the inconsistency invisible.
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
@@ -3265,7 +3322,8 @@ def audit(
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
         console.print(
             f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
-            f"{_assertion_breakdown()} ({len(unmapped_results)} unmapped)"
+            f"{_assertion_breakdown()} ({len(unmapped_results)} orphan, "
+            f"--allow-orphan-results override active)"
         )
     elif not provenance_verified and not content_verified:
         # No cryptographic verification ran. Don't claim authenticity.

@@ -1279,12 +1279,14 @@ class TestAuditPackageComprehensive:
         assert "CTRL-OLD" in out_flat
         assert "(retired)" in out_flat
 
-    def test_orphan_results_render_separately_and_demote_verdict(self, tmp_path):
-        """A truly orphaned result (no parent in either block) used to
-        fall into "<unmapped>" silently and the verdict could still
-        read VERIFIED. Now it renders in an explicit ``Unmapped
-        results`` section and demotes the verdict to PARTIALLY
-        VERIFIED."""
+    def test_orphan_results_fail_closed_by_default(self, tmp_path):
+        """Package-integrity issue: a result floats free of any control
+        or assumption. The auditor cannot verify CONSISTENCY of the
+        package, and consistency is a precondition for any other check.
+        Default behaviour is fail-closed (same precedent as bundle
+        signature INVALID and --require-verification): exit 1, verdict
+        FAILED with a specific package-integrity message that
+        distinguishes from cryptographic-chain failure."""
         pkg_path = self._build_pkg(
             tmp_path,
             results=[{"assertion_id": "asrt_ghost", "result": "pass", "tier": 1}],
@@ -1292,12 +1294,42 @@ class TestAuditPackageComprehensive:
         )
         runner = CliRunner()
         result = runner.invoke(main, ["audit", pkg_path])
+        assert result.exit_code == 1, result.output
         out_flat = " ".join(result.output.split())
         assert "Unmapped results" in result.output
         assert "asrt_ghost" in out_flat
         assert "Backend marked 1 assertion id(s)" in out_flat
+        assert "Verdict: FAILED" in out_flat
+        assert "internally-inconsistent" in out_flat
+        # Crypto-chain status reported separately so the auditor
+        # immediately sees this is a package-shape issue, not a
+        # signature failure.
+        assert "Cryptographic chain itself is INTACT" in out_flat
+        # Override flag is surfaced in the failure message so the
+        # auditor doesn't have to re-read the docs to find it.
+        assert "--allow-orphan-results" in result.output
+
+    def test_orphan_results_override_demotes_to_partially_verified(self, tmp_path):
+        """``--allow-orphan-results`` lets an auditor who's manually
+        reviewed the orphan list downgrade the verdict from FAILED
+        (default) to PARTIALLY VERIFIED. The orphan count stays in the
+        verdict line so the inconsistency remains visible — the
+        override doesn't pretend the package is healthy."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            results=[{"assertion_id": "asrt_ghost", "result": "pass", "tier": 1}],
+            orphan_assertion_ids=["asrt_ghost"],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path, "--allow-orphan-results"])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
         assert "PARTIALLY VERIFIED" in out_flat
-        assert "1 unmapped" in out_flat
+        assert "1 orphan" in out_flat
+        assert "--allow-orphan-results override active" in out_flat
+        # The Unmapped section still renders so the auditor can see
+        # what they're allowing through.
+        assert "Unmapped results" in result.output
 
 
 class TestTrustContractSigstoreAnchored:
