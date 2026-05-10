@@ -2084,6 +2084,14 @@ def audit(
     has_failure = False
     provenance_verified = False  # Bundle verify_artifact succeeded.
     content_verified = False  # content_integrity signature verify succeeded.
+    # Sigstore-anchored rows intentionally skip the inline content_integrity
+    # signature: the Sigstore bundle is the authoritative trust anchor for
+    # those rows, so re-verifying the inline signature would be redundant.
+    # Tracked separately from content_verified so the trust-contract summary
+    # can report SKIPPED (intentional) instead of FAILED (signature present
+    # but couldn't verify) — those are different states and conflating them
+    # makes a clean Sigstore audit look broken.
+    content_anchored_in_sigstore = False
 
 
     # --- Provenance ---
@@ -2769,6 +2777,7 @@ def audit(
                 # this row; skip the redundant content_integrity verify
                 # entirely. `provenance_verified` already reflects the
                 # bundle's verdict.
+                content_anchored_in_sigstore = True
                 console.print(
                     "  Signature:       [cyan]SKIPPED[/cyan] "
                     "(Sigstore provenance is the trust anchor for this row)"
@@ -2958,7 +2967,14 @@ def audit(
             if any(isinstance(a, dict) and a.get("id") == aid for a in asserts):
                 ctrl_id = cid
                 break
-        by_ctrl.setdefault(ctrl_id or "unknown", []).append(r)
+        # When the result's assertion_id has no entry in
+        # ``assertions_by_control``, name the bucket descriptively
+        # rather than the opaque "unknown". The most common cause is
+        # an assertion that bound to an assumption (not a control)
+        # being included in results — surfacing this lets the export
+        # owner notice the export's assertions_by_control map is
+        # incomplete instead of seeing a generic "unknown" header.
+        by_ctrl.setdefault(ctrl_id or "<unmapped: not in assertions_by_control>", []).append(r)
 
     total_pass = sum(
         1 for r in results
@@ -3050,6 +3066,17 @@ def audit(
         console.print(
             "  Content-integrity sig:  [green]VERIFIED[/green]"
         )
+    elif content_anchored_in_sigstore:
+        # Sigstore was the authoritative trust anchor for this row and
+        # the inline content_integrity signature was intentionally not
+        # checked. Reporting FAILED here would mis-describe the state:
+        # the signature wasn't tried-and-broken, it was deliberately
+        # skipped because the upstream Sigstore bundle covers the same
+        # claim with a stronger transparency-log proof.
+        console.print(
+            "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
+            "(Sigstore provenance is the trust anchor for this row)"
+        )
     elif ci and ci.get("signature"):
         console.print(
             "  Content-integrity sig:  [red]FAILED[/red] "
@@ -3106,22 +3133,37 @@ def audit(
             f"{total_pass}/{len(results)} assertions pass, "
             f"{suff_count}/{ctrl_count} controls sufficient"
         )
-    elif insuff_count > 0:
+    elif ctrl_count > 0 and suff_count < ctrl_count:
+        # Any non-sufficient control (insufficient OR pending) demotes
+        # the verdict to PARTIALLY VERIFIED. "Pending" means the
+        # sufficiency evaluation hasn't completed yet (e.g. the
+        # backend's LLM-collective check is queued); the proof is
+        # incomplete, so claiming a flat VERIFIED would overstate.
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
-        if content_verified:
+        if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+        # Build a precise breakdown of WHY the controls aren't sufficient
+        # so the auditor can act. "0/1 sufficient" alone doesn't say
+        # whether the gap is insufficient evaluations or queued pending ones.
+        pending_count = ctrl_count - suff_count - insuff_count
+        breakdown_parts = []
+        if insuff_count > 0:
+            breakdown_parts.append(f"{insuff_count} insufficient")
+        if pending_count > 0:
+            breakdown_parts.append(f"{pending_count} pending")
+        breakdown = " (" + ", ".join(breakdown_parts) + ")" if breakdown_parts else ""
         console.print(f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — "
                        f"{prefix}"
                        f"{total_pass}/{len(results)} assertions pass, "
-                       f"{suff_count}/{ctrl_count} controls sufficient ({insuff_count} insufficient)")
+                       f"{suff_count}/{ctrl_count} controls sufficient{breakdown}")
     else:
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
-        if content_verified:
+        if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
         console.print(f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
