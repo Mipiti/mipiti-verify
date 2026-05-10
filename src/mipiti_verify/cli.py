@@ -848,7 +848,8 @@ def _resolve_pubkey_from_jwks(fingerprint: str, key_url: str):
         console.print(f"  Using default JWKS: {key_url}")
     try:
         import httpx
-        resp = httpx.get(key_url, timeout=10)
+        from ._tls import tls_context
+        resp = httpx.get(key_url, timeout=10, verify=tls_context())
         resp.raise_for_status()
         jwks = resp.json()
     except httpx.HTTPError as e:
@@ -919,7 +920,8 @@ def _resolve_pubkey_from_anchor(
     console.print(f"  Anchor URL: {anchor_url}")
     try:
         import httpx
-        resp = httpx.get(anchor_url, timeout=15)
+        from ._tls import tls_context
+        resp = httpx.get(anchor_url, timeout=15, verify=tls_context())
         resp.raise_for_status()
         bundle_bytes = resp.content
     except httpx.HTTPError as e:

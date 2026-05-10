@@ -79,10 +79,14 @@ class OllamaProvider(Tier2Provider):
         ollama_url: str = "http://localhost:11434",
     ) -> None:
         import httpx
+        from ._tls import tls_context
 
         self.model = model or "llama3.1"
         self.url = ollama_url.rstrip("/")
-        self._client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=300.0))
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=300.0),
+            verify=tls_context(),
+        )
 
     def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
         resp = self._client.post(
