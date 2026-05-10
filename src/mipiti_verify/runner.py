@@ -728,12 +728,13 @@ def _auto_detect_oidc(audience: str = "") -> str:
     if url and token:
         try:
             import httpx
+            from ._tls import tls_context
 
             if audience:
                 aud_url = f"{url}&audience={audience}" if "?" in url else f"{url}?audience={audience}"
             else:
                 aud_url = url
-            resp = httpx.get(aud_url, headers={"Authorization": f"Bearer {token}"})
+            resp = httpx.get(aud_url, headers={"Authorization": f"Bearer {token}"}, verify=tls_context())
             resp.raise_for_status()
             return resp.json().get("value", "")
         except Exception:

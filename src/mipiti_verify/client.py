@@ -62,10 +62,12 @@ class MipitiClient:
                 "or pass api_key= to MipitiClient."
             )
         self.key_scope = "verifier" if self.api_key.startswith("mv_") else "developer"
+        from ._tls import tls_context
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={"X-API-Key": self.api_key},
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+            verify=tls_context(),
         )
 
     def close(self) -> None:
