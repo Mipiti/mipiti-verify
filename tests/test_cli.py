@@ -1145,6 +1145,161 @@ class TestBundleBindExplicit:
         assert "Bundle Subject digest does not match" in out_flat
 
 
+class TestAuditPackageComprehensive:
+    """End-to-end CLI coverage of the comprehensive audit-envelope shape.
+
+    Covers consumption of every key the post-fix backend emits:
+    ``assumptions: [...]``, flat ``assertions_by_assumption`` map,
+    per-result denormalised ``control_id`` / ``assumption_id``,
+    soft-delete markers, and ``orphan_result_assertion_ids``.
+
+    Each test pins one CLI behaviour the auditor relies on; together
+    they make the fix end-to-end (the backend produces the shape;
+    these tests prove the CLI consumes it correctly)."""
+
+    def _build_pkg(
+        self,
+        tmp_path,
+        *,
+        controls=None,
+        assumptions=None,
+        results=None,
+        assertions_by_control=None,
+        assertions_by_assumption=None,
+        sufficiency=None,
+        orphan_assertion_ids=None,
+    ):
+        import json
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": controls or [],
+            "assumptions": assumptions or [],
+            "assertions_by_control": assertions_by_control or {},
+            "assertions_by_assumption": assertions_by_assumption or {},
+            "sufficiency": sufficiency or {},
+            "verification_run": {
+                "id": "r1",
+                "results": results or [],
+                "orphan_result_assertion_ids": orphan_assertion_ids or [],
+            },
+            "provenance": {},
+            "content_integrity": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(json.dumps(pkg), encoding="utf-8")
+        return str(path)
+
+    def test_assumption_bound_assertion_renders_under_assumptions_section(self, tmp_path):
+        """Pre-fix: an assertion bound to an assumption (not a control)
+        had nowhere to render. It fell into "<unmapped>" with a generic
+        header.
+
+        Post-fix: assumption-bound results get their own section with
+        the assumption's description and an explicit note that
+        sufficiency doesn't apply."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            assumptions=[{"id": "AS1", "description": "External auth provider enforces MFA",
+                          "type": "external", "status": "active", "assertions": [], "deleted": False}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "", "assumption_id": "AS1"}],
+            assertions_by_assumption={"AS1": [{"id": "asrt_1"}]},
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "Assumptions" in result.output
+        assert "AS1" in out_flat
+        assert "External auth provider enforces MFA" in out_flat
+        assert "asrt_1" in out_flat
+        # Sufficiency caveat appears, no per-row sufficiency line.
+        assert "Sufficiency does not apply" in out_flat
+        # The verdict tally separates control vs assumption assertions.
+        assert "1/1 assumption assertions pass" in out_flat
+
+    def test_denormalised_control_id_drives_grouping_when_lookup_tables_empty(self, tmp_path):
+        """Pre-fix: with no flat lookup tables AND no rich nested
+        assertions, the CLI fell into "<unmapped>".
+
+        Post-fix: the per-result ``control_id`` denorm field is the
+        primary grouping signal. Even without lookup tables present,
+        results group correctly under their parent control."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-1", "description": "Encrypt at rest",
+                       "status": "implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [], "deleted": False}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "CTRL-1", "assumption_id": ""}],
+            # Deliberately omit assertions_by_control to prove the
+            # denorm path is engaged, not the cross-reference fallback.
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-1" in out_flat
+        assert "Encrypt at rest" in out_flat
+        assert "Unmapped" not in out_flat
+
+    def test_legacy_envelope_without_denorm_falls_back_to_assertions_by_control(self, tmp_path):
+        """Pre-fix backends produced envelopes without the per-result
+        denorm fields and without ``assertions_by_assumption``. The CLI
+        must still group correctly using whatever lookup tables are
+        present, including the rich nested ``controls[].assertions``
+        list as a final fallback."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-1", "description": "encrypt",
+                       "status": "implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [{"id": "asrt_1"}], "deleted": False}],
+            # No flat lookup map, no per-result denorm — only the rich list.
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1}],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-1" in out_flat
+        assert "Unmapped" not in out_flat
+
+    def test_soft_deleted_control_renders_with_retired_marker(self, tmp_path):
+        """A control retired after a verification ran still has its
+        results in the package; render them with a ``(retired)`` marker
+        instead of dropping or mis-attributing."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            controls=[{"id": "CTRL-OLD", "description": "old check",
+                       "status": "not_implemented", "co_mappings": [], "sufficiency": None,
+                       "assertions": [], "deleted": True}],
+            results=[{"assertion_id": "asrt_1", "result": "pass", "tier": 1,
+                      "control_id": "CTRL-OLD", "assumption_id": ""}],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "CTRL-OLD" in out_flat
+        assert "(retired)" in out_flat
+
+    def test_orphan_results_render_separately_and_demote_verdict(self, tmp_path):
+        """A truly orphaned result (no parent in either block) used to
+        fall into "<unmapped>" silently and the verdict could still
+        read VERIFIED. Now it renders in an explicit ``Unmapped
+        results`` section and demotes the verdict to PARTIALLY
+        VERIFIED."""
+        pkg_path = self._build_pkg(
+            tmp_path,
+            results=[{"assertion_id": "asrt_ghost", "result": "pass", "tier": 1}],
+            orphan_assertion_ids=["asrt_ghost"],
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", pkg_path])
+        out_flat = " ".join(result.output.split())
+        assert "Unmapped results" in result.output
+        assert "asrt_ghost" in out_flat
+        assert "Backend marked 1 assertion id(s)" in out_flat
+        assert "PARTIALLY VERIFIED" in out_flat
+        assert "1 unmapped" in out_flat
+
+
 class TestTrustContractSigstoreAnchored:
     """When the row's key_source is ``sigstore``, the inline
     content_integrity signature is intentionally skipped because the

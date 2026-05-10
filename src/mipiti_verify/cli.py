@@ -2937,19 +2937,62 @@ def audit(
     vr = vr_raw if isinstance(vr_raw, dict) else {}
     results_raw = vr.get("results", [])
     results = results_raw if isinstance(results_raw, list) else []
-    controls_raw = pkg.get("controls")
-    controls_map = controls_raw if isinstance(controls_raw, dict) else {}
-    assertions_raw = pkg.get("assertions_by_control")
-    assertions_map = assertions_raw if isinstance(assertions_raw, dict) else {}
+    # Backend emits `controls` as a list of dicts (rich shape). Older
+    # tooling sometimes saw a dict shape. Normalise both into a dict
+    # keyed by control id so downstream lookups don't have to branch.
+    controls_raw = pkg.get("controls", [])
+    if isinstance(controls_raw, list):
+        controls_map = {
+            c.get("id"): c for c in controls_raw
+            if isinstance(c, dict) and c.get("id")
+        }
+    elif isinstance(controls_raw, dict):
+        controls_map = controls_raw
+    else:
+        controls_map = {}
+    assumptions_raw = pkg.get("assumptions", [])
+    if isinstance(assumptions_raw, list):
+        assumptions_map = {
+            a.get("id"): a for a in assumptions_raw
+            if isinstance(a, dict) and a.get("id")
+        }
+    elif isinstance(assumptions_raw, dict):
+        assumptions_map = assumptions_raw
+    else:
+        assumptions_map = {}
+    # Flat lookup maps emitted by the post-fix audit envelope. Fall
+    # back to walking the rich nested lists when these are absent
+    # (legacy envelopes from a pre-fix backend).
+    assertions_by_ctrl_raw = pkg.get("assertions_by_control")
+    assertions_by_ctrl = assertions_by_ctrl_raw if isinstance(assertions_by_ctrl_raw, dict) else {}
+    assertions_by_asm_raw = pkg.get("assertions_by_assumption")
+    assertions_by_asm = assertions_by_asm_raw if isinstance(assertions_by_asm_raw, dict) else {}
     sufficiency_raw = pkg.get("sufficiency")
     sufficiency_map = sufficiency_raw if isinstance(sufficiency_raw, dict) else {}
 
-    # Group results by control. Use defensive .get so that a forged
-    # package with missing fields produces a structural failure rather
-    # than an uncaught KeyError traceback in the auditor's CI gate.
-    # Missing `result` is treated as not-pass — we never want a
-    # structural defect to be silently counted as success.
+    def _aid_in(asserts) -> bool:
+        # Tolerant of either list-of-dicts or list-of-strings.
+        if not isinstance(asserts, list):
+            return False
+        return any(
+            (isinstance(a, dict) and a.get("id") == aid)
+            or (isinstance(a, str) and a == aid)
+            for a in asserts
+        )
+
+    # Group results by parent identity (control or assumption).
+    # Resolution order:
+    #   1. Per-result denorm fields (control_id / assumption_id) — set
+    #      at submission time by post-fix backends; primary path because
+    #      it survives lookup-table staleness from soft-deletes /
+    #      multi-version drift.
+    #   2. Flat lookup maps (assertions_by_control / assertions_by_assumption).
+    #   3. Rich nested lists (controls[].assertions, assumptions[].assertions).
+    #   4. Truly orphaned — bucket separately so the auditor can flag
+    #      it as a data-integrity issue rather than mis-grouping it.
     by_ctrl: dict = {}
+    by_asm: dict = {}
+    unmapped_results: list = []
     malformed_count = 0
     for r in results:
         if not isinstance(r, dict):
@@ -2959,22 +3002,37 @@ def audit(
         if not aid:
             malformed_count += 1
             continue
-        # Find which control this assertion belongs to
-        ctrl_id = None
-        for cid, asserts in assertions_map.items():
-            if not isinstance(asserts, list):
-                continue
-            if any(isinstance(a, dict) and a.get("id") == aid for a in asserts):
-                ctrl_id = cid
-                break
-        # When the result's assertion_id has no entry in
-        # ``assertions_by_control``, name the bucket descriptively
-        # rather than the opaque "unknown". The most common cause is
-        # an assertion that bound to an assumption (not a control)
-        # being included in results — surfacing this lets the export
-        # owner notice the export's assertions_by_control map is
-        # incomplete instead of seeing a generic "unknown" header.
-        by_ctrl.setdefault(ctrl_id or "<unmapped: not in assertions_by_control>", []).append(r)
+        ctrl_id = (r.get("control_id") or "").strip()
+        as_id = (r.get("assumption_id") or "").strip()
+
+        if not ctrl_id and not as_id:
+            for cid, asserts in assertions_by_ctrl.items():
+                if _aid_in(asserts):
+                    ctrl_id = cid
+                    break
+            if not ctrl_id:
+                for asid, asserts in assertions_by_asm.items():
+                    if _aid_in(asserts):
+                        as_id = asid
+                        break
+
+        if not ctrl_id and not as_id:
+            for cid, c in controls_map.items():
+                if _aid_in(c.get("assertions") if isinstance(c, dict) else None):
+                    ctrl_id = cid
+                    break
+            if not ctrl_id:
+                for asid, asm in assumptions_map.items():
+                    if _aid_in(asm.get("assertions") if isinstance(asm, dict) else None):
+                        as_id = asid
+                        break
+
+        if ctrl_id:
+            by_ctrl.setdefault(ctrl_id, []).append(r)
+        elif as_id:
+            by_asm.setdefault(as_id, []).append(r)
+        else:
+            unmapped_results.append(r)
 
     total_pass = sum(
         1 for r in results
@@ -2992,57 +3050,115 @@ def audit(
             "structurally-invalid packages.[/red]"
         )
         has_failure = True
+
     ctrl_count = len(by_ctrl)
+    asm_count = len(by_asm)
+    ctrl_pass = sum(1 for rs in by_ctrl.values() for r in rs if r.get("result") == "pass")
+    asm_pass = sum(1 for rs in by_asm.values() for r in rs if r.get("result") == "pass")
+    ctrl_assertion_total = sum(len(rs) for rs in by_ctrl.values())
+    asm_assertion_total = sum(len(rs) for rs in by_asm.values())
     suff_count = sum(
-        1 for s in sufficiency_map.values()
-        if isinstance(s, dict) and s.get("status") == "sufficient"
+        1 for cid, _ in by_ctrl.items()
+        if isinstance(sufficiency_map.get(cid), dict)
+        and sufficiency_map[cid].get("status") == "sufficient"
     )
     insuff_count = sum(
-        1 for s in sufficiency_map.values()
-        if isinstance(s, dict) and s.get("status") == "insufficient"
+        1 for cid, _ in by_ctrl.items()
+        if isinstance(sufficiency_map.get(cid), dict)
+        and sufficiency_map[cid].get("status") == "insufficient"
     )
 
-    console.print(f"\n[bold]Results ({len(results)} assertions, {ctrl_count} controls)[/bold]")
+    header_parts = [f"{len(results)} assertions"]
+    if ctrl_count:
+        header_parts.append(f"{ctrl_count} controls")
+    if asm_count:
+        header_parts.append(f"{asm_count} assumptions")
+    console.print(f"\n[bold]Results ({', '.join(header_parts)})[/bold]")
 
-    for ctrl_id, ctrl_results in sorted(by_ctrl.items()):
-        ctrl_raw = controls_map.get(ctrl_id, {})
-        ctrl = ctrl_raw if isinstance(ctrl_raw, dict) else {}
-        desc = ctrl.get("description", "")
-        console.print(f"\n  [bold]{ctrl_id}[/bold]  {desc}")
+    def _render_assertion_result(r: dict) -> None:
+        nonlocal has_failure
+        passed = r.get("result") == "pass"
+        icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
+        tier = r.get("tier", "?")
+        details_raw = r.get("details", "")
+        details = details_raw if isinstance(details_raw, str) else ""
+        reasoning_raw = r.get("reasoning", details)
+        reasoning = reasoning_raw if isinstance(reasoning_raw, str) else ""
+        aid_local = r.get("assertion_id", "<unknown>")
+        console.print(f"    {icon} {aid_local}  Tier {tier} {'PASS' if passed else 'FAIL'}")
+        if reasoning:
+            if not passed:
+                for line in reasoning.split("\n"):
+                    console.print(f"      {line}")
+                has_failure = True
+            else:
+                first_line = reasoning.split(".")[0] + "." if "." in reasoning else reasoning[:100]
+                console.print(f"      {first_line}")
 
-        for r in ctrl_results:
-            passed = r.get("result") == "pass"
-            icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
-            tier = r.get("tier", "?")
-            details_raw = r.get("details", "")
-            details = details_raw if isinstance(details_raw, str) else ""
-            reasoning_raw = r.get("reasoning", details)
-            reasoning = reasoning_raw if isinstance(reasoning_raw, str) else ""
-            aid = r.get("assertion_id", "<unknown>")
-            console.print(f"    {icon} {aid}  Tier {tier} {'PASS' if passed else 'FAIL'}")
-            if reasoning:
-                # Show full reasoning for failures, first line for passes
-                if not passed:
-                    for line in reasoning.split("\n"):
-                        console.print(f"      {line}")
-                    has_failure = True
-                else:
-                    first_line = reasoning.split(".")[0] + "." if "." in reasoning else reasoning[:100]
-                    console.print(f"      {first_line}")
+    if by_ctrl:
+        if by_asm or unmapped_results:
+            console.print("\n[bold]Controls[/bold]")
+        for ctrl_id, ctrl_results in sorted(by_ctrl.items()):
+            ctrl = controls_map.get(ctrl_id, {})
+            ctrl = ctrl if isinstance(ctrl, dict) else {}
+            desc = ctrl.get("description", "")
+            deleted = bool(ctrl.get("deleted", False))
+            marker = " [yellow](retired)[/yellow]" if deleted else ""
+            console.print(f"\n  [bold]{ctrl_id}[/bold]{marker}  {desc}")
+            for r in ctrl_results:
+                _render_assertion_result(r)
+            suff = sufficiency_map.get(ctrl_id, {})
+            suff = suff if isinstance(suff, dict) else {}
+            suff_status = suff.get("status", "pending")
+            suff_details = suff.get("details", "")
+            if suff_status == "sufficient":
+                console.print(f"    Sufficiency: [green]SUFFICIENT[/green]")
+            elif suff_status == "insufficient":
+                console.print(f"    Sufficiency: [blue]INSUFFICIENT[/blue]")
+                if suff_details:
+                    console.print(f"      {suff_details}")
+            else:
+                console.print(f"    Sufficiency: [yellow]{suff_status}[/yellow]")
 
-        # Sufficiency
-        suff_raw = sufficiency_map.get(ctrl_id, {})
-        suff = suff_raw if isinstance(suff_raw, dict) else {}
-        suff_status = suff.get("status", "pending")
-        suff_details = suff.get("details", "")
-        if suff_status == "sufficient":
-            console.print(f"    Sufficiency: [green]SUFFICIENT[/green]")
-        elif suff_status == "insufficient":
-            console.print(f"    Sufficiency: [blue]INSUFFICIENT[/blue]")
-            if suff_details:
-                console.print(f"      {suff_details}")
-        else:
-            console.print(f"    Sufficiency: [yellow]{suff_status}[/yellow]")
+    if by_asm:
+        console.print("\n[bold]Assumptions[/bold]")
+        console.print(
+            "  [dim](Sufficiency does not apply: assumptions are external "
+            "trust statements, not implementations to accumulate evidence "
+            "for. The verdict reports per-assertion pass/fail only.)[/dim]"
+        )
+        for as_id, as_results in sorted(by_asm.items()):
+            asm = assumptions_map.get(as_id, {})
+            asm = asm if isinstance(asm, dict) else {}
+            desc = asm.get("description", "")
+            deleted = bool(asm.get("deleted", False))
+            status = asm.get("status", "")
+            marker = " [yellow](retired)[/yellow]" if deleted else ""
+            status_marker = f" [dim]({status})[/dim]" if status and status != "active" else ""
+            console.print(f"\n  [bold]{as_id}[/bold]{marker}{status_marker}  {desc}")
+            for r in as_results:
+                _render_assertion_result(r)
+
+    if unmapped_results:
+        console.print("\n[yellow bold]Unmapped results[/yellow bold]")
+        console.print(
+            "  These results reference assertions that don't appear in either\n"
+            "  the controls or assumptions blocks of this package. Possible\n"
+            "  causes: assertion hard-deleted after this run; run pulled from\n"
+            "  a different model; envelope corrupted between sign and audit."
+        )
+        for r in unmapped_results:
+            _render_assertion_result(r)
+        # Cross-reference the backend's explicit orphan list when the
+        # envelope provides one (post-fix backends emit it). When they
+        # agree we don't need to escalate; when they disagree something
+        # is off in either the envelope build or the CLI parse.
+        backend_orphans = vr.get("orphan_result_assertion_ids")
+        if isinstance(backend_orphans, list) and backend_orphans:
+            console.print(
+                f"  [dim]Backend marked {len(backend_orphans)} assertion id(s) "
+                "as orphaned in this run.[/dim]"
+            )
 
     # --- Trust contract summary ---
     console.print()
@@ -3115,23 +3231,49 @@ def audit(
 
     # --- Verdict ---
     # Emit a verdict that accurately describes what was actually
-    # verified. Without this, a package with no signatures (provenance
-    # missing AND content_integrity missing) and no failed results
-    # would print "VERIFIED — provenance authentic, content intact" —
-    # both claims false. Track which checks succeeded and tailor the
-    # text accordingly.
+    # verified. Tally control- and assumption-bound assertion results
+    # separately: assumptions are external trust statements (sufficiency
+    # doesn't apply) but their CI verdicts are still observable evidence
+    # the auditor cares about.
+    def _assertion_breakdown() -> str:
+        parts = []
+        if ctrl_assertion_total or not asm_assertion_total:
+            parts.append(f"{ctrl_pass}/{ctrl_assertion_total} control assertions pass")
+        if asm_assertion_total:
+            parts.append(f"{asm_pass}/{asm_assertion_total} assumption assertions pass")
+        if unmapped_results:
+            unmapped_pass = sum(1 for r in unmapped_results if r.get("result") == "pass")
+            parts.append(f"{unmapped_pass}/{len(unmapped_results)} unmapped pass")
+        if ctrl_count:
+            parts.append(f"{suff_count}/{ctrl_count} controls sufficient")
+        return ", ".join(parts)
+
     console.print()
     if has_failure or total_fail > 0:
-        console.print(f"[red bold]Verdict: FAILED[/red bold] — {total_pass}/{len(results)} assertions pass, "
-                       f"{suff_count}/{ctrl_count} controls sufficient")
+        console.print(f"[red bold]Verdict: FAILED[/red bold] — {_assertion_breakdown()}")
+    elif unmapped_results:
+        # Any orphan result demotes the verdict — the auditor can't
+        # reach a clean "VERIFIED" when the package itself is internally
+        # inconsistent (results referencing assertions that don't exist
+        # in either bucket). Render as PARTIALLY VERIFIED rather than
+        # FAILED because the cryptographic chain may still be intact.
+        verified_parts = []
+        if provenance_verified:
+            verified_parts.append("provenance authentic")
+        if content_verified or content_anchored_in_sigstore:
+            verified_parts.append("content intact")
+        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+        console.print(
+            f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
+            f"{_assertion_breakdown()} ({len(unmapped_results)} unmapped)"
+        )
     elif not provenance_verified and not content_verified:
         # No cryptographic verification ran. Don't claim authenticity.
         console.print(
             f"[yellow bold]Verdict: UNVERIFIED[/yellow bold] — no Sigstore "
             f"provenance and no content_integrity signature were verified. "
             f"This package contains no cryptographic evidence of authenticity. "
-            f"{total_pass}/{len(results)} assertions pass, "
-            f"{suff_count}/{ctrl_count} controls sufficient"
+            f"{_assertion_breakdown()}"
         )
     elif ctrl_count > 0 and suff_count < ctrl_count:
         # Any non-sufficient control (insufficient OR pending) demotes
@@ -3146,8 +3288,7 @@ def audit(
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
         # Build a precise breakdown of WHY the controls aren't sufficient
-        # so the auditor can act. "0/1 sufficient" alone doesn't say
-        # whether the gap is insufficient evaluations or queued pending ones.
+        # so the auditor can act.
         pending_count = ctrl_count - suff_count - insuff_count
         breakdown_parts = []
         if insuff_count > 0:
@@ -3155,10 +3296,10 @@ def audit(
         if pending_count > 0:
             breakdown_parts.append(f"{pending_count} pending")
         breakdown = " (" + ", ".join(breakdown_parts) + ")" if breakdown_parts else ""
-        console.print(f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — "
-                       f"{prefix}"
-                       f"{total_pass}/{len(results)} assertions pass, "
-                       f"{suff_count}/{ctrl_count} controls sufficient{breakdown}")
+        console.print(
+            f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
+            f"{_assertion_breakdown()}{breakdown}"
+        )
     else:
         verified_parts = []
         if provenance_verified:
@@ -3166,9 +3307,10 @@ def audit(
         if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
-        console.print(f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
-                       f"{total_pass}/{len(results)} assertions pass, "
-                       f"{suff_count}/{ctrl_count} controls sufficient")
+        console.print(
+            f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
+            f"{_assertion_breakdown()}"
+        )
     console.print()
 
     sys.exit(1 if (has_failure or total_fail > 0) else 0)
