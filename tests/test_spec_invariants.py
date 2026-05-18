@@ -129,6 +129,15 @@ FP_CUSTOMER = _fp(KEY_CUSTOMER)
 # --- Customer-keyed offline DSSE bundle (no network) -------------------
 
 
+# Memoize deterministic customer-DSSE bundles: identical logical inputs
+# (signing/embed key identity + content_hash + predicate fields) yield a
+# behaviorally identical *valid* bundle, so build + ECDSA-sign ONCE
+# instead of per BFS cell (this was ~476s of CI). Pure speedup — the
+# real verifier re-verifies every returned bundle, and nothing the
+# spec/impl checks depends on signature byte values.
+_CUSTOMER_DSSE_BUNDLE_CACHE: dict = {}
+
+
 def _build_customer_dsse_bundle(
     *,
     content_hash: str,
@@ -150,15 +159,19 @@ def _build_customer_dsse_bundle(
     different key models a swapped/forged customer key that fails the
     fingerprint-pin / signature step.
     """
+    if embed_key is None:
+        embed_key = signing_key
+    _ck = (content_hash, id(signing_key), id(embed_key), model_id, commit_sha)
+    _hit = _CUSTOMER_DSSE_BUNDLE_CACHE.get(_ck)
+    if _hit is not None:
+        return _hit
+
     from mipiti_verify.customer_dsse_signer import (
         BUNDLE_KIND,
         PAYLOAD_TYPE,
         build_statement_bytes,
         compute_pae,
     )
-
-    if embed_key is None:
-        embed_key = signing_key
     payload = build_statement_bytes(
         model_id=model_id,
         tier=1,
@@ -182,7 +195,9 @@ def _build_customer_dsse_bundle(
         )
         .decode("ascii"),
     }
-    return json.dumps(bundle)
+    _out = json.dumps(bundle)
+    _CUSTOMER_DSSE_BUNDLE_CACHE[_ck] = _out
+    return _out
 
 
 # --- Real Fulcio minting (CI only) -------------------------------------
