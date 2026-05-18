@@ -179,6 +179,50 @@ Package == [
     bundle_bind_signature  : (BundleBindSigOutcomes \cup {NONE})
 ]
 
+\* ---- Generation-time customer_dsse pruning for Config 2 -----------
+\* PackageGen(gen) is the set TLC ENUMERATES at Init. With gen = TRUE
+\* it is exactly `Package` (Config 1 / audit.cfg — byte-equivalent,
+\* customer_dsse fully generated). With gen = FALSE (Config 2) the
+\* WSSig generator drops KS_CUSTOMER_DSSE from `key_source` and pins
+\* the three customer_dsse-ONLY fields to their canonical sentinels —
+\* so TLC's `\in` enumerator generates ~18x fewer WSSig records
+\* (3 * 3 * 2 collapsed to 1 * 1 * 1, KeySources 6 -> 5). This is a
+\* genuine generation-domain restriction (membership in a smaller
+\* set), NOT a post-`\in` filter — TLC never materialises the
+\* customer_dsse sub-product.
+\*
+\* Lossless (COMPOSITION.md "Config-2 customer_dsse exclusion"):
+\* every invariant Config 2 checks (I8/I14/V1/V2/V4, + TypeOK)
+\* requires pkg.bundle # ABSENT in its premise, and a customer_dsse
+\* row has bundle = ABSENT (KeySourceResolver R12, imported in
+\* InitBase), so every dropped customer_dsse state is vacuously-true
+\* for all Config-2 invariants and contributes zero coverage. The
+\* dropped customer_dsse-only field values are likewise unobserved on
+\* the surviving non-customer_dsse rows (the pre-existing InitBase
+\* dead-field pin already canonicalises them there). Config 1
+\* (Init_main) uses gen = TRUE and keeps customer_dsse — V5a/V5b/V5c
+\* live in its partition and need it.
+WSSigGen(gen) ==
+    [ signing_key_fp : Fingerprints,
+      claimed_fp     : Fingerprints \cup {NONE},
+      message_hash   : Hashes,
+      valid          : BOOLEAN,
+      key_source     : IF gen THEN KeySources
+                              ELSE KeySources \ {KS_CUSTOMER_DSSE},
+      dsse_predicate_model_id   : IF gen THEN ModelIds \cup {NONE}
+                                         ELSE {NONE},
+      dsse_predicate_commit_sha : IF gen THEN CommitShas \cup {NONE}
+                                         ELSE {NONE},
+      customer_key_fp_match     : IF gen THEN BOOLEAN ELSE {TRUE} ]
+
+PackageGen(gen) ==
+    [ bundle                 : (Bundle \cup {ABSENT}),
+      ws_sig                 : (WSSigGen(gen) \cup {ABSENT}),
+      results_hash           : (Hashes \cup {NONE}),
+      results_canonical_hash : Hashes,
+      bundle_bind_hash       : (Hashes \cup {NONE}),
+      bundle_bind_signature  : (BundleBindSigOutcomes \cup {NONE}) ]
+
 Pins == [
     san             : Identities \cup {NONE},
     issuer_explicit : Issuers \cup {NONE},
@@ -541,8 +585,25 @@ Audit(k, q) ==
 \* and "dead signature when bind FAILED" pruning the original spec
 \* enforced. Compositional split refines this into two narrower init
 \* predicates below; each .cfg picks one Spec.
-InitBase ==
-    /\ pkg \in Package
+\* InitBase(genCustomerDsse) — shared init skeleton, parameterised on
+\* whether customer_dsse rows are GENERATED.
+\*
+\*   - genCustomerDsse = TRUE  (Config 1 / audit.cfg): customer_dsse
+\*     rows are generated; the R12 producer constraint and the
+\*     relation-class canonicalisation apply (V5a/V5b/V5c need them).
+\*   - genCustomerDsse = FALSE (Config 2 / audit_bundle_bind.cfg):
+\*     customer_dsse is excluded at GENERATION time via PackageGen
+\*     (FALSE): the enumerated WSSig set drops KS_CUSTOMER_DSSE and
+\*     pins the three customer_dsse-only fields to singletons, so
+\*     TLC's `\in` enumerator never materialises the customer_dsse
+\*     sub-product (true domain restriction, not a post-filter). This
+\*     is the lossless Config-2 customer_dsse exclusion
+\*     (COMPOSITION.md): every invariant Config 2 checks
+\*     (I8/I14/V1/V2/V4) requires pkg.bundle # ABSENT, and a
+\*     customer_dsse row has bundle = ABSENT (R12), so every excluded
+\*     state is vacuously-true for all Config-2 invariants.
+InitBase(genCustomerDsse) ==
+    /\ pkg \in PackageGen(genCustomerDsse)
     /\ pins \in Pins
     \* When the envelope carries no bundle, bundle_bind_hash and
     \* bundle_bind_signature describe the bundle-bind relationship
@@ -669,7 +730,7 @@ InitBase ==
 \* Pinning bundle_bind to "matching, valid" is the canonical
 \* representative for the equivalence class.
 Init_main ==
-    /\ InitBase
+    /\ InitBase(TRUE)
     /\ (pkg.bundle # ABSENT
         => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
            /\ pkg.bundle_bind_signature = "VALID")
@@ -681,17 +742,51 @@ Init_main ==
 \* preconditions require ws_sig present with specific key_source
 \* values). Pins are pinned to NONE since V1/V2's premises require
 \* all pins NONE, and I8/I14 are independent of pins.
+\*
+\* Lossless customer_dsse exclusion (see formal/COMPOSITION.md
+\* "Config-2 customer_dsse exclusion"). Every invariant Config 2
+\* checks — I8, I14, V1, V2, V4 (and TypeOK) — has a premise conjunct
+\* requiring `pkg.bundle # ABSENT`. A customer_dsse row has
+\* `pkg.bundle = ABSENT` (KeySourceResolver R12 producer constraint,
+\* imported in InitBase lines ~601-603), so on every customer_dsse
+\* state all five Config-2 invariant premises are vacuously false and
+\* the invariants hold trivially — customer_dsse states contribute
+\* zero coverage to Config 2. None of I8/I14/V1/V2/V4 reference
+\* KS_CUSTOMER_DSSE / dsse_predicate_* / customer_key_fp_match /
+\* IsCustomerDsse in their own bodies (only the shared, invariant-
+\* agnostic Audit/WSSig/KeySources infrastructure does). Excluding
+\* customer_dsse rows from generation is therefore lossless for
+\* Config 2 — it drops only states on which every checked invariant
+\* is vacuously true — and collapses Config 2 back to its
+\* pre-customer_dsse magnitude. Config 1 (Init_main) legitimately
+\* keeps customer_dsse: V5a/V5b/V5c live in its partition and need it.
+\*
+\* The exclusion is enforced at *generation* time, not as a
+\* post-filter. InitBase(FALSE) enumerates `pkg \in PackageGen(FALSE)`
+\* (defined next to Package), whose WSSig generator already DROPS
+\* KS_CUSTOMER_DSSE from `key_source` and pins the three
+\* customer_dsse-only fields to singletons — so TLC's `\in`
+\* enumerator generates ~18x fewer WSSig records and never
+\* materialises the customer_dsse sub-product. A bare conjunctive
+\* `key_source # KS_CUSTOMER_DSSE` AFTER an unparameterised
+\* `pkg \in Package` would NOT prune generation (TLC still iterates
+\* the full record product, then discards) — empirically the
+\* init-generation blow-up the AuditView / InitBase-canon work
+\* documents. PackageGen(FALSE) ⊆ Package, so TypeOK still holds on
+\* every Config-2 state. Measured: Config 2 completes in ~3.5 min /
+\* 142,743 distinct states (was multi-hour / non-terminating).
 Init_bind ==
-    /\ InitBase
+    /\ InitBase(FALSE)
     /\ pins.san = NONE
     /\ pins.issuer_explicit = NONE
     /\ pins.workspace_fp = NONE
     /\ pins.model_id = NONE
     /\ pins.commit_sha = NONE
 
-\* Backward-compatible Init: the original full-domain enumeration.
-\* Kept so audit.cfg (the un-split config) continues to work.
-Init == InitBase
+\* Backward-compatible Init: the original full-domain enumeration
+\* (customer_dsse generated). Kept so audit.cfg (the un-split config)
+\* continues to work.
+Init == InitBase(TRUE)
 
 Next == UNCHANGED vars
 

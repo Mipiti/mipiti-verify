@@ -76,8 +76,9 @@ These invariants explicitly reference `bundle_bind_hash` and/or
 |---|---|
 | `I8_BundleBoundToBundleBindHash` | Conclusion: `bundle.bound_hash = bundle_bind_hash`. Must explore states where they differ. |
 | `I14_BundleBindExplicit` | Conclusion: `bundle_bind_hash ≠ NONE` AND `bundle.bound_hash = bundle_bind_hash`. Same. |
-| `V1_SigstoreSkipSoundness` | Premise: `bundle_bind_hash = bundle.bound_hash` AND `bundle_bind_signature ≠ FALSE`. Must explore the full domain to confirm the conclusion holds on all premise-satisfying states. |
+| `V1_SigstoreSkipSoundness` | Premise: `bundle ≠ ABSENT` AND `bundle_bind_hash = bundle.bound_hash` AND `bundle_bind_signature ∉ {INVALID, KEY_UNRESOLVABLE}`. Must explore the full domain to confirm the conclusion holds on all premise-satisfying states. |
 | `V2_OrphanWithBundleVerified` | Same as V1 with `KS_ORPHAN`. |
+| `V4_BundleBindSigKeyResolutionExplicit` | Premise: `bundle ≠ ABSENT` AND `bundle_bind_signature = KEY_UNRESOLVABLE`. Conclusion: `Audit ∈ {FAILED, USAGE_ERROR}`. Directly references the `bundle_bind_signature` domain. |
 
 Config 2 pins all auditor pins (`pins.san`, `issuer_explicit`,
 `workspace_fp`, `model_id`, `commit_sha`) to `NONE`. Reason: V1/V2's
@@ -130,6 +131,119 @@ on `audit.tla`'s reachable state space.
 The original `audit.cfg` is retained for backward compatibility and
 periodic soundness verification (manual or scheduled run); it is not
 required on every CI tick.
+
+## Config-2 customer_dsse exclusion (lossless)
+
+`Init_bind` (Config 2's init operator, selected by
+`audit_bundle_bind.cfg` via `SPECIFICATION Spec_bind`) calls the
+parameterised `InitBase(genCustomerDsse)` with `genCustomerDsse =
+FALSE`. `InitBase(FALSE)` enumerates `pkg \in PackageGen(FALSE)`,
+whose `WSSigGen(FALSE)` generator **drops `KS_CUSTOMER_DSSE` from the
+`key_source` domain and pins the three customer_dsse-only WSSig
+fields to singletons**:
+
+```tla
+key_source                : KeySources \ {KS_CUSTOMER_DSSE}
+dsse_predicate_model_id   : {NONE}
+dsse_predicate_commit_sha : {NONE}
+customer_key_fp_match     : {TRUE}
+```
+
+i.e. **Config 2 never generates a customer_dsse row** — and, because
+this is a smaller *enumerated set* (not a post-`\in` filter), TLC's
+init-state generator never materialises the customer_dsse
+sub-product (~18× fewer WSSig records: `3·3·2` collapsed to `1·1·1`,
+`KeySources` 6→5). `Init_main` (Config 1) and the legacy `Init` call
+`InitBase(TRUE)`, where `PackageGen(TRUE)` is byte-equivalent to the
+original `Package` (customer_dsse fully generated). Note
+`PackageGen(FALSE) ⊆ Package`, so `TypeOK == pkg \in Package` still
+holds on every Config-2 state. A *bare conjunctive* exclusion
+(`… /\ pkg.ws_sig.key_source # KS_CUSTOMER_DSSE`) layered after an
+unparameterised `pkg \in Package` was measured **not** to prune
+generation — TLC iterates the full record product first and only
+then discards — which is the init-generation blow-up the AuditView /
+InitBase-canon work documents; the generator-set restriction is what
+actually prunes.
+
+This is *lossless* — it removes only states on which every invariant
+Config 2 checks is vacuously true:
+
+- The exact invariant set Config 2 verifies is
+  `ConfigBindInvariants` = **`I8`, `I14`, `V1`, `V2`, `V4`** (plus
+  `TypeOK`). This is the machine-checked list — `audit.tla`'s
+  `ConfigBindInvariants` body — not a prose restatement.
+- **Every one of `I8`, `I14`, `V1`, `V2`, `V4` has a premise conjunct
+  requiring `pkg.bundle # ABSENT`** (I8: `… /\ pkg.bundle # ABSENT`;
+  I14: `Audit = VERIFIED /\ pkg.bundle # ABSENT`; V1/V2:
+  `… /\ pkg.bundle # ABSENT /\ pkg.bundle.valid …`; V4:
+  `pkg.bundle # ABSENT /\ bundle_bind_signature = KEY_UNRESOLVABLE`).
+  `TypeOK` is a pure type predicate that holds on every well-typed
+  state regardless.
+- A customer_dsse row has **`pkg.bundle = ABSENT`** — the
+  KeySourceResolver `R12` producer constraint imported into
+  `InitBase` (the clause `pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+  => pkg.bundle = ABSENT /\ pkg.ws_sig.valid = TRUE`).
+- Therefore on **every** customer_dsse state, all five Config-2
+  invariant premises are vacuously false ⇒ each invariant holds
+  trivially. Customer_dsse states contribute **zero** invariant
+  coverage to Config 2.
+
+This is the *same* partition argument that already places the
+customer_dsse positive properties (`V5a`/`V5b`/`V5c`) in **Config
+1's** partition: customer_dsse rows are bundle-absent, hence
+`bundle_bind`-pinned `NONE/NONE`, hence Config-1 territory.
+`Init_main` (Config 1) is **unchanged** and still generates
+customer_dsse — `V5a`/`V5b`/`V5c` legitimately need it, and Config
+1's sound full run stands.
+
+**Soundness gate (verified before adopting the exclusion).** The
+transitive operator closure of `ConfigBindInvariants`/`TypeOK` (the
+same call-graph the AST proof in `check_audit_view_faithful.py`
+walks) reaches `KS_CUSTOMER_DSSE` / `dsse_predicate_*` /
+`customer_key_fp_match` / `IsCustomerDsse` **only** through the
+shared, invariant-agnostic `Audit` / `WSSig` / `KeySources`
+infrastructure. **No Config-2 invariant body itself** references any
+customer_dsse symbol, nor does any Config-2 invariant observe the
+customer_dsse `Audit` terminal-dispatch outcome (each requires
+`bundle # ABSENT`, which customer_dsse — being bundle-absent — can
+never satisfy, so the customer_dsse branch of `Audit` is unreachable
+on any state where a Config-2 premise is non-vacuous). The exclusion
+is sound.
+
+Effect (measured, `eclipse-temurin:21-jre`, `-Xmx8g -workers auto`,
+TLC 2.19): Config 2 (`audit_bundle_bind.cfg`) **completes** —
+`Model checking completed. No error has been found.` — in
+**3 min 37 s**, **142,743 distinct states** (1,272,102 generated).
+Before this change Config 2 did not terminate (stuck in init-state
+generation past 2 h with the customer_dsse cross-product
+materialised). Config 1 (`audit_main.cfg`) is byte-unchanged and its
+prior sound ~1 h run stands (its spec call `InitBase(TRUE)` is
+provably a no-op refactor: `PackageGen(TRUE) ≡ Package`).
+
+The reduction is orthogonal to (and composes with) the `AuditView`
+VIEW and the `InitBase` relation-class canonicalisation: those make
+the *retained* customer_dsse states tractable for Config 1; this
+exclusion removes the *vacuous* ones from Config 2 entirely.
+
+## CI job split
+
+The audit-spec TLC work runs in a **dedicated `audit-tlc` job** in
+`.github/workflows/ci.yml`, parallel to `test` and
+`test-spec-invariants`:
+
+- `audit-tlc` owns the `check_audit_view_faithful.py` AST-proof gate
+  (it certifies the lossless `AuditView` reduction these two configs
+  depend on), the TLC download, and the two `audit.tla` configs
+  (`audit_main.cfg` Config 1 + `audit_bundle_bind.cfg` Config 2),
+  both with `-workers auto`.
+- `test` keeps the Python BFS cross-check and the
+  `VerificationPipeline` / `KeySourceResolver` TLC runs.
+
+Rationale: a long-but-correct audit TLC run no longer sits on the
+critical path of the fast unit/BFS suite. No gate is weakened — every
+job (`test`, `audit-tlc`, `test-spec-invariants`) remains a required
+status check; the AST proof still fails closed; `-workers auto` and
+the JVM tuning are unchanged.
 
 ## Companion: resolver-side invariant index
 
