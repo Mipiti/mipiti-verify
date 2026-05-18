@@ -255,7 +255,7 @@ ResolveIssuer(p) ==
 (*     pin.                                                                 *)
 (*   - The predicate pins --expected-model-id / --expected-commit-sha       *)
 (*     ARE enforced, but against the CUSTOMER-signed DSSE predicate         *)
-(*     (dsse_predicate_*), not a Sigstore bundle predicate.                 *)
+(*     (the dsse_predicate fields), not a Sigstore bundle predicate.        *)
 (*   - --expected-customer-key satisfies the same SAN-substitute role for   *)
 (*     the SAN-less-co-pin usage error: model_id / commit_sha co-pins       *)
 (*     WITHOUT a SAN are NOT a usage error for customer_dsse (cli.py        *)
