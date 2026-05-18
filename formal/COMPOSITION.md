@@ -320,7 +320,7 @@ refinement therefore introduces no new `bundle_bind`-dependent premise
 or conclusion, so the partition argument and
 `ConfigMainCompositionLemma` above remain sound unchanged.
 
-## `AuditView` — lossless customer_dsse state-space reduction
+## `AuditView` — lossless two-sided Rel3 state-space reduction
 
 The `customer_dsse` modeling added three `WSSig` fields —
 `customer_key_fp_match : BOOLEAN`,
@@ -348,33 +348,63 @@ checkpoint (effectively non-terminating in CI).
 `AuditView` (defined in `audit.tla`, wired via `VIEW AuditView` in
 both cfgs) is a **key-source-conditional** TLC view:
 
-- **On a `customer_dsse` row** (`IsCustomerDsse(pkg)`): it projects
-  the pair `(dsse_predicate_model_id, pins.model_id)` to a 3-valued
-  relation token via `Rel3` — `q_none` (pin unset) / `match` /
-  `mismatch` — does the same for `(dsse_predicate_commit_sha,
-  pins.commit_sha)`, keeps `customer_key_fp_match` verbatim (a
-  boolean), and keeps **every other observable field of `pkg`/`pins`
-  verbatim**. The 162-way raw product collapses to
-  `2·3·3 = 18` observable classes.
-- **On every NON-customer_dsse state** (and when `ws_sig = ABSENT`):
-  the view is the **identity** `<<pkg, pins>>`.
+- **On a `customer_dsse` row** (`IsCustomerDsse(pkg)`, THEN branch):
+  it projects the pair `(dsse_predicate_model_id, pins.model_id)` to
+  a 3-valued relation token via `Rel3` — `q_none` (pin unset) /
+  `match` / `mismatch` — does the same for
+  `(dsse_predicate_commit_sha, pins.commit_sha)`, keeps
+  `customer_key_fp_match` verbatim (a boolean), and keeps **every
+  other observable field of `pkg`/`pins` verbatim**. The 162-way raw
+  product collapses to `2·3·3 = 18` observable classes.
+- **On a NON-customer_dsse row with `bundle # ABSENT`** (the
+  Sigstore / bundle class, ELSE-then branch): it projects the pair
+  `(pkg.bundle.predicate_model_id, pins.model_id)` to a 3-valued
+  `Rel3` token, does the same for
+  `(pkg.bundle.predicate_commit_sha, pins.commit_sha)`, drops those
+  four identities, and keeps **every other field of
+  `pkg`/`bundle`/`pins` verbatim**. The `3·3·3·3` predicate × pin
+  raw cross-product collapses to `3·3 = 9` observable classes. This
+  is the **two-sided extension**: the symmetric twin of the
+  customer_dsse collapse, on the previously-identity Sigstore class
+  that was the dominant Config-1 state-mass bottleneck.
+- **On a NON-customer_dsse row with `bundle = ABSENT`** (and when
+  `ws_sig = ABSENT`): the view is the **identity** `<<pkg, pins>>`,
+  bit-for-bit unchanged from the pre-extension view on this subcase.
 
-### Why identity off the customer_dsse path (soundness)
+### Why the two-sided collapse is sound
 
-Collapsing `pins.model_id` / `pins.commit_sha` *globally* would be
-**unsound**: `I12` / `I13` assert
-`bundle.predicate_model_id = pins.model_id` (resp. commit_sha) and
-`Audit`'s Sigstore bundle-predicate branches compare the *bundle*
-predicate to `q.model_id` *by identity*. A global collapse would
-conflate states those Sigstore-pin invariants distinguish, hiding
-real violations. `AuditView` therefore collapses
-`pins.model_id`/`commit_sha` **only on a customer_dsse row**, where
-`bundle = ABSENT` (KeySourceResolver `R12`, imported in `InitBase`)
-makes every bundle-predicate branch vacuous — so the collapse is
-observationally inert for the Sigstore-pin invariants. On every
-Sigstore / platform / workspace / orphan / legacy state `AuditView`
-is the literal identity, so I1–I14 / V1–V4 and their Sigstore-pin
-identity uses see the unreduced state exactly as before.
+Both branches discharge the **same** factor-through obligation.
+Across the `Audit` operator and **every** cfg invariant — every
+`Audit` invocation is `Audit(pkg, pins)`, so `q ≡ pins` — the bundle
+predicate fields are observed **only** through (in)equality against
+the pins or the `NONE` sentinel:
+
+- `pkg.bundle.predicate_model_id # q.model_id` (`Audit`:481–482),
+  guarded by `q.model_id # NONE`;
+- `pkg.bundle.predicate_model_id = pins.model_id` (`I12`), guarded
+  by `pins.model_id # NONE`;
+- symmetric for `predicate_commit_sha` (`Audit`:486–487, `I13`);
+- `pins.model_id` / `pins.commit_sha` are otherwise read **only**
+  via `# NONE` / `= NONE` (`I1`/`I7`/`V3` …) — a relation the
+  `Rel3` token's `q_none` class preserves exactly.
+
+So a bundle-present non-customer_dsse row's contribution to every
+invariant **factors through**
+`<Rel3(bundle.predicate_model_id, pins.model_id),
+Rel3(bundle.predicate_commit_sha, pins.commit_sha)>` exactly as a
+customer_dsse row factors through the `dsse_predicate_*` tokens —
+collapsing it is lossless, not merely dedup-equivalent.
+
+The **bundle-absent** non-customer_dsse subcase stays the literal
+identity: there is no bundle predicate (every bundle-predicate /
+`I12` / `I13` read is guarded by `bundle # ABSENT` and is vacuous),
+and `pins.model_id` / `pins.commit_sha` are observed there only via
+`# NONE` / `= NONE` with no predicate to fold them into — so keeping
+them verbatim is the only sound choice and preserves behaviour
+exactly. A *global* (bundle-absent included) pins collapse would be
+**unsound** for the same reason it was before the extension; the
+extension narrows the identity region to exactly that subcase rather
+than the whole Sigstore class.
 
 ### Lossless by construction — the AST proof
 
@@ -387,7 +417,8 @@ a stdlib-only structural analysis of `audit.tla`:
    transitively from the `INVARIANTS` roots of both cfgs (an
    invariant calling a helper that touches a collapsed field counts).
 2. For every reference to a collapsed field
-   (`dsse_predicate_model_id`, `dsse_predicate_commit_sha`,
+   (`dsse_predicate_model_id`, `dsse_predicate_commit_sha`, the
+   Sigstore bundle `predicate_model_id` / `predicate_commit_sha`,
    `customer_key_fp_match`, and the `.model_id` / `.commit_sha`
    pins) inside any invariant-reachable operator body, classify its
    immediate syntactic context and **assert** it is an operand of an
@@ -453,6 +484,15 @@ violation (`V5a_CustomerDssePinMismatchFails` counterexample),
 proving the view did not hide the regression. Reverting the mutation
 restores a clean run. See the final-report record of the
 before/after TLC output.
+
+The two-sided extension adds a proof-side non-vacuity check: a
+structural (`\in`) use of the newly-collapsed
+`pkg.bundle.predicate_model_id` is transiently injected into `I12`
+and `check_audit_view_faithful.py` is confirmed to **FAIL** within
+seconds (it flags the non-(in)equality use of a collapsed field),
+then reverted. This proves the extended AST proof actually
+constrains the bundle predicate fields rather than passing them
+vacuously.
 
 ### Residual soundness assumption
 

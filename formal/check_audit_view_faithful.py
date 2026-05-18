@@ -8,9 +8,23 @@ cross-product:
 
   * `customer_key_fp_match`        — BOOLEAN, kept verbatim;
   * `dsse_predicate_model_id`      — projected, with the auditor pin
-    `pins.model_id`,   to a 3-valued relation token;
+    `pins.model_id`,   to a 3-valued relation token (customer_dsse
+    THEN branch);
   * `dsse_predicate_commit_sha`    — projected, with `pins.commit_sha`,
-    to a 3-valued relation token.
+    to a 3-valued relation token (customer_dsse THEN branch);
+  * `predicate_model_id`           — the Sigstore *bundle* predicate;
+    projected, with `pins.model_id`, to a 3-valued relation token on
+    the non-customer_dsse / bundle-present ELSE branch;
+  * `predicate_commit_sha`         — symmetric, with `pins.commit_sha`.
+
+The two-sided collapse is sound by the SAME factor-through argument:
+across the `Audit` operator and every cfg invariant the bundle
+predicate fields are read ONLY as `bundle.predicate_* # q.model_id`
+(Audit, q ≡ pins — every cfg `Audit(pkg, pins)` invocation) and
+`bundle.predicate_* = pins.*` (I12 / I13), so a bundle-present
+non-customer_dsse row's verdict factors through
+`Rel3(bundle.predicate_*, pins.*)` exactly as a customer_dsse row's
+does through `Rel3(dsse_predicate_*, pins.*)`.
 
 A TLC VIEW is lossless iff every checked invariant *factors through*
 the view — i.e. two states with the same view agree on every
@@ -65,23 +79,39 @@ _CFGS = ("audit_main.cfg", "audit_bundle_bind.cfg")
 # invariant must therefore observe them ONLY via (in)equality so its
 # truth value is a function of the token / boolean.
 #
-#   * The two DSSE predicate WSSig fields (record-field selectors).
+#   * The two DSSE predicate WSSig fields (record-field selectors) —
+#     folded into relation tokens on the customer_dsse THEN branch.
+#   * The two Sigstore *bundle* predicate fields — folded into
+#     relation tokens on the non-customer_dsse / bundle-present ELSE
+#     branch (the two-sided collapse extension).
 #   * The boolean fp-match WSSig field.
 #   * The auditor pin fields model_id / commit_sha — these are folded
-#     INTO the relation tokens on a customer_dsse row, so on that row
-#     they too must be observed only via (in)equality. (Off the
-#     customer_dsse path the VIEW is the identity on pins, so I12/I13's
-#     identity use of pins.model_id is irrelevant to faithfulness and
-#     deliberately NOT constrained here.)
+#     INTO the relation tokens on BOTH the customer_dsse row (vs the
+#     ws_sig DSSE predicate) and the bundle-present non-customer_dsse
+#     row (vs the bundle predicate), so wherever they appear they too
+#     must be observed only via (in)equality. The script already
+#     enforced this everywhere (a sound over-approximation: it never
+#     restricted the pin check to customer_dsse rows); the bundle
+#     branch reuses the SAME obligation. On the bundle-ABSENT
+#     non-customer_dsse subcase the view is the identity, so the pin
+#     identity is preserved verbatim there anyway.
 # ---------------------------------------------------------------------------
 
 _DSSE_FIELDS = ("dsse_predicate_model_id", "dsse_predicate_commit_sha")
+# Sigstore bundle predicate fields — collapsed on the ELSE (non-
+# customer_dsse, bundle-present) branch. Same (in)equality discipline.
+_BUNDLE_PREDICATE_FIELDS = ("predicate_model_id", "predicate_commit_sha")
 _BOOL_FIELD = "customer_key_fp_match"
 _PIN_FIELDS = ("model_id", "commit_sha")  # as .model_id / .commit_sha
 
 # Field selectors we treat as "collapsed reference sites". A token of
 # the form  <ident>.<field>  where field is one of these.
-_COLLAPSED_FIELDS = set(_DSSE_FIELDS) | {_BOOL_FIELD} | set(_PIN_FIELDS)
+_COLLAPSED_FIELDS = (
+    set(_DSSE_FIELDS)
+    | set(_BUNDLE_PREDICATE_FIELDS)
+    | {_BOOL_FIELD}
+    | set(_PIN_FIELDS)
+)
 
 
 @dataclass
@@ -634,6 +664,7 @@ def main() -> int:
     print("  Every invariant in audit_main.cfg / audit_bundle_bind.cfg —")
     print("  transitively through Audit and all helpers — observes")
     print("  dsse_predicate_model_id / dsse_predicate_commit_sha /")
+    print("  the Sigstore bundle predicate_model_id / predicate_commit_sha /")
     print("  customer_key_fp_match / the model_id|commit_sha pins ONLY")
     print("  via =, #, /= (or the boolean used as a boolean). Each")
     print("  invariant therefore FACTORS THROUGH AuditView's 3-valued")
