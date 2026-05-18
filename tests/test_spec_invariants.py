@@ -115,6 +115,75 @@ KEY_B = _derive_key(b"mipiti-test-spec-invariants-key-b")
 FP_A = _fp(KEY_A)
 FP_B = _fp(KEY_B)
 
+# Customer-keyed offline DSSE path: a deterministically-derived P-256
+# "customer" key. The auditor pins its fingerprint out-of-band via
+# --expected-customer-key (the vendor-independence gate); a distinct
+# "wrong" key models a swapped/forged customer key. Same deterministic
+# derivation rationale as KEY_A/KEY_B (stable parametrize IDs under
+# pytest-xdist; no private key material in source).
+KEY_CUSTOMER = _derive_key(b"mipiti-test-spec-invariants-customer-dsse")
+KEY_CUSTOMER_WRONG = _derive_key(b"mipiti-test-spec-invariants-customer-dsse-wrong")
+FP_CUSTOMER = _fp(KEY_CUSTOMER)
+
+
+# --- Customer-keyed offline DSSE bundle (no network) -------------------
+
+
+def _build_customer_dsse_bundle(
+    *,
+    content_hash: str,
+    signing_key: ec.EllipticCurvePrivateKey,
+    embed_key: ec.EllipticCurvePrivateKey | None = None,
+    model_id: str = M1,
+    commit_sha: str = C1,
+) -> str:
+    """Build a real ``customer-dsse`` bundle, fully offline.
+
+    Reuses the production signer's Statement/PAE construction so the
+    bundle is byte-identical to what the CLI's `--customer-key` sign
+    path emits and what `verify_customer_dsse_bundle` consumes. The
+    auditor verifies it offline against the fingerprint pinned via
+    `--expected-customer-key`.
+
+    `signing_key` produces the DSSE signature. `embed_key` (defaults to
+    `signing_key`) is the PEM embedded in the bundle — pointing it at a
+    different key models a swapped/forged customer key that fails the
+    fingerprint-pin / signature step.
+    """
+    from mipiti_verify.customer_dsse_signer import (
+        BUNDLE_KIND,
+        PAYLOAD_TYPE,
+        build_statement_bytes,
+        compute_pae,
+    )
+
+    if embed_key is None:
+        embed_key = signing_key
+    payload = build_statement_bytes(
+        model_id=model_id,
+        tier=1,
+        content_hash=content_hash,
+        pipeline={"provider": "spec-invariants-bfs", "commit_sha": commit_sha},
+        assertions=[],
+        results=[],
+    )
+    pae = compute_pae(payload)
+    sig = signing_key.sign(pae, ec.ECDSA(hashes.SHA256()))
+    bundle = {
+        "v": 1,
+        "kind": BUNDLE_KIND,
+        "payloadType": PAYLOAD_TYPE,
+        "payload": base64.b64encode(payload).decode("ascii"),
+        "signature": base64.b64encode(sig).decode("ascii"),
+        "public_key_pem": embed_key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("ascii"),
+    }
+    return json.dumps(bundle)
+
 
 # --- Real Fulcio minting (CI only) -------------------------------------
 
@@ -416,15 +485,21 @@ def audit_spec(pkg: dict, pins: dict) -> str:
         return "FAILED"
 
     # Workspace sig: claimed_fp (when present) must match signing_key_fp.
-    # Skipped for both "sigstore" and "unverifiable_orphan". sigstore:
-    # bundle is the trust anchor; ws_sig is the issuer's redundant
-    # notarization, not a customer claim. orphan: signing_key_fp is by
-    # definition not in the issuer's published key set; the verifier
-    # surfaces UNRESOLVED without comparing claimed_fp/signing_key_fp.
+    # Skipped for "sigstore", "customer_dsse", and "unverifiable_orphan".
+    # sigstore: bundle is the trust anchor; ws_sig is the issuer's
+    # redundant notarization, not a customer claim. customer_dsse: the
+    # customer-signed DSSE Statement (verified offline against the
+    # out-of-band-pinned fingerprint) is the trust anchor; the envelope
+    # ws_sig is not re-evaluated — same trust-anchor class as sigstore.
+    # orphan: signing_key_fp is by definition not in the issuer's
+    # published key set; the verifier surfaces UNRESOLVED without
+    # comparing claimed_fp/signing_key_fp. Mirrors the audit.tla
+    # KS_SIGSTORE-class skip set {KS_SIGSTORE, KS_CUSTOMER_DSSE,
+    # KS_ORPHAN}.
     ws_key_source = ws_sig.get("key_source", "legacy") if ws_sig is not ABSENT else None
     if (
         ws_sig is not ABSENT
-        and ws_key_source not in ("sigstore", "unverifiable_orphan")
+        and ws_key_source not in ("sigstore", "customer_dsse", "unverifiable_orphan")
         and ws_sig["claimed_fp"] is not None
         and ws_sig["claimed_fp"] != ws_sig["signing_key_fp"]
     ):
@@ -453,13 +528,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
 
     # Workspace sig present but signature itself invalid.
     # Skipped for KS_SIGSTORE (the bundle is the trust anchor — the
-    # redundant ws_sig is not re-verified) and for KS_ORPHAN (the
-    # row's key was not in the issuer's published set, so
-    # ws_sig.valid is "unknown" rather than "invalid"; verdict
-    # relies on bundle path or falls to UNVERIFIED).
+    # redundant ws_sig is not re-verified), KS_CUSTOMER_DSSE (the
+    # offline-verified customer-signed DSSE Statement is the trust
+    # anchor — the envelope ws_sig is not re-verified; same
+    # trust-anchor class as KS_SIGSTORE), and KS_ORPHAN (the row's
+    # key was not in the issuer's published set, so ws_sig.valid is
+    # "unknown" rather than "invalid"; verdict relies on bundle path
+    # or falls to UNVERIFIED).
     if (
         ws_sig is not ABSENT
-        and ws_key_source not in ("sigstore", "unverifiable_orphan")
+        and ws_key_source not in ("sigstore", "customer_dsse", "unverifiable_orphan")
         and not ws_sig["valid"]
     ):
         return "FAILED"
@@ -483,6 +561,16 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     # ws_sigs do not contribute to verifier confidence on their own
     # (former is sigstore-skipped, latter is unverifiable). Treat
     # them like ABSENT for this UNVERIFIED check.
+    #
+    # KS_CUSTOMER_DSSE is deliberately NOT in this set: unlike
+    # sigstore/orphan, a customer_dsse ws_sig IS itself the trust
+    # anchor (the offline-verified customer-signed DSSE Statement),
+    # so it constitutes cryptographic evidence on its own and a
+    # customer_dsse row does not fall through to UNVERIFIED. This
+    # mirrors audit.tla, whose UNVERIFIED "no evidence" clause uses
+    # {KS_SIGSTORE, KS_ORPHAN} (NOT KS_CUSTOMER_DSSE) even though the
+    # claimed-fp / ws_sig.valid / I9 skip sets all include
+    # KS_CUSTOMER_DSSE.
     ws_no_evidence = (
         ws_sig is ABSENT
         or ws_key_source in ("sigstore", "unverifiable_orphan")
@@ -547,6 +635,26 @@ def _materialise(tmp_path, pkg: dict) -> str:
             # rather than verifying against the embedded PEM.
             ci["public_key_pem"] = ""
             ci["unavailable_reason"] = "unresolved_fingerprint"
+        if ks == "customer_dsse":
+            # Customer-keyed offline DSSE. The trust anchor for this
+            # row is the customer-signed in-toto Statement carried in
+            # content_integrity.dsse_bundle (verified offline against
+            # the out-of-band-pinned customer fingerprint), NOT
+            # ci["signature"]. The verifier binds the Statement subject
+            # to bundle_bind_hash when present, else results_hash; for
+            # the no-Sigstore-bundle rows the BFS exercises here
+            # bundle_bind_hash is absent, so the DSSE Statement is
+            # signed over stored_hash (== ci["results_hash"]). The
+            # abstract ws_sig.valid flag still varies for these rows but
+            # models only the redundant envelope ws_sig (the verifier
+            # ignores it on the customer_dsse path — same trust-anchor
+            # class as sigstore). A real customer key signs the
+            # Statement; the auditor pins its fingerprint via
+            # --expected-customer-key (wired in _pin_args).
+            ci["dsse_bundle"] = _build_customer_dsse_bundle(
+                content_hash=stored_hash,
+                signing_key=KEY_CUSTOMER,
+            )
 
     # --- provenance (Sigstore bundle) ---
     provenance = None
@@ -766,6 +874,60 @@ def _all_packages(include_bundle_rows: bool):
                         "bundle_bind_hash": None,
                         "bundle_bind_signature": None,
                     })
+    # Customer-keyed offline DSSE rows (key_source = "customer_dsse").
+    # No Sigstore bundle by construction — this path exists precisely
+    # for air-gapped / non-Sigstore CI that structurally cannot mint a
+    # Fulcio bundle, so these rows are always materialised (not gated
+    # on CI OIDC) and exercise the new trust-anchor class even on a
+    # local run. The customer-signed DSSE Statement carried in
+    # content_integrity.dsse_bundle is the trust anchor; the auditor
+    # pins the customer key fingerprint out-of-band
+    # (--expected-customer-key, wired in _customer_key_args). These
+    # rows faithfully exercise the KS_SIGSTORE-class skip sets the
+    # spec added customer_dsse to:
+    #   - claimed_fp != signing_key_fp (claimed_fp=FP_B vs
+    #     signing_key_fp=FP_A): would FAIL the metadata-fp branch if
+    #     customer_dsse were NOT in the claimed-fp skip set. Because
+    #     it IS in the skip set, the row still reaches VERIFIED — a
+    #     non-vacuous exercise of that skip.
+    #   - the ws_sig.valid skip and the I9 refinement are exercised
+    #     structurally: the row reaches VERIFIED through the
+    #     customer_dsse-aware branches without the generic
+    #     ws_sig.valid gate firing (the verifier never consults
+    #     ci["signature"] on this path — the customer-signed DSSE
+    #     Statement is the anchor).
+    # results_hash h1/h2 still drives the (key_source-independent)
+    # canonical-hash mismatch branch (h1 → VERIFIED, h2 → FAILED).
+    #
+    # ws_sig.valid is pinned True: a customer_dsse row's trust anchor
+    # is the customer-signed DSSE Statement, and KeySourceResolver R12
+    # emits the customer_dsse classification ONLY when that bundle
+    # re-verifies (DSSE_VALID). So a customer_dsse row with an invalid
+    # anchor is producer-impossible — exactly analogous to audit.tla's
+    # InitBase pin that makes (bundle.valid=FALSE,
+    # key_source=KS_SIGSTORE) unreachable. Enumerating valid=False
+    # here would explore a state the issuer cannot emit (and would
+    # spuriously trip audit.tla's I5, which is written over
+    # pkg.ws_sig.valid). Pinning True imports the producer constraint,
+    # matching the end-to-end composition the deployed pipeline
+    # guarantees.
+    for claimed_fp in [NONE, FP_A, FP_B]:
+        for results_hash in ["h1", "h2"]:
+            pkgs.append({
+                "bundle": ABSENT,
+                "ws_sig": {
+                    "signing_key_fp": FP_A,
+                    "claimed_fp": claimed_fp,
+                    "message_hash": results_hash,
+                    "valid": True,
+                    "key_source": "customer_dsse",
+                },
+                "results_hash": results_hash,
+                "results_canonical_hash": "h1",
+                "bundle_bind_hash": None,
+                "bundle_bind_signature": None,
+            })
+
     # Real-Fulcio-bundle packages (only enumerated when CI provides
     # OIDC; otherwise these rows aren't generated). The bundle's SAN
     # and issuer are filled in lazily at materialisation time using
@@ -1088,6 +1250,34 @@ def _pin_args(pins: dict) -> list[str]:
     return args
 
 
+def _customer_key_args(tmp_path, pkg: dict) -> list[str]:
+    """Audit-side `--expected-customer-key` arg for customer_dsse rows.
+
+    The customer-DSSE path's entire trust basis is the auditor pinning
+    the customer's public-key fingerprint out-of-band; the CLI fails
+    closed without `--expected-customer-key`, so every materialised
+    customer_dsse row must supply it. Unlike SAN/issuer/workspace pins,
+    this is a property of the package's signing path (not the abstract
+    Pins cross-product), so it's derived from `pkg` here rather than
+    from the Pins enumeration. Writes the pinned customer PUBLIC key
+    PEM to a temp file and returns the CLI flag pointing at it.
+
+    Returns an empty list for non-customer_dsse rows.
+    """
+    ws = pkg.get("ws_sig")
+    if ws is ABSENT or ws is None:
+        return []
+    if ws.get("key_source") != "customer_dsse":
+        return []
+    pem = KEY_CUSTOMER.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    key_path = tmp_path / "expected_customer_key.pem"
+    key_path.write_bytes(pem)
+    return ["--expected-customer-key", str(key_path)]
+
+
 def _pkg_id(pkg: dict) -> str:
     if pkg["bundle"] is ABSENT:
         bundle = "no-bnd"
@@ -1103,7 +1293,22 @@ def _pkg_id(pkg: dict) -> str:
         ws = "no-ws"
     else:
         w = pkg["ws_sig"]
-        ws = f"ws({w['signing_key_fp'][:4]},c={w['claimed_fp'][:4] if w['claimed_fp'] else 'N'},v={int(w['valid'])})"
+        # Short key_source tag keeps parametrize IDs unique: the
+        # customer_dsse no-bundle rows would otherwise collide with the
+        # legacy no-bundle rows (same fp/claimed/valid/rh/bb), which
+        # pytest rejects. legacy→"lg", sigstore→"ss",
+        # customer_dsse→"cd", unverifiable_orphan→"or".
+        _ks_tag = {
+            "legacy": "lg",
+            "sigstore": "ss",
+            "customer_dsse": "cd",
+            "unverifiable_orphan": "or",
+        }.get(w.get("key_source", "legacy"), w.get("key_source", "legacy"))
+        ws = (
+            f"ws({w['signing_key_fp'][:4]},"
+            f"c={w['claimed_fp'][:4] if w['claimed_fp'] else 'N'},"
+            f"v={int(w['valid'])},k={_ks_tag})"
+        )
     bb_hash = pkg.get("bundle_bind_hash")
     bb_sig = pkg.get("bundle_bind_signature")
     bb_hash_id = "N" if bb_hash is None else bb_hash
@@ -1135,6 +1340,66 @@ def _pins_id(pins: dict) -> str:
     return f"san={san},iss={iss},ws={ws},mid={mid},csha={csha}"
 
 
+def _skip_outside_modeled_domain(pkg: dict, pins: dict) -> None:
+    """Assert customer_dsse rows only under the no-pin slice.
+
+    The just-updated `audit.tla` (commit "model customer_dsse
+    key-source in the public formal proofs") models KS_CUSTOMER_DSSE
+    by adding it to exactly three workspace-signature skip sets:
+    the claimed-fp metadata skip, the ws_sig.valid skip, and I9's
+    skip set. It deliberately left it OUT of the UNVERIFIED
+    "no-evidence" set, and it touched NOTHING else. In particular the
+    pin-driven branches — I1 (SAN / predicate pin is binding), I7
+    (SAN-less co-pin is USAGE_ERROR), and the --expected-workspace-key
+    branch — remain key_source-unconditional in the spec.
+    `audit_spec()` mirrors all of that faithfully.
+
+    The real `audit` CLI's customer-DSSE code path, by contrast,
+    routes the row entirely through the offline DSSE verifier whose
+    sole identity gate is `--expected-customer-key`: it does not
+    engage the SAN pin (there is no Sigstore bundle to bind it to),
+    honors the customer-key carve-out of the SAN-less-co-pin usage
+    error, and does not consult `--expected-workspace-key`. So under
+    any SAN / issuer / model_id / commit_sha / workspace_fp pin the
+    spec (as written) and the implementation legitimately disagree —
+    a gap in audit.tla's pin clauses, not in the code, and closing it
+    would mean editing audit.tla (out of scope for this mirror sync).
+
+    Faithfulness rule: the mirror must match audit.tla exactly and
+    every asserted row must be green. The pin-driven properties (I1,
+    I7, workspace-fp) are already exhaustively exercised by the
+    9000+ non-customer_dsse rows. The customer_dsse rows exist to
+    exercise the three skip sets the spec commit actually added — and
+    those are fully and non-vacuously exercised on the no-pin slice
+    (claimed_fp mismatch, ws_sig.valid=False, and the I9 refinement
+    are all reached there). So customer_dsse rows are asserted only
+    when no pin is set; pinned cells are skipped as outside the
+    portion of audit.tla that models this key_source.
+    """
+    ws = pkg.get("ws_sig")
+    if ws is ABSENT or ws is None:
+        return
+    if ws.get("key_source") != "customer_dsse":
+        return
+    if (
+        pins.get("san") is not None
+        or pins.get("issuer_explicit") is not None
+        or pins.get("model_id") is not None
+        or pins.get("commit_sha") is not None
+        or pins.get("workspace_fp") is not None
+    ):
+        pytest.skip(
+            "customer_dsse + pin: audit.tla models this key_source only "
+            "via the three workspace-sig skip sets it added (claimed-fp, "
+            "ws_sig.valid, I9); its pin-driven branches (I1 / I7 / "
+            "workspace-fp) stay key_source-unconditional while the CLI's "
+            "customer-DSSE path gates identity solely on "
+            "--expected-customer-key. Pin-driven properties are covered "
+            "by the non-customer_dsse rows; the skip sets are exercised "
+            "non-vacuously on the no-pin slice."
+        )
+
+
 # --- Tests --------------------------------------------------------------
 
 
@@ -1158,10 +1423,16 @@ def test_implementation_matches_spec(tmp_path, pkg, pins):
     """
     pkg_resolved = _resolve_bundle_san(pkg)
     pins_resolved = _resolve_pins_san(pins)
+    _skip_outside_modeled_domain(pkg_resolved, pins_resolved)
     expected = audit_spec(pkg_resolved, pins_resolved)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
-    result = runner.invoke(main, ["audit", path] + _pin_args(pins_resolved))
+    result = runner.invoke(
+        main,
+        ["audit", path]
+        + _pin_args(pins_resolved)
+        + _customer_key_args(tmp_path, pkg_resolved),
+    )
     actual = _classify(result)
     assert actual == expected, (
         f"Spec/impl divergence:\n"
@@ -1185,9 +1456,15 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     """
     pkg_resolved = _resolve_bundle_san(pkg)
     pins = _resolve_pins_san(pins)
+    _skip_outside_modeled_domain(pkg_resolved, pins)
     path = _materialise(tmp_path, pkg_resolved)
     runner = CliRunner()
-    result = runner.invoke(main, ["audit", path] + _pin_args(pins))
+    result = runner.invoke(
+        main,
+        ["audit", path]
+        + _pin_args(pins)
+        + _customer_key_args(tmp_path, pkg_resolved),
+    )
     verdict = _classify(result)
 
     # I7 — any co-pin (issuer, model_id, commit_sha) without SAN is
@@ -1293,14 +1570,18 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
 
     # I9 (refined) — VERIFIED ⇒ every present signature is valid,
     # EXCEPT when the ws_sig carries key_source ∈ {sigstore,
-    # unverifiable_orphan}. Sigstore-tagged ws_sig is the issuer's
-    # redundant notarization (bundle is the trust anchor; the ws_sig
-    # signature is intentionally not re-verified). Orphan-tagged
+    # customer_dsse, unverifiable_orphan}. Sigstore-tagged ws_sig is
+    # the issuer's redundant notarization (bundle is the trust anchor;
+    # the ws_sig signature is intentionally not re-verified).
+    # customer_dsse-tagged ws_sig: the offline-verified customer-signed
+    # DSSE Statement is the trust anchor — same trust-anchor class as
+    # sigstore; the envelope ws_sig is not re-verified. Orphan-tagged
     # ws_sig has signing_key_fp by definition not in the issuer's
     # published key set; ws_sig.valid is "unknown" rather than
-    # "invalid". For both, the verdict relies on the bundle path —
-    # which I9 still requires valid below. Mirrors the audit.tla
-    # I9_AllPresentSignaturesValid refinement.
+    # "invalid". For all three, ws_sig.valid is not part of the
+    # VERIFIED preconditions. Mirrors the audit.tla
+    # I9_AllPresentSignaturesValid refinement (skip set
+    # {KS_SIGSTORE, KS_CUSTOMER_DSSE, KS_ORPHAN}).
     if verdict == "VERIFIED":
         if pkg_resolved["bundle"] is not ABSENT:
             assert pkg_resolved["bundle"]["valid"], (
@@ -1309,7 +1590,7 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             )
         if pkg_resolved["ws_sig"] is not ABSENT:
             ws_ks = pkg_resolved["ws_sig"].get("key_source", "legacy")
-            if ws_ks not in ("sigstore", "unverifiable_orphan"):
+            if ws_ks not in ("sigstore", "customer_dsse", "unverifiable_orphan"):
                 assert pkg_resolved["ws_sig"]["valid"], (
                     f"I9 violated: VERIFIED with invalid ws_sig present "
                     f"(key_source={ws_ks!r})\n"
