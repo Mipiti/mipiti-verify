@@ -132,6 +132,7 @@ class MipitiClient:
         signature: str = "",
         signed_hash: str = "",
         content_hash: str = "",
+        dsse_bundle: str = "",
     ) -> dict[str, Any]:
         """POST /api/models/{id}/verification/results
 
@@ -142,6 +143,12 @@ class MipitiClient:
 
         Self-hosted deployments without OIDC supply `signature` + `signed_hash`
         produced with a workspace ECDSA key instead.
+
+        Air-gapped / non-Sigstore CI supplies `dsse_bundle` — a self-contained
+        customer-keyed DSSE attestation (standard DSSE / in-toto, signed
+        offline with the customer's ECDSA P-256 key). The backend verifies it
+        against the customer's registered workspace public key and stores it
+        opaquely in the audit envelope; no network at sign or verify time.
         """
         body: dict[str, Any] = {
             "pipeline": pipeline,
@@ -154,6 +161,8 @@ class MipitiClient:
             body["signature"] = signature
         if signed_hash:
             body["signed_hash"] = signed_hash
+        if dsse_bundle:
+            body["dsse_bundle"] = dsse_bundle
 
         resp = self._client.post(
             f"/api/models/{model_id}/verification/results",

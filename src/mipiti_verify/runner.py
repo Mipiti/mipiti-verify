@@ -14,6 +14,9 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .client import MipitiClient
+from .customer_dsse_signer import (
+    sign_verification_statement as sign_customer_dsse_statement,
+)
 from .sigstore_signer import sign_verification_statement
 from .verifiers import get_verifier
 from .workspace_key_signer import WorkspaceKeySigner
@@ -76,6 +79,8 @@ class Runner:
         sigstore_tuf_url: str | None = None,
         sigstore_trust_config_path: str | None = None,
         workspace_signing_key_path: str | None = None,
+        customer_key_path: str | None = None,
+        customer_key_passphrase: str | None = None,
         signing_prefer: str = "sigstore",
         require_attestation: bool = False,
         dry_run: bool = False,
@@ -129,6 +134,24 @@ class Runner:
                 # explicit signing intent.
                 raise ValueError(f"--workspace-signing-key load failed: {e}") from e
 
+        # Customer-keyed offline DSSE signer. Used for air-gapped and
+        # non-Sigstore CI (Jenkins, self-managed/older GitLab,
+        # Buildkite/CircleCI without OIDC, regulated networks) that cannot
+        # reach Sigstore at sign time. When a customer key is supplied it
+        # is the *preferred* path (before Sigstore) — the operator has
+        # explicitly opted into the customer-controlled, offline-verifiable
+        # attestation. Auto-detected from MIPITI_CUSTOMER_SIGNING_KEY /
+        # MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE when the CLI flags are
+        # omitted, mirroring the other signer auto-detect patterns. The
+        # PEM is read lazily at sign time so a bad passphrase surfaces a
+        # clear error rather than silently submitting unsigned.
+        self.customer_key_path = customer_key_path or os.environ.get(
+            "MIPITI_CUSTOMER_SIGNING_KEY", ""
+        ) or None
+        self.customer_key_passphrase = customer_key_passphrase or os.environ.get(
+            "MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE", ""
+        ) or None
+
         prefer = (signing_prefer or "sigstore").lower()
         if prefer not in ("sigstore", "workspace"):
             raise ValueError(
@@ -164,6 +187,40 @@ class Runner:
             )
             return "", ""
 
+    def _sign_with_customer_key(
+        self,
+        *,
+        model_id: str,
+        tier: int,
+        content_hash: str,
+        pipeline: dict[str, Any],
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> str:
+        """Build a customer-keyed offline DSSE bundle for this tier's run.
+
+        Returns the bundle JSON, or ``""`` when no customer key is
+        configured. A bad key / passphrase is a hard error — surfacing it
+        as a silent fall-through to "submit unsigned" would defeat the
+        operator's explicit signing intent (same contract as the
+        workspace-key load error).
+        """
+        if not self.customer_key_path:
+            return ""
+        try:
+            return sign_customer_dsse_statement(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+                key_path=self.customer_key_path,
+                passphrase=self.customer_key_passphrase,
+            )
+        except ValueError as e:
+            raise ValueError(f"--customer-key signing failed: {e}") from e
+
     def _choose_attestation(
         self,
         *,
@@ -173,16 +230,37 @@ class Runner:
         pipeline: dict[str, Any],
         assertions: list[dict[str, Any]],
         results: list[dict[str, Any]],
-    ) -> tuple[str, str, str]:
-        """Pick the attestation path per ``signing_prefer`` precedence.
+    ) -> tuple[str, str, str, str]:
+        """Pick the attestation path per precedence.
 
-        Returns ``(bundle, signature, signed_hash)`` — exactly one of
-        ``bundle`` or (``signature`` + ``signed_hash``) is populated when
-        signing succeeds; all empty when no signer is available or both
-        signers fail. Sigstore wins by default; ``signing_prefer="workspace"``
-        forces the workspace-ECDSA path even when an OIDC token is present.
+        Returns ``(bundle, signature, signed_hash, dsse_bundle)`` — exactly
+        one of ``dsse_bundle``, ``bundle``, or (``signature`` +
+        ``signed_hash``) is populated when signing succeeds; all empty when
+        no signer is available or every signer fails.
+
+        Precedence: when a customer key is supplied, the customer-keyed
+        offline DSSE path wins (the operator explicitly opted into the
+        customer-controlled, offline-verifiable attestation). Otherwise
+        Sigstore wins by default; ``signing_prefer="workspace"`` forces the
+        workspace-ECDSA path even when an OIDC token is present.
         """
-        bundle, signature, signed_hash = "", "", ""
+        bundle, signature, signed_hash, dsse_bundle = "", "", "", ""
+
+        if self.customer_key_path:
+            dsse_bundle = self._sign_with_customer_key(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=assertions,
+                results=results,
+            )
+            if dsse_bundle:
+                if self.verbose:
+                    console.print(
+                        f"  [dim]Tier {tier} attestation: customer-dsse (offline)[/dim]"
+                    )
+                return "", "", "", dsse_bundle
 
         if self.oidc_token and self.signing_prefer != "workspace":
             bundle = self._sign_with_sigstore(
@@ -196,7 +274,7 @@ class Runner:
             if bundle:
                 if self.verbose:
                     console.print(f"  [dim]Tier {tier} attestation: sigstore[/dim]")
-                return bundle, "", ""
+                return bundle, "", "", ""
             # Sigstore failed — fall through to workspace key if available.
 
         if self.workspace_signer is not None:
@@ -204,23 +282,25 @@ class Runner:
             if signature:
                 if self.verbose:
                     console.print(f"  [dim]Tier {tier} attestation: workspace-ecdsa[/dim]")
-                return "", signature, signed_hash
+                return "", signature, signed_hash, ""
 
         if self.require_attestation:
             raise AttestationRequiredError(
                 "No attestation available for this run "
                 f"(tier {tier}) and --require-attestation is set. "
-                "Configure either an OIDC token (CI environment with "
-                "id-token: write) for Sigstore signing, or "
-                "--workspace-signing-key (env: "
+                "Configure one of: a customer-keyed offline DSSE key "
+                "(--customer-key, env: MIPITI_CUSTOMER_SIGNING_KEY) for "
+                "air-gapped / non-Sigstore CI; an OIDC token (CI "
+                "environment with id-token: write) for Sigstore signing; "
+                "or --workspace-signing-key (env: "
                 "MIPITI_WORKSPACE_SIGNING_KEY) for workspace-ECDSA "
-                "signing. Both signers attempted; both unavailable or "
-                "failed."
+                "signing. All available signers attempted; none "
+                "produced an attestation."
             )
 
         if self.verbose:
             console.print(f"  [dim]Tier {tier} attestation: none (submitting unsigned)[/dim]")
-        return "", "", ""
+        return "", "", "", ""
 
     def _sign_with_sigstore(
         self,
@@ -328,7 +408,7 @@ class Runner:
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t1_assertions, t1_results)
-            bundle, signature, signed_hash = self._choose_attestation(
+            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
                 model_id=model_id,
                 tier=1,
                 content_hash=content_hash,
@@ -344,6 +424,7 @@ class Runner:
                 signature=signature,
                 signed_hash=signed_hash,
                 content_hash=content_hash,
+                dsse_bundle=dsse_bundle,
             )
             t1_run_id = resp.get("run_id", "")
 
@@ -354,7 +435,7 @@ class Runner:
         t2_run_id = ""
         if t2_results and not self.dry_run and not self._developer_key:
             content_hash = compute_content_hash(t2_assertions, t2_results)
-            bundle, signature, signed_hash = self._choose_attestation(
+            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
                 model_id=model_id,
                 tier=2,
                 content_hash=content_hash,
@@ -370,6 +451,7 @@ class Runner:
                 signature=signature,
                 signed_hash=signed_hash,
                 content_hash=content_hash,
+                dsse_bundle=dsse_bundle,
             )
             t2_run_id = resp.get("run_id", "")
 
