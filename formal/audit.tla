@@ -614,6 +614,47 @@ InitBase ==
             (/\ pkg.ws_sig.dsse_predicate_model_id = NONE
              /\ pkg.ws_sig.dsse_predicate_commit_sha = NONE
              /\ pkg.ws_sig.customer_key_fp_match = TRUE)))
+    \* Customer-DSSE relation-class canonicalisation (generation-time
+    \* twin of the AuditView reduction). A TLC `VIEW` collapses the
+    \* *seen/queue* set but TLC still *generates* every raw InitBase
+    \* tuple — and the customer_dsse predicate × pin cross-product is
+    \* the residual generation blow-up. By the SAME faithfulness
+    \* property the AuditView VIEW relies on (machine-proven by
+    \* formal/check_audit_view_faithful.py): every invariant —
+    \* transitively through Audit — observes dsse_predicate_model_id /
+    \* dsse_predicate_commit_sha ONLY via (in)equality against
+    \* pins.model_id / pins.commit_sha, so a customer_dsse row's
+    \* verdict is a function of the 3-valued relation token
+    \*   Rel3(dsse_predicate_*, pins.*) ∈ {q_none, match, mismatch}
+    \* alone, NOT of the predicate's identity. It therefore suffices
+    \* to GENERATE one canonical representative of each reachable
+    \* relation class instead of the full predicate domain:
+    \*   - pins.* = NONE  ⇒ relation is `q_none` for every predicate
+    \*     value ⇒ pin the predicate to NONE (1 rep, was 3).
+    \*   - pins.* # NONE   ⇒ only `match` (predicate = pin) and
+    \*     `mismatch` are reachable; NONE is a canonical mismatch
+    \*     witness (NONE # any non-NONE pin), so the predicate ranges
+    \*     over {pins.*, NONE} — exactly the two classes, 2 reps
+    \*     (was 3). Any other mismatch value is relation-equivalent to
+    \*     the NONE witness and, by the proven faithfulness, yields an
+    \*     identical verdict on every invariant — so dropping it from
+    \*     *generation* is lossless, not merely dedup-equivalent.
+    \* This is the standard canonical-representative InitBase pruning
+    \* (same pattern as the dead-field pins above), certified lossless
+    \* by the AuditView AST proof rather than asserted. The VIEW is
+    \* retained: it is the formal lossless artifact under review and
+    \* still collapses the residual successor/seen-set space.
+    /\ (pkg.ws_sig # ABSENT /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+        => /\ (pins.model_id = NONE
+               => pkg.ws_sig.dsse_predicate_model_id = NONE)
+           /\ (pins.model_id # NONE
+               => pkg.ws_sig.dsse_predicate_model_id
+                    \in {pins.model_id, NONE})
+           /\ (pins.commit_sha = NONE
+               => pkg.ws_sig.dsse_predicate_commit_sha = NONE)
+           /\ (pins.commit_sha # NONE
+               => pkg.ws_sig.dsse_predicate_commit_sha
+                    \in {pins.commit_sha, NONE}))
 
 \* Init_main — Config 1 init for audit_main.cfg.
 \*
@@ -1148,5 +1189,122 @@ ConfigBindInvariants ==
 TypeOK ==
     /\ pkg \in Package
     /\ pins \in Pins
+
+(***************************************************************************)
+(* AuditView — a provably lossless TLC VIEW that collapses the             *)
+(* customer_dsse-specific identity cross-product.                          *)
+(*                                                                          *)
+(* Problem. The customer_dsse modeling added three WSSig fields —           *)
+(* `customer_key_fp_match`, `dsse_predicate_model_id`,                      *)
+(* `dsse_predicate_commit_sha`. On a customer_dsse row the auditor's        *)
+(* model_id / commit_sha pins are cross-checked against the                 *)
+(* customer-signed DSSE predicate (the dsse_predicate_* fields), so the     *)
+(* state space carries the FULL product                                     *)
+(* (dsse_predicate_model_id × pins.model_id) ×                              *)
+(* (dsse_predicate_commit_sha × pins.commit_sha) × customer_key_fp_match    *)
+(* = 3·3 · 3·3 · 2 = 162 raw combinations on the configured constants,      *)
+(* multiplied into the rest of the audit space. TLC explodes.               *)
+(*                                                                          *)
+(* Key observation (soundness basis). Every invariant in both .cfgs'        *)
+(* INVARIANTS list — and the `Audit` operator itself — observes these       *)
+(* collapsed fields ONLY through (in)equality relations, never through      *)
+(* their identities:                                                        *)
+(*                                                                          *)
+(*   * `customer_key_fp_match` is a BOOLEAN used as a boolean (the          *)
+(*     terminal-dispatch `~customer_key_fp_match ⇒ FAILED` clause;          *)
+(*     V5a's `~customer_key_fp_match`; V5b's `customer_key_fp_match`).      *)
+(*   * `dsse_predicate_model_id` is read ONLY as                            *)
+(*     `dsse_predicate_model_id # q.model_id` (Audit's customer_dsse        *)
+(*     model-id branch) and `dsse_predicate_model_id = pins.model_id`       *)
+(*     (V5b). Both are equality tests against `q.model_id`, themselves      *)
+(*     guarded by `q.model_id # NONE`. The verdict therefore depends only   *)
+(*     on which of three classes the pair (dsse_predicate_model_id,         *)
+(*     q.model_id) falls in: q_none / match / mismatch.                     *)
+(*   * `dsse_predicate_commit_sha` — symmetric, same three classes.         *)
+(*                                                                          *)
+(* So a customer_dsse row's contribution to every invariant FACTORS         *)
+(* THROUGH the tuple                                                        *)
+(*   <customer_key_fp_match,                                                 *)
+(*    Rel3(dsse_predicate_model_id,  q.model_id),                           *)
+(*    Rel3(dsse_predicate_commit_sha, q.commit_sha)>                        *)
+(* — 2·3·3 = 18 observable classes instead of 162. `check_audit_view_*`     *)
+(* mechanically PROVES the "factors through" claim by an AST walk over      *)
+(* the cfg invariants' operator-call graph (every collapsed-field           *)
+(* reference must be inside `=` / `#` / `/=` or be a boolean-as-boolean).   *)
+(*                                                                          *)
+(* Key-source conditionality (the soundness-critical part). The collapse    *)
+(* is applied ONLY on customer_dsse rows. On every NON-customer_dsse row    *)
+(* (and when ws_sig is ABSENT) the view is the IDENTITY on these fields,    *)
+(* because:                                                                  *)
+(*                                                                          *)
+(*   * `dsse_predicate_*` / `customer_key_fp_match` are already pinned to   *)
+(*     canonical dead-field sentinels for every non-customer_dsse row by    *)
+(*     InitBase — collapsing them there is a no-op anyway, but the view     *)
+(*     keeps them verbatim so the proof obligation is local.                *)
+(*   * `pins.model_id` / `pins.commit_sha` are LOAD-BEARING by IDENTITY     *)
+(*     off the customer_dsse path: I12/I13 assert                           *)
+(*     `bundle.predicate_model_id = pins.model_id` and Audit's              *)
+(*     bundle-predicate branches compare the *Sigstore bundle* predicate    *)
+(*     to `q.model_id`. Collapsing pins.model_id/commit_sha globally would  *)
+(*     conflate states the Sigstore-pin invariants distinguish — UNSOUND.   *)
+(*     A customer_dsse row has `bundle = ABSENT` (KeySourceResolver R12,    *)
+(*     imported in InitBase), so the bundle-predicate branches are          *)
+(*     vacuous there and collapsing pins.model_id/commit_sha on THAT row    *)
+(*     is observationally inert for the Sigstore-pin invariants.            *)
+(*                                                                          *)
+(* Net: AuditView collapses ONLY the customer_dsse-specific redundancy and  *)
+(* is the literal identity on every Sigstore / platform / workspace /       *)
+(* orphan / legacy state. Two states with the same AuditView agree on       *)
+(* every cfg invariant (the AST proof) ⇒ the VIEW is lossless by            *)
+(* construction; the mutation test corroborates empirically.                *)
+(***************************************************************************)
+
+\* Three-valued relation token for an (envelope-predicate, auditor-pin)
+\* pair. q = NONE means the pin is unset (the pin-guarded branches are
+\* vacuous); otherwise the only thing any invariant or the Audit
+\* operator observes is whether the predicate equals the pin.
+Rel3(predicate_val, pin_val) ==
+    IF pin_val = NONE THEN "q_none"
+    ELSE IF predicate_val = pin_val THEN "match"
+    ELSE "mismatch"
+
+AuditView ==
+    IF IsCustomerDsse(pkg)
+    THEN \* Customer_dsse row: project the model_id / commit_sha
+         \* identities to their observable 3-valued relation classes
+         \* and the fp-match flag verbatim; keep EVERY other
+         \* observable field of pkg/pins verbatim. `pkg.bundle` is
+         \* ABSENT here (R12 / InitBase), so bundle_bind_* and the
+         \* bundle record are already at canonical sentinels.
+         << \* --- pkg with the two dsse predicate identities + the
+            \*     two collapsed pin identities replaced by tokens ---
+            [ bundle                 |-> pkg.bundle,
+              results_hash           |-> pkg.results_hash,
+              results_canonical_hash |-> pkg.results_canonical_hash,
+              bundle_bind_hash       |-> pkg.bundle_bind_hash,
+              bundle_bind_signature  |-> pkg.bundle_bind_signature,
+              ws_sig_signing_key_fp  |-> pkg.ws_sig.signing_key_fp,
+              ws_sig_claimed_fp      |-> pkg.ws_sig.claimed_fp,
+              ws_sig_message_hash    |-> pkg.ws_sig.message_hash,
+              ws_sig_valid           |-> pkg.ws_sig.valid,
+              ws_sig_key_source      |-> pkg.ws_sig.key_source,
+              \* collapsed: boolean kept verbatim
+              customer_key_fp_match  |-> pkg.ws_sig.customer_key_fp_match,
+              \* collapsed: (dsse predicate, pin) -> 3-valued token
+              model_id_rel    |-> Rel3(pkg.ws_sig.dsse_predicate_model_id,
+                                       pins.model_id),
+              commit_sha_rel  |-> Rel3(pkg.ws_sig.dsse_predicate_commit_sha,
+                                       pins.commit_sha) ],
+            \* --- pins with the two collapsed identities dropped
+            \*     (folded into the tokens above); the rest verbatim ---
+            [ san             |-> pins.san,
+              issuer_explicit |-> pins.issuer_explicit,
+              workspace_fp    |-> pins.workspace_fp ] >>
+    ELSE \* Every non-customer_dsse state (incl. ws_sig = ABSENT):
+         \* the view is the IDENTITY. pins.model_id / pins.commit_sha
+         \* and the bundle predicate are load-bearing by identity for
+         \* I12/I13 and Audit's Sigstore bundle-predicate branches —
+         \* collapsing here would be UNSOUND, so we do not.
+         << pkg, pins >>
 
 ====

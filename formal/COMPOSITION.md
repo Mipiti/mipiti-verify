@@ -205,3 +205,152 @@ Config 1's partition, and `ConfigMainCompositionLemma` (premise
 refinement therefore introduces no new `bundle_bind`-dependent premise
 or conclusion, so the partition argument and
 `ConfigMainCompositionLemma` above remain sound unchanged.
+
+## `AuditView` — lossless customer_dsse state-space reduction
+
+The `customer_dsse` modeling added three `WSSig` fields —
+`customer_key_fp_match : BOOLEAN`,
+`dsse_predicate_model_id : ModelIds ∪ {NONE}`,
+`dsse_predicate_commit_sha : CommitShas ∪ {NONE}`. On a customer_dsse
+row the auditor's `model_id` / `commit_sha` pins are cross-checked
+against the customer-signed DSSE predicate (the `dsse_predicate_*`
+fields), so the reachable state space carries the **full
+cross-product**
+
+```
+(dsse_predicate_model_id × pins.model_id)
+  × (dsse_predicate_commit_sha × pins.commit_sha)
+  × customer_key_fp_match
+= 3·3 · 3·3 · 2 = 162 raw combinations
+```
+
+multiplied into the rest of the audit space, on top of the already
+symmetry-reduced graph. With this product present, TLC on
+`audit_main.cfg` / `audit_bundle_bind.cfg` ran 2h+ with no progress
+checkpoint (effectively non-terminating in CI).
+
+### The reduction
+
+`AuditView` (defined in `audit.tla`, wired via `VIEW AuditView` in
+both cfgs) is a **key-source-conditional** TLC view:
+
+- **On a `customer_dsse` row** (`IsCustomerDsse(pkg)`): it projects
+  the pair `(dsse_predicate_model_id, pins.model_id)` to a 3-valued
+  relation token via `Rel3` — `q_none` (pin unset) / `match` /
+  `mismatch` — does the same for `(dsse_predicate_commit_sha,
+  pins.commit_sha)`, keeps `customer_key_fp_match` verbatim (a
+  boolean), and keeps **every other observable field of `pkg`/`pins`
+  verbatim**. The 162-way raw product collapses to
+  `2·3·3 = 18` observable classes.
+- **On every NON-customer_dsse state** (and when `ws_sig = ABSENT`):
+  the view is the **identity** `<<pkg, pins>>`.
+
+### Why identity off the customer_dsse path (soundness)
+
+Collapsing `pins.model_id` / `pins.commit_sha` *globally* would be
+**unsound**: `I12` / `I13` assert
+`bundle.predicate_model_id = pins.model_id` (resp. commit_sha) and
+`Audit`'s Sigstore bundle-predicate branches compare the *bundle*
+predicate to `q.model_id` *by identity*. A global collapse would
+conflate states those Sigstore-pin invariants distinguish, hiding
+real violations. `AuditView` therefore collapses
+`pins.model_id`/`commit_sha` **only on a customer_dsse row**, where
+`bundle = ABSENT` (KeySourceResolver `R12`, imported in `InitBase`)
+makes every bundle-predicate branch vacuous — so the collapse is
+observationally inert for the Sigstore-pin invariants. On every
+Sigstore / platform / workspace / orphan / legacy state `AuditView`
+is the literal identity, so I1–I14 / V1–V4 and their Sigstore-pin
+identity uses see the unreduced state exactly as before.
+
+### Lossless by construction — the AST proof
+
+A TLC `VIEW` is lossless iff every checked invariant *factors
+through* the view (two states with the same view agree on every
+invariant). `formal/check_audit_view_faithful.py` **proves** this by
+a stdlib-only structural analysis of `audit.tla`:
+
+1. Parse every top-level operator; resolve the operator-call graph
+   transitively from the `INVARIANTS` roots of both cfgs (an
+   invariant calling a helper that touches a collapsed field counts).
+2. For every reference to a collapsed field
+   (`dsse_predicate_model_id`, `dsse_predicate_commit_sha`,
+   `customer_key_fp_match`, and the `.model_id` / `.commit_sha`
+   pins) inside any invariant-reachable operator body, classify its
+   immediate syntactic context and **assert** it is an operand of an
+   (in)equality operator (`=`, `#`, `/=`) or — for the boolean —
+   used as a boolean. Arithmetic, ordering (`<`,`>`,`<=`,`>=`),
+   function application exposing identity, and identity-distinguishing
+   set membership all FAIL. Any reference not *positively* provable
+   safe FAILS (sound over-approximation: unprovable ⇒ unsafe).
+
+Because every invariant observes the collapsed quantities **only via
+(in)equality / boolean-as-boolean**, each invariant's truth value is
+a function of the 3-valued relation token and the kept boolean —
+i.e. it factors through `AuditView`. The reduction therefore loses
+no invariant violation: it is **lossless by construction**, and the
+script is the machine-checked proof. The AST analyzer is a sound
+over-approximation (it never passes a reference it cannot prove
+safe) and is non-vacuous (a negative self-test confirms it flags an
+injected arithmetic/ordering use of a collapsed field).
+
+### Generation-time twin: the InitBase relation-class canonicalisation
+
+A TLC `VIEW` collapses the *seen / state-queue* set but TLC still
+**generates** every raw `InitBase` tuple before applying the view —
+so the customer_dsse predicate × pin cross-product remained the
+residual *generation* blow-up (init-state enumeration never reached
+the BFS phase where the view's benefit applies). `InitBase`
+therefore also pins the customer_dsse predicate fields to a
+**canonical representative of each reachable relation class**, by the
+*same* faithfulness property the AST proof establishes:
+
+- `pins.model_id = NONE` ⇒ the relation is `q_none` for every
+  predicate value ⇒ `dsse_predicate_model_id = NONE` (1 generated
+  rep, was 3).
+- `pins.model_id # NONE` ⇒ only `match`
+  (`dsse_predicate_model_id = pins.model_id`) and `mismatch` are
+  reachable; `NONE` is a canonical mismatch witness
+  (`NONE # any non-NONE pin`), so the predicate ranges over
+  `{pins.model_id, NONE}` — exactly the two classes (2 reps, was 3).
+- Symmetric for `commit_sha`.
+
+This is **lossless, not merely dedup-equivalent**: because every
+invariant's verdict is a proven function of
+`Rel3(dsse_predicate_*, pins.*)` alone (the AST proof), every dropped
+predicate value is relation-equivalent to a retained representative
+and yields an identical verdict on every invariant — so omitting it
+from *generation* changes no checked property. It is the standard
+canonical-representative `InitBase` pruning (same pattern as the
+pre-existing dead-field pins), certified by
+`check_audit_view_faithful.py` rather than asserted. The `VIEW`
+is retained — it is the formal lossless artifact under review and
+still collapses the residual successor/seen-set space; the
+`InitBase` canonicalisation is its generation-time twin so TLC
+actually terminates in tractable time.
+
+### Corroborated by a mutation test
+
+As an independent empirical check that the view does not mask
+regressions: a customer_dsse invariant is deliberately broken (the
+`Audit` terminal-dispatch clause `~customer_key_fp_match ⇒ FAILED`
+weakened so a mismatched customer key no longer fails) and TLC is
+re-run **with the view active**. TLC still reports an invariant
+violation (`V5a_CustomerDssePinMismatchFails` counterexample),
+proving the view did not hide the regression. Reverting the mutation
+restores a clean run. See the final-report record of the
+before/after TLC output.
+
+### Residual soundness assumption
+
+The faithfulness proof reasons over `audit.tla`'s source structure:
+it assumes the spec uses the standard TLA+ operators it tokenizes
+(`=`, `#`, `/=`, `\/`, `/\`, `~`, `=>`, `\in`, etc.) and does not
+hide an identity-exposing observation of a collapsed field behind a
+construct the tokenizer does not model (e.g. a user-defined operator
+that returns one of the collapsed fields unequal-tested). The
+call-graph closure and the conservative "unprovable ⇒ unsafe" rule
+bound this: a new helper that touched a collapsed field unsafely
+would have to do so via one of the classified syntactic shapes (and
+fail) or via an unmodeled construct (and the analyzer, being
+conservative on unknown contexts, fails closed). The mutation test
+provides orthogonal empirical assurance.

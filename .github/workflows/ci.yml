@@ -55,6 +55,16 @@ jobs:
       - name: Formal verification (Python BFS + cross-check)
         run: python formal/check_pipeline.py
 
+      - name: Formal verification (AuditView faithfulness — AST proof)
+        # Gates the lossless `VIEW AuditView` reduction in
+        # audit_main.cfg / audit_bundle_bind.cfg. Structurally proves
+        # every cfg invariant observes the collapsed customer_dsse
+        # fields only via (in)equality, so each factors through the
+        # view ⇒ the reduction loses no invariant violation. Sound
+        # over-approximation; fails closed on any unprovable
+        # reference. See formal/COMPOSITION.md.
+        run: python formal/check_audit_view_faithful.py
+
       - name: Download TLC
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
