@@ -152,7 +152,56 @@ On the verifier side, `audit.tla` adds `KS_CUSTOMER_DSSE` to
 customer-signed DSSE Statement, verified offline against an
 out-of-band-pinned fingerprint, is the anchor — the envelope ws_sig
 is not re-evaluated). It is added to the `KS_SIGSTORE`-style ws_sig
-skip sets and to `I9`'s skip set; it introduces no new
-`bundle_bind`-dependent premise or conclusion, so the partition
-argument and `ConfigMainCompositionLemma` above remain sound
-unchanged.
+skip sets and to `I9`'s skip set.
+
+### Customer-DSSE identity-pin scoping
+
+The customer-keyed offline DSSE path gates identity **solely** on the
+auditor's `--expected-customer-key` fingerprint pin (the
+vendor-independence gate, `customer_dsse_verifier.py` step 3). It does
+**not** engage the Sigstore-SAN identity pins (`--expected-ci-identity`
+/ the resolved-issuer pin) nor the `--expected-workspace-key` pin —
+there is no Sigstore bundle to bind a SAN to, and the customer-DSSE
+CLI branch never consults the workspace-key pin. The model_id /
+commit_sha predicate pins ARE enforced, but against the
+customer-signed DSSE predicate, not a Sigstore bundle.
+
+`audit.tla` models this with a key_source-aware refinement that is
+**additive** (no behaviour change for sigstore / platform / workspace
+/ orphan / legacy):
+
+- A `KS_CUSTOMER_DSSE` *terminal dispatch* in the `Audit` operator
+  (placed after the `I2` workspace-pin fail, mirroring the CLI's
+  `customer_dsse_handled` branch): an `--expected-customer-key`
+  fingerprint mismatch ⇒ `FAILED`; a model_id / commit_sha pin not
+  matching the customer-signed predicate ⇒ `FAILED`; otherwise the
+  key_source-independent canonical-hash check decides
+  (`VERIFIED` / `FAILED`).
+- The Sigstore-identity pin clauses are scoped out of customer_dsse:
+  `I1` (bundle-binding-pin-is-binding) and `I7`'s predicate-co-pin
+  clause carve out customer_dsse; `I4` (workspace-fp bound) carves it
+  out; the `Audit` operator's SAN-less-co-pin / I1-omission /
+  SAN-match / workspace-fp branches all gain `~IsCustomerDsse(k)`
+  guards. `I7`'s **issuer-explicit-alone** clause stays
+  key_source-unconditional (a bare `--expected-issuer` is a usage
+  error regardless of key_source).
+- Three new invariants positively state the customer_dsse pinned
+  property: **`V5a`** (a customer-key fingerprint-pin mismatch must
+  FAIL), **`V5b`** (a match + a producer-valid customer-signed DSSE
+  row + intact canonical hash + matching predicate pins ⇒ VERIFIED,
+  *even when* a SAN or workspace-fp pin is set), and **`V5c`** (a
+  customer_dsse row's verdict is invariant under the SAN pin — the
+  Sigstore-identity pins provably do not gate it).
+
+The `KS_CUSTOMER_DSSE` producer contract from `KeySourceResolver.tla`
+`R12` (the class fires only when no valid Sigstore bundle is present
+and a valid customer-signed DSSE bundle re-verifies) is imported into
+`InitBase`: a customer_dsse row has `bundle = ABSENT` and a
+producer-valid envelope ws_sig (`valid = TRUE`). Because
+`bundle = ABSENT`, `bundle_bind` is pinned `NONE/NONE` and the
+customer_dsse invariants are `bundle_bind`-independent — they live in
+Config 1's partition, and `ConfigMainCompositionLemma` (premise
+`pkg.bundle # ABSENT`) is vacuous on customer_dsse rows. The
+refinement therefore introduces no new `bundle_bind`-dependent premise
+or conclusion, so the partition argument and
+`ConfigMainCompositionLemma` above remain sound unchanged.

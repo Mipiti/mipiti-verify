@@ -361,7 +361,29 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     bundle = pkg["bundle"]
     ws_sig = pkg["ws_sig"]
 
-    # I7: --expected-issuer alone is a usage error.
+    # Customer-keyed offline DSSE discriminator. Mirrors audit.tla's
+    # IsCustomerDsse(k): a ws_sig present and tagged customer_dsse.
+    # The real CLI routes such a row entirely through the offline
+    # DSSE verifier whose sole identity gate is --expected-customer-
+    # key; the Sigstore-SAN pins and --expected-workspace-key do NOT
+    # gate it. The materialiser builds the customer-signed DSSE
+    # Statement with model_id=M1 / commit_sha=C1 and signs it with the
+    # pinned customer key, so a materialised customer_dsse row has
+    # dsse_predicate_model_id=M1, dsse_predicate_commit_sha=C1, and
+    # customer_key_fp_match=True (the auditor always supplies the
+    # matching --expected-customer-key via _customer_key_args).
+    is_customer_dsse = (
+        ws_sig is not ABSENT
+        and ws_sig.get("key_source") == "customer_dsse"
+    )
+    cd_pred_model_id = M1
+    cd_pred_commit_sha = C1
+    cd_key_fp_match = True
+
+    # I7: --expected-issuer alone is a usage error — key_source-
+    # UNCONDITIONAL (cli.py line ~1840: issuer needs a SAN to bind to
+    # regardless of key_source; --expected-customer-key does not
+    # rescue a bare issuer pin).
     if pins["issuer_explicit"] is not None and pins["san"] is None:
         return "USAGE_ERROR"
 
@@ -371,26 +393,73 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     # OIDC can craft any predicate values matching the auditor's
     # pins — the predicate pins alone don't deliver compromised-
     # platform defense (the flag's documented purpose).
+    #
+    # key_source-aware carve-out for customer_dsse: --expected-
+    # customer-key is the SAN-substitute for the customer-keyed
+    # offline DSSE path (cli.py line ~1866), so a model_id /
+    # commit_sha co-pin WITHOUT a SAN is NOT a usage error there.
     if (
         (pins.get("model_id") is not None or pins.get("commit_sha") is not None)
         and pins["san"] is None
+        and not is_customer_dsse
     ):
         return "USAGE_ERROR"
 
     # I1: any bundle-binding pin + no bundle = FAILED. SAN, model_id,
     # commit_sha all live in the bundle's signed material; omitting
     # the bundle bypasses the pin.
+    #
+    # key_source-aware carve-out for customer_dsse: the dsse_bundle
+    # IS the upstream evidence (cli.py line ~2750: a dsse-bearing
+    # package is exempt from the no-Sigstore-bundle pin gate), so a
+    # SAN / model_id / commit_sha pin + no Sigstore bundle is not
+    # pin-bypass-by-omission for that key_source.
     if (
         (pins["san"] is not None
          or pins.get("model_id") is not None
          or pins.get("commit_sha") is not None)
         and bundle is ABSENT
+        and not is_customer_dsse
     ):
         return "FAILED"
 
     # I2: workspace pin + no content_integrity = FAILED.
     if pins["workspace_fp"] is not None and ws_sig is ABSENT:
         return "FAILED"
+
+    # ---- customer_dsse terminal dispatch -------------------------
+    # Mirrors audit.tla's KS_CUSTOMER_DSSE terminal dispatch and the
+    # CLI's `customer_dsse_handled` branch: identity is gated by the
+    # --expected-customer-key fingerprint pin (step 3 of
+    # verify_customer_dsse_bundle); --expected-model-id /
+    # --expected-commit-sha are cross-checked against the CUSTOMER-
+    # signed predicate; the SAN pin and --expected-workspace-key do
+    # NOT gate this key_source. The key_source-independent canonical-
+    # hash check still applies further below (so a tampered
+    # results_hash → FAILED), reached by falling through rather than
+    # short-circuiting VERIFIED here.
+    if is_customer_dsse:
+        if not cd_key_fp_match:
+            return "FAILED"
+        if (
+            pins.get("model_id") is not None
+            and cd_pred_model_id != pins["model_id"]
+        ):
+            return "FAILED"
+        if (
+            pins.get("commit_sha") is not None
+            and cd_pred_commit_sha != pins["commit_sha"]
+        ):
+            return "FAILED"
+        # Canonical-hash mismatch is enforced uniformly for every
+        # key_source; apply it here so the customer_dsse fall-through
+        # verdict matches the CLI (h2 → FAILED, h1 → VERIFIED).
+        if (
+            pkg["results_hash"] is not None
+            and pkg["results_hash"] != pkg["results_canonical_hash"]
+        ):
+            return "FAILED"
+        return "VERIFIED"
 
     # Self-hosted SAN with no resolvable issuer = FAILED (the audit
     # cannot enforce policy.Identity without an issuer).
@@ -1341,63 +1410,38 @@ def _pins_id(pins: dict) -> str:
 
 
 def _skip_outside_modeled_domain(pkg: dict, pins: dict) -> None:
-    """Assert customer_dsse rows only under the no-pin slice.
+    """No-op: customer_dsse is now fully modeled under every pin.
 
-    The just-updated `audit.tla` (commit "model customer_dsse
-    key-source in the public formal proofs") models KS_CUSTOMER_DSSE
-    by adding it to exactly three workspace-signature skip sets:
-    the claimed-fp metadata skip, the ws_sig.valid skip, and I9's
-    skip set. It deliberately left it OUT of the UNVERIFIED
-    "no-evidence" set, and it touched NOTHING else. In particular the
-    pin-driven branches — I1 (SAN / predicate pin is binding), I7
-    (SAN-less co-pin is USAGE_ERROR), and the --expected-workspace-key
-    branch — remain key_source-unconditional in the spec.
-    `audit_spec()` mirrors all of that faithfully.
+    Previously this skipped pinned customer_dsse rows: the earlier
+    `audit.tla` modeled KS_CUSTOMER_DSSE only via the three
+    workspace-signature skip sets (claimed-fp, ws_sig.valid, I9) and
+    left its pin clauses (I1 / I7 / the SAN identity pin / the
+    --expected-workspace-key pin) key_source-UNCONDITIONAL, so the
+    spec over-broadly disagreed with the real CLI on the pinned
+    customer_dsse path (the CLI gates customer-DSSE identity solely on
+    --expected-customer-key). That public proof-vs-code gap is now
+    CLOSED: `audit.tla` was refined so the identity-pin invariants are
+    key_source-aware —
 
-    The real `audit` CLI's customer-DSSE code path, by contrast,
-    routes the row entirely through the offline DSSE verifier whose
-    sole identity gate is `--expected-customer-key`: it does not
-    engage the SAN pin (there is no Sigstore bundle to bind it to),
-    honors the customer-key carve-out of the SAN-less-co-pin usage
-    error, and does not consult `--expected-workspace-key`. So under
-    any SAN / issuer / model_id / commit_sha / workspace_fp pin the
-    spec (as written) and the implementation legitimately disagree —
-    a gap in audit.tla's pin clauses, not in the code, and closing it
-    would mean editing audit.tla (out of scope for this mirror sync).
+      - I1 / I7's predicate co-pin / the SAN-match branch / the
+        --expected-workspace-key branch are scoped OUT of
+        customer_dsse (additively: every other key_source's behaviour
+        is unchanged);
+      - the new V5a/V5b/V5c invariants positively state the
+        customer_dsse pinned property — an --expected-customer-key
+        fingerprint mismatch FAILS; a match + producer-valid
+        customer-signed DSSE row + intact canonical hash + matching
+        predicate pins VERIFIES; the Sigstore-SAN pins do not gate
+        customer_dsse.
 
-    Faithfulness rule: the mirror must match audit.tla exactly and
-    every asserted row must be green. The pin-driven properties (I1,
-    I7, workspace-fp) are already exhaustively exercised by the
-    9000+ non-customer_dsse rows. The customer_dsse rows exist to
-    exercise the three skip sets the spec commit actually added — and
-    those are fully and non-vacuously exercised on the no-pin slice
-    (claimed_fp mismatch, ws_sig.valid=False, and the I9 refinement
-    are all reached there). So customer_dsse rows are asserted only
-    when no pin is set; pinned cells are skipped as outside the
-    portion of audit.tla that models this key_source.
+    `audit_spec()` mirrors the refined operator (the customer_dsse
+    terminal dispatch + the carve-outs), so the pinned customer_dsse
+    cells now EXECUTE against the spec rather than skip — exercising
+    the pin-driven customer_dsse path non-vacuously. The function is
+    retained (still called by both test bodies) so the call sites
+    stay stable; it now intentionally does nothing.
     """
-    ws = pkg.get("ws_sig")
-    if ws is ABSENT or ws is None:
-        return
-    if ws.get("key_source") != "customer_dsse":
-        return
-    if (
-        pins.get("san") is not None
-        or pins.get("issuer_explicit") is not None
-        or pins.get("model_id") is not None
-        or pins.get("commit_sha") is not None
-        or pins.get("workspace_fp") is not None
-    ):
-        pytest.skip(
-            "customer_dsse + pin: audit.tla models this key_source only "
-            "via the three workspace-sig skip sets it added (claimed-fp, "
-            "ws_sig.valid, I9); its pin-driven branches (I1 / I7 / "
-            "workspace-fp) stay key_source-unconditional while the CLI's "
-            "customer-DSSE path gates identity solely on "
-            "--expected-customer-key. Pin-driven properties are covered "
-            "by the non-customer_dsse rows; the skip sets are exercised "
-            "non-vacuously on the no-pin slice."
-        )
+    return
 
 
 # --- Tests --------------------------------------------------------------
@@ -1467,30 +1511,82 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     )
     verdict = _classify(result)
 
-    # I7 — any co-pin (issuer, model_id, commit_sha) without SAN is
-    # a usage error.
+    # Customer-keyed offline DSSE discriminator (mirrors audit.tla's
+    # IsCustomerDsse). The identity-pin invariants below are
+    # key_source-AWARE: the SAN / predicate-co-pin / workspace-fp pin
+    # clauses are scoped OUT of customer_dsse (the CLI's customer-DSSE
+    # path gates identity solely on --expected-customer-key); the
+    # corresponding positive properties are asserted as V5a/V5b. The
+    # issuer-explicit-alone clause stays key_source-unconditional.
+    ws_cd = pkg_resolved.get("ws_sig")
+    is_cd = (
+        ws_cd is not ABSENT
+        and ws_cd is not None
+        and ws_cd.get("key_source") == "customer_dsse"
+    )
+
+    # I7 — issuer-explicit-alone (no SAN) is a usage error for EVERY
+    # key_source (cli.py line ~1840). The model_id / commit_sha
+    # co-pin clause is a usage error too, EXCEPT for customer_dsse,
+    # whose --expected-customer-key is the SAN-substitute (cli.py
+    # line ~1866).
     if pins["san"] is None and (
         pins["issuer_explicit"] is not None
-        or pins.get("model_id") is not None
-        or pins.get("commit_sha") is not None
+        or (
+            (pins.get("model_id") is not None
+             or pins.get("commit_sha") is not None)
+            and not is_cd
+        )
     ):
         assert verdict == "USAGE_ERROR", (
             f"I7 violated: pins={pins}, verdict={verdict}\n{result.output}"
         )
         return  # I7 fires first — other invariants don't apply.
 
-    # I1 — SAN pin + no bundle ⇒ FAILED.
-    if pins["san"] is not None and pkg_resolved["bundle"] is ABSENT:
+    # I1 — SAN pin + no bundle ⇒ FAILED. Scoped out of customer_dsse:
+    # the dsse_bundle is its own upstream evidence (cli.py line
+    # ~2750), so a SAN / predicate pin + no Sigstore bundle is not
+    # pin-bypass-by-omission for that key_source — see V5b.
+    if (
+        pins["san"] is not None
+        and pkg_resolved["bundle"] is ABSENT
+        and not is_cd
+    ):
         assert verdict == "FAILED", (
             f"I1 violated: pins={pins}, pkg={pkg_resolved}, verdict={verdict}\n"
             f"{result.output}"
         )
 
-    # I2 — workspace pin + no ws_sig ⇒ FAILED.
+    # I2 — workspace pin + no ws_sig ⇒ FAILED. (customer_dsse always
+    # carries a ws_sig, so this is vacuous there — left unscoped.)
     if pins["workspace_fp"] is not None and pkg_resolved["ws_sig"] is ABSENT:
         assert verdict == "FAILED", (
             f"I2 violated: pins={pins}, pkg={pkg_resolved}, verdict={verdict}\n"
             f"{result.output}"
+        )
+
+    # V5a/V5b — the customer_dsse pinned property, asserted positively
+    # against the real CLI. The materialiser always supplies the
+    # matching --expected-customer-key (via _customer_key_args) and
+    # signs the customer DSSE Statement with model_id=M1 / commit_sha
+    # =C1, so a materialised customer_dsse row has a matched key and a
+    # predicate that matches the {NONE, M1} × {NONE, C1} pin domain.
+    # The verdict is therefore VERIFIED when the canonical hash is
+    # intact (results_hash == canonical) and FAILED when it is not —
+    # INDEPENDENT of any SAN / issuer / workspace-fp pin set, proving
+    # those pins do not gate customer_dsse (V5c). --expected-issuer
+    # alone is excluded (key_source-independent USAGE_ERROR handled
+    # by the I7 return above).
+    if is_cd:
+        hash_intact = (
+            pkg_resolved["results_hash"]
+            == pkg_resolved["results_canonical_hash"]
+        )
+        expected_cd = "VERIFIED" if hash_intact else "FAILED"
+        assert verdict == expected_cd, (
+            f"V5 violated: customer_dsse pinned verdict\n"
+            f"  pkg={pkg_resolved}, pins={pins}\n"
+            f"  expected={expected_cd}, got={verdict}\n{result.output}"
         )
 
     # I3 — bundle present + pin SAN matches but bundle's actual issuer
@@ -1511,10 +1607,15 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"  resolved={_resolve_issuer(pins)}\n{result.output}"
         )
 
-    # I4 — workspace pin + signing_key_fp ≠ pinned ⇒ FAILED.
+    # I4 — workspace pin + signing_key_fp ≠ pinned ⇒ FAILED. Scoped
+    # out of customer_dsse: the customer-DSSE CLI path never consults
+    # --expected-workspace-key; its identity binding is the
+    # --expected-customer-key fingerprint pin (asserted via V5
+    # above).
     if (
         pins["workspace_fp"] is not None
         and pkg_resolved["ws_sig"] is not ABSENT
+        and not is_cd
         and pkg_resolved["ws_sig"]["signing_key_fp"] != pins["workspace_fp"]
     ):
         assert verdict == "FAILED", (

@@ -104,7 +104,36 @@ WSSig == [
     \* the pre-discriminator BFS rows continue to validate against
     \* the existing 13 invariants unchanged. KS_SIGSTORE and
     \* KS_ORPHAN unlock the V1/V2/V3 invariants below.
-    key_source     : KeySources
+    key_source     : KeySources,
+    \* --- KS_CUSTOMER_DSSE fields ---------------------------------
+    \* The customer-keyed offline DSSE path has NO Sigstore bundle by
+    \* construction (it exists precisely for air-gapped / non-Sigstore
+    \* CI). The customer-signed in-toto Statement carried in the
+    \* envelope's content_integrity.dsse_bundle is the trust anchor;
+    \* the auditor binds it out-of-band via --expected-customer-key.
+    \* These fields model the Statement + the auditor's customer-key
+    \* fingerprint pin so the spec can state the pinned property
+    \* positively. They are observable ONLY when
+    \* key_source = KS_CUSTOMER_DSSE; for every other key_source they
+    \* are pinned to canonical sentinels in InitBase (dead fields, no
+    \* enumeration cost).
+    \*
+    \* dsse_predicate_model_id / dsse_predicate_commit_sha: the
+    \* model_id / commit_sha signed inside the customer's DSSE
+    \* predicate. The verifier cross-checks --expected-model-id /
+    \* --expected-commit-sha against THESE (cli.py customer_dsse
+    \* branch), not against a Sigstore bundle predicate.
+    dsse_predicate_model_id   : ModelIds \cup {NONE},
+    dsse_predicate_commit_sha : CommitShas \cup {NONE},
+    \* customer_key_fp_match: did the key that actually signed the DSSE
+    \* bundle (recomputed SHA-256 DER-SPKI fingerprint) equal the
+    \* auditor's out-of-band --expected-customer-key fingerprint?
+    \* This is step 3 of verify_customer_dsse_bundle — THE
+    \* vendor-independence gate and the sole identity binding for this
+    \* key_source. The CLI fails closed when --expected-customer-key
+    \* is absent, so a customer_dsse row is always evaluated against
+    \* this pin; FALSE models a swapped / vendor-substituted key.
+    customer_key_fp_match     : BOOLEAN
 ]
 
 \* bundle_bind_signature outcomes — the verifier-side resolution and
@@ -209,6 +238,43 @@ ResolveIssuer(p) ==
          ELSE NONE
 
 (***************************************************************************)
+(* Customer-keyed offline DSSE: key_source-aware predicate.                 *)
+(*                                                                          *)
+(* IsCustomerDsse(k) is TRUE iff the package's content_integrity row is     *)
+(* the customer-keyed offline DSSE shape: a ws_sig present and tagged       *)
+(* KS_CUSTOMER_DSSE. The real CLI routes such a row entirely through the    *)
+(* offline DSSE verifier (cli.py `customer_dsse` branch +                   *)
+(* customer_dsse_verifier.py):                                              *)
+(*                                                                          *)
+(*   - Identity is gated SOLELY by the auditor's --expected-customer-key    *)
+(*     fingerprint pin (step 3 of verify_customer_dsse_bundle). The         *)
+(*     Sigstore-SAN identity pins (I1/I7's SAN clauses, the SAN-match       *)
+(*     branch) and the --expected-workspace-key fingerprint pin do NOT      *)
+(*     gate this key_source — there is no Sigstore bundle to bind a SAN     *)
+(*     to, and the customer-DSSE path never consults the workspace-key      *)
+(*     pin.                                                                 *)
+(*   - The predicate pins --expected-model-id / --expected-commit-sha       *)
+(*     ARE enforced, but against the CUSTOMER-signed DSSE predicate         *)
+(*     (dsse_predicate_*), not a Sigstore bundle predicate.                 *)
+(*   - --expected-customer-key satisfies the same SAN-substitute role for   *)
+(*     the SAN-less-co-pin usage error: model_id / commit_sha co-pins       *)
+(*     WITHOUT a SAN are NOT a usage error for customer_dsse (cli.py        *)
+(*     line ~1866), because the customer-key fingerprint pin binds          *)
+(*     verification to a specific key. --expected-issuer alone IS still a   *)
+(*     usage error regardless of key_source (cli.py line ~1840).            *)
+(*                                                                          *)
+(* The customer-DSSE path has no Sigstore bundle by construction; a         *)
+(* KS_CUSTOMER_DSSE row therefore always has bundle = ABSENT. This is the   *)
+(* producer contract from KeySourceResolver.tla R12 (the class fires only   *)
+(* when NO valid Sigstore bundle is present and a valid customer-signed     *)
+(* DSSE bundle re-verifies against the resolved fingerprint); InitBase      *)
+(* imports it so the consumer spec does not explore producer-impossible     *)
+(* states.                                                                  *)
+(***************************************************************************)
+IsCustomerDsse(k) ==
+    k.ws_sig # ABSENT /\ k.ws_sig.key_source = KS_CUSTOMER_DSSE
+
+(***************************************************************************)
 (* Audit: the abstract specification of what the verifier should compute.  *)
 (* The actual Python implementation is checked against this in the BFS     *)
 (* test. The cases are listed in the same order as the implementation      *)
@@ -221,25 +287,92 @@ Audit(k, q) ==
     \* the OIDC-token-holder supplies; without a SAN pin constraining
     \* whose OIDC was used, the predicate pins offer no compromised-
     \* platform defense (the flag's documented purpose).
-    IF q.san = NONE
-       /\ (q.issuer_explicit # NONE
-           \/ q.model_id # NONE
-           \/ q.commit_sha # NONE)
+    \*
+    \* key_source-aware carve-out for KS_CUSTOMER_DSSE: the customer-
+    \* keyed offline DSSE path binds verification to a specific key via
+    \* the auditor's --expected-customer-key fingerprint pin, which is
+    \* the SAN-substitute for this key_source (cli.py line ~1866). So a
+    \* model_id / commit_sha co-pin WITHOUT a SAN is NOT a usage error
+    \* for customer_dsse — the predicate is signed by the customer's
+    \* own pinned key, so the predicate pins are meaningful. But
+    \* --expected-issuer alone is STILL a usage error regardless of
+    \* key_source (cli.py line ~1840: issuer needs a SAN to bind to;
+    \* customer-key does not rescue a bare issuer pin).
+    IF q.san = NONE /\ q.issuer_explicit # NONE
+    THEN "USAGE_ERROR"
+
+    ELSE IF q.san = NONE
+       /\ (q.model_id # NONE \/ q.commit_sha # NONE)
+       /\ ~IsCustomerDsse(k)
     THEN "USAGE_ERROR"
 
     \* I1 case: SAN pin + no Sigstore bundle = FAILED (pin-bypass-by-omission).
     \* Generalised to all bundle-binding pins: model_id and commit_sha
     \* live in the bundle's signed predicate, so omitting the bundle
     \* bypasses those pins too.
+    \*
+    \* key_source-aware carve-out for KS_CUSTOMER_DSSE: a customer-keyed
+    \* offline DSSE envelope carries its OWN independent upstream
+    \* evidence (the customer-signed in-toto Statement in
+    \* content_integrity.dsse_bundle, with model_id / commit_sha in its
+    \* signed predicate). The CLI exempts a dsse-bundle-bearing package
+    \* from the no-Sigstore-bundle pin gate (cli.py line ~2750:
+    \* `not _has_dsse`) and instead enforces the predicate pins against
+    \* the customer-signed Statement in the customer_dsse branch below.
+    \* So a SAN / model_id / commit_sha pin + no Sigstore bundle is NOT
+    \* pin-bypass-by-omission for customer_dsse — the evidence is the
+    \* DSSE bundle, not a Fulcio bundle.
     ELSE IF (q.san # NONE \/ q.model_id # NONE \/ q.commit_sha # NONE)
          /\ k.bundle = ABSENT
+         /\ ~IsCustomerDsse(k)
     THEN "FAILED"
 
     \* I2 case: workspace pin + no content_integrity = FAILED.
     ELSE IF q.workspace_fp # NONE /\ k.ws_sig = ABSENT
     THEN "FAILED"
 
+    \* ---- KS_CUSTOMER_DSSE terminal dispatch -----------------------
+    \* The customer-keyed offline DSSE path is resolved here in full,
+    \* mirroring the CLI's `customer_dsse_handled` branch which routes
+    \* the row entirely through customer_dsse_verifier.py and then
+    \* skips the generic content_integrity / Sigstore dispatch. By
+    \* this point the SAN-less issuer-alone usage error (above) and the
+    \* workspace-pin-without-ws_sig fail (I2, above) have been applied;
+    \* the I1 / SAN-less-co-pin branches were carved out for
+    \* customer_dsse. What remains is the customer-DSSE contract:
+    \*
+    \*   1. Identity gate: the auditor's --expected-customer-key
+    \*      fingerprint pin must match the key that signed the DSSE
+    \*      bundle (verify_customer_dsse_bundle step 3 — the
+    \*      vendor-independence gate). Mismatch ⇒ FAILED. This is the
+    \*      SOLE identity binding for this key_source; the Sigstore-SAN
+    \*      pins and the workspace-fp pin do NOT gate it.
+    \*   2. Predicate pins: --expected-model-id / --expected-commit-sha
+    \*      are cross-checked against the CUSTOMER-signed DSSE
+    \*      predicate (dsse_predicate_*), not a Sigstore bundle.
+    \*      Mismatch ⇒ FAILED.
+    \*   3. Otherwise, with the offline-verified customer-signed
+    \*      Statement as the trust anchor and the canonical content
+    \*      hash intact, the row is VERIFIED. The key_source-independent
+    \*      results_hash canonical-hash check still applies (a tampered
+    \*      results_hash ⇒ FAILED) — it is enforced uniformly further
+    \*      below, so customer_dsse falls through to it rather than
+    \*      short-circuiting VERIFIED here.
+    ELSE IF IsCustomerDsse(k) /\ ~k.ws_sig.customer_key_fp_match
+    THEN "FAILED"
+
+    ELSE IF IsCustomerDsse(k) /\ q.model_id # NONE
+         /\ k.ws_sig.dsse_predicate_model_id # q.model_id
+    THEN "FAILED"
+
+    ELSE IF IsCustomerDsse(k) /\ q.commit_sha # NONE
+         /\ k.ws_sig.dsse_predicate_commit_sha # q.commit_sha
+    THEN "FAILED"
+
     \* Self-hosted SAN with no resolvable issuer = FAILED.
+    \* customer_dsse is exempt: there is no Sigstore bundle and the
+    \* SAN pin does not gate this key_source (the customer-key
+    \* fingerprint pin, checked above, is its identity binding).
     ELSE IF q.san # NONE /\ k.bundle # ABSENT /\ ResolveIssuer(q) = NONE
     THEN "FAILED"
 
@@ -343,7 +476,15 @@ Audit(k, q) ==
     THEN "FAILED"
 
     \* Workspace sig: pin requires recomputed signing_key_fp match.
+    \* key_source-aware carve-out for KS_CUSTOMER_DSSE: the customer-
+    \* keyed offline DSSE path never consults --expected-workspace-key
+    \* (cli.py routes the row through the offline DSSE verifier whose
+    \* sole identity gate is --expected-customer-key, applied above).
+    \* A workspace-fp pin therefore does not gate a customer_dsse row;
+    \* its identity binding is the customer-key fingerprint pin already
+    \* enforced in the terminal dispatch.
     ELSE IF k.ws_sig # ABSENT /\ q.workspace_fp # NONE
+         /\ k.ws_sig.key_source # KS_CUSTOMER_DSSE
          /\ k.ws_sig.signing_key_fp # q.workspace_fp
     THEN "FAILED"
 
@@ -437,6 +578,42 @@ InitBase ==
          /\ (\/ pkg.bundle_bind_hash = NONE
              \/ pkg.bundle.bound_hash # pkg.bundle_bind_hash))
         => pkg.bundle_bind_signature = NONE)
+    \* ---- KS_CUSTOMER_DSSE producer constraints + dead-field pin ---
+    \* Producer-side classification constraint (KeySourceResolver.tla
+    \* R12): the issuer emits key_source = KS_CUSTOMER_DSSE ONLY when
+    \* (a) no valid Sigstore bundle is present — the customer-DSSE
+    \* path exists precisely for non-Sigstore CI, and Sigstore still
+    \* wins by precedence — and (b) a valid customer-signed DSSE
+    \* bundle re-verifies against the resolved fingerprint, so the
+    \* envelope row is a well-formed signed row. Import both into the
+    \* consumer spec so the BFS does not explore producer-impossible
+    \* states (analogous to the R3a sigstore pin above): a
+    \* customer_dsse row has bundle = ABSENT and the envelope ws_sig
+    \* itself is well-formed (valid = TRUE — its validity is never
+    \* re-evaluated by the verifier on this path; KeySourceResolver
+    \* R12 only emits the class when the row is producer-valid).
+    \* customer_key_fp_match is DELIBERATELY left free: it is the
+    \* auditor's independent out-of-band --expected-customer-key pin
+    \* (not a producer property), so both match (VERIFIED) and
+    \* mismatch (a swapped / vendor-substituted key ⇒ FAILED) must be
+    \* explored to exercise the customer-DSSE identity property
+    \* non-vacuously.
+    /\ (pkg.ws_sig # ABSENT /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+        => /\ pkg.bundle = ABSENT
+           /\ pkg.ws_sig.valid = TRUE)
+    \* Dead-field pruning: the customer-DSSE Statement fields
+    \* (dsse_predicate_model_id / dsse_predicate_commit_sha) and the
+    \* customer-key fingerprint-pin outcome (customer_key_fp_match)
+    \* are read by the Audit operator ONLY on the KS_CUSTOMER_DSSE
+    \* terminal-dispatch branch. For every other key_source (and for
+    \* an absent ws_sig) they have no observable behaviour; pin them
+    \* to canonical sentinels (NONE / NONE / TRUE) so TLC does not
+    \* enumerate equivalent-output duplicates.
+    /\ (~(pkg.ws_sig # ABSENT /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE)
+        => (pkg.ws_sig = ABSENT \/
+            (/\ pkg.ws_sig.dsse_predicate_model_id = NONE
+             /\ pkg.ws_sig.dsse_predicate_commit_sha = NONE
+             /\ pkg.ws_sig.customer_key_fp_match = TRUE)))
 
 \* Init_main — Config 1 init for audit_main.cfg.
 \*
@@ -500,9 +677,23 @@ Spec == Init /\ [][Next]_vars
 \* (predicate-pin-without-SAN, issuer-without-SAN) returns
 \* USAGE_ERROR before I1's FAILED branch fires. Both verdicts are
 \* non-positive — the safety property is preserved either way.
+\*
+\* key_source scoping: this invariant governs the key_sources whose
+\* pinned material lives in a SIGSTORE bundle (sigstore / platform /
+\* workspace / orphan / legacy). KS_CUSTOMER_DSSE is excluded — it
+\* carries its OWN upstream evidence (the customer-signed in-toto
+\* Statement) and has no Sigstore bundle by construction, so
+\* "omitting the bundle" is not pin-bypass for that key_source. The
+\* corresponding positive property for customer_dsse — that its
+\* identity binding is the --expected-customer-key fingerprint pin,
+\* not a SAN / predicate-without-key pin — is stated by V5a/V5b. The
+\* exclusion is additive: I1's strength on every key_source it
+\* governed before is unchanged.
 I1_SanPinIsBinding ==
     ((pins.san # NONE \/ pins.model_id # NONE \/ pins.commit_sha # NONE)
-     /\ pkg.bundle = ABSENT)
+     /\ pkg.bundle = ABSENT
+     /\ ~(pkg.ws_sig # ABSENT
+          /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE))
     => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
 \* I2 — workspace pin requires content_integrity evidence.
@@ -530,9 +721,20 @@ I3_IssuerNeverSelfAttested ==
 \* the package's claim. Forged-key attacks must FAIL.
 \* Allows USAGE_ERROR for the same reason as I1/I2 (I7 fires first
 \* when a co-pin is set without SAN).
+\*
+\* key_source scoping: --expected-workspace-key governs the ECDSA
+\* workspace-signature path (platform / workspace / legacy) and the
+\* orphan case (V3). KS_CUSTOMER_DSSE is excluded — the customer-DSSE
+\* CLI path never consults --expected-workspace-key; its identity
+\* binding is the --expected-customer-key fingerprint pin (V5a/V5b).
+\* Pinning workspace_fp on a customer_dsse row is a no-op for that
+\* pin, not a forged-key signal, so the FAILED conclusion does not
+\* apply. The exclusion is additive: I4's strength on every
+\* key_source it governed before is unchanged.
 I4_WorkspaceFpBound ==
     (pins.workspace_fp # NONE
      /\ pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source # KS_CUSTOMER_DSSE
      /\ pkg.ws_sig.signing_key_fp # pins.workspace_fp)
     => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
@@ -554,11 +756,29 @@ I6_ContentHashBoundToResults ==
 \* error. policy.Identity needs both SAN+issuer; predicate pins
 \* without SAN deliver no compromised-platform defense because an
 \* attacker minting under their own OIDC controls the predicate.
+\*
+\* key_source scoping for the predicate co-pins: --expected-model-id
+\* / --expected-commit-sha without a SAN pin is a usage error for
+\* the Sigstore-bundle key_sources, but NOT for KS_CUSTOMER_DSSE —
+\* --expected-customer-key is the SAN-substitute for the customer-
+\* keyed offline DSSE path (cli.py line ~1866): the predicate is
+\* signed by the customer's own pinned key, so the predicate pins
+\* ARE meaningful there. The issuer-explicit-alone clause stays
+\* key_source-UNCONDITIONAL: --expected-issuer needs a SAN to bind
+\* to regardless of key_source (cli.py line ~1840), so a bare issuer
+\* pin is a usage error even for customer_dsse. V5b states the
+\* corresponding positive property (customer_dsse with matched
+\* predicate pins and a matched customer key VERIFIES). The scoping
+\* is additive: I7's strength on every key_source it governed before
+\* is unchanged for the issuer clause, and unchanged for the
+\* predicate clause on every key_source except the one the CLI
+\* explicitly carves out.
 I7_SanRequiredForCoPins ==
     (pins.san = NONE
      /\ (pins.issuer_explicit # NONE
-         \/ pins.model_id # NONE
-         \/ pins.commit_sha # NONE))
+         \/ ((pins.model_id # NONE \/ pins.commit_sha # NONE)
+             /\ ~(pkg.ws_sig # ABSENT
+                  /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE))))
     => Audit(pkg, pins) = "USAGE_ERROR"
 
 \* I8 — bundle present + positive verdict ⇒ bundle's bound_hash
@@ -756,6 +976,65 @@ V4_BundleBindSigKeyResolutionExplicit ==
      /\ pkg.bundle_bind_signature = "KEY_UNRESOLVABLE")
     => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
 
+\* V5 — Customer-keyed offline DSSE: the identity binding under a pin
+\* is the customer-key fingerprint pin, NOT the Sigstore-SAN pin nor
+\* the workspace-fp pin. This is the positive statement of the
+\* property the implementation correctly enforces (cli.py
+\* `customer_dsse` branch + customer_dsse_verifier.py step 3); the
+\* spec must model it rather than over-constrain customer_dsse with
+\* the Sigstore-identity pins it does not engage.
+\*
+\* V5a — --expected-customer-key pin MISMATCH must FAIL. The
+\* fingerprint pin is the entire trust basis for this key_source
+\* (the vendor-independence gate); a swapped / vendor-substituted
+\* customer key cannot earn a positive verdict, regardless of any
+\* SAN / issuer / workspace-fp / predicate pin the auditor set.
+V5a_CustomerDssePinMismatchFails ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+     /\ ~pkg.ws_sig.customer_key_fp_match)
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
+
+\* V5b — a matching --expected-customer-key pin, a producer-valid
+\* customer-signed DSSE row (R12), the canonical content hash intact,
+\* and any predicate pins (model_id / commit_sha) matching the
+\* customer-signed predicate ⇒ VERIFIED. Crucially, the verdict is
+\* positive EVEN WHEN a Sigstore-SAN pin or a workspace-fp pin is
+\* set: those pins do not gate customer_dsse, so they must neither
+\* vacuously over-constrain it nor wrongly reject it. (--expected-
+\* issuer alone is excluded because that is a key_source-independent
+\* usage error per cli.py line ~1840.)
+V5b_CustomerDsseKeyMatchVerifies ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+     /\ pkg.bundle = ABSENT
+     /\ pkg.ws_sig.customer_key_fp_match
+     /\ pkg.results_hash # NONE
+     /\ pkg.results_hash = pkg.results_canonical_hash
+     /\ ~(pins.san = NONE /\ pins.issuer_explicit # NONE)
+     /\ (pins.model_id # NONE
+         => pkg.ws_sig.dsse_predicate_model_id = pins.model_id)
+     /\ (pins.commit_sha # NONE
+         => pkg.ws_sig.dsse_predicate_commit_sha = pins.commit_sha))
+    => Audit(pkg, pins) = "VERIFIED"
+
+\* V5c — the Sigstore-identity pins (SAN, resolved issuer) do NOT
+\* gate customer_dsse. Concretely: a customer_dsse row's verdict is
+\* invariant under the SAN pin — substituting any SAN pin value
+\* yields the same verdict as with no SAN pin. This positively states
+\* that I1/I7's SAN clauses and the SAN-match branch are correctly
+\* scoped out of customer_dsse (they govern only the key_sources that
+\* actually carry a Sigstore bundle). The issuer-alone usage error is
+\* key_source-independent, so SAN is varied with issuer_explicit held
+\* at NONE to isolate the SAN dimension.
+V5c_CustomerDsseSanPinDoesNotGate ==
+    (pkg.ws_sig # ABSENT
+     /\ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+     /\ pins.issuer_explicit = NONE)
+    => \A alt_san \in (Identities \cup {NONE}) :
+         Audit(pkg, [pins EXCEPT !.san = alt_san])
+           = Audit(pkg, [pins EXCEPT !.san = NONE])
+
 \* C1 — Composition lemma for Config 1.
 \*
 \* Asserts that, on every state in Config 1's pinned domain, Audit's
@@ -818,6 +1097,9 @@ SecurityInvariants ==
     /\ V2_OrphanWithBundleVerified
     /\ V3_OrphanWithWorkspacePinFails
     /\ V4_BundleBindSigKeyResolutionExplicit
+    /\ V5a_CustomerDssePinMismatchFails
+    /\ V5b_CustomerDsseKeyMatchVerifies
+    /\ V5c_CustomerDsseSanPinDoesNotGate
 
 \* Config 1's invariant set: the subset of SecurityInvariants whose
 \* truth value is independent of bundle_bind on the pinned-matching
@@ -837,6 +1119,16 @@ ConfigMainInvariants ==
     /\ I12_BundleModelIdMatchesPin
     /\ I13_BundleCommitShaMatchesPin
     /\ V3_OrphanWithWorkspacePinFails
+    \* V5a/V5b/V5c — customer_dsse pinned property. customer_dsse
+    \* rows have bundle = ABSENT (R12 producer constraint imported in
+    \* InitBase), so bundle_bind is pinned NONE/NONE and these
+    \* invariants are bundle_bind-independent — Config 1's partition.
+    \* ConfigMainCompositionLemma is vacuous on customer_dsse rows
+    \* (its premise is pkg.bundle # ABSENT), so the partition
+    \* argument is unaffected.
+    /\ V5a_CustomerDssePinMismatchFails
+    /\ V5b_CustomerDsseKeyMatchVerifies
+    /\ V5c_CustomerDsseSanPinDoesNotGate
     /\ ConfigMainCompositionLemma
 
 \* Config 2's invariant set: the bundle-bind-specific invariants
