@@ -73,7 +73,7 @@ jobs:
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: VerificationPipeline reverify=true ---"
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
-          echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R10) ---"
+          echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R6, R10, R12 + R3a) ---"
           java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
         working-directory: formal
 

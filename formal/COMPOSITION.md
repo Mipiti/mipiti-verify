@@ -130,3 +130,29 @@ on `audit.tla`'s reachable state space.
 The original `audit.cfg` is retained for backward compatibility and
 periodic soundness verification (manual or scheduled run); it is not
 required on every CI tick.
+
+## Companion: resolver-side invariant index
+
+The issuer-side `KeySourceResolver.tla` carries its own invariant set
+(`R1`–`R6`, `R10`, `R12` + `R3a`), indexed in that module's header.
+The `customer_dsse` key-source classification adds **`R12` —
+Customer-DSSE binding integrity**: the `customer_dsse` class fires iff
+a stored workspace key resolves the fingerprint AND a valid
+customer-signed DSSE bundle re-verifies against it (and no valid
+Sigstore bundle is present, which still wins by precedence); it must
+carry the dsse_bundle, stored public key, and workspace id and must
+not be an orphan, while the bare-key `workspace` class must never
+carry a dsse_bundle. This is a resolver invariant, not part of the
+`audit.tla` `bundle_bind` partition above — it is checked by
+`KeySourceResolver.cfg` (and the companion Python BFS), independently
+of the two audit configs.
+
+On the verifier side, `audit.tla` adds `KS_CUSTOMER_DSSE` to
+`KeySources` in the same trust-anchor class as `KS_SIGSTORE` (the
+customer-signed DSSE Statement, verified offline against an
+out-of-band-pinned fingerprint, is the anchor — the envelope ws_sig
+is not re-evaluated). It is added to the `KS_SIGSTORE`-style ws_sig
+skip sets and to `I9`'s skip set; it introduces no new
+`bundle_bind`-dependent premise or conclusion, so the partition
+argument and `ConfigMainCompositionLemma` above remain sound
+unchanged.

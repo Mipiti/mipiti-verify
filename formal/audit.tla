@@ -41,6 +41,14 @@ CONSTANTS
                            \* and skipped during verification.
     KS_PLATFORM,           \* server-notarized; ws_sig.valid required.
     KS_WORKSPACE,          \* customer-uploaded ECDSA; ws_sig.valid required.
+    KS_CUSTOMER_DSSE,      \* customer-keyed offline DSSE attestation. The
+                           \* customer-signed in-toto Statement (verified
+                           \* offline against an out-of-band-pinned
+                           \* fingerprint) is the trust anchor; the
+                           \* envelope ws_sig is NOT re-evaluated — same
+                           \* trust-anchor class as KS_SIGSTORE. See
+                           \* KeySourceResolver.tla (KSCustomerDsse / R12)
+                           \* for the issuer-side contract.
     KS_ORPHAN,             \* fingerprint did not resolve in issuer's
                            \* published key set; ws_sig.valid is unknown.
     KS_LEGACY              \* envelope without key_source field
@@ -83,7 +91,8 @@ Bundle == [
     valid                  : BOOLEAN
 ]
 
-KeySources == {KS_SIGSTORE, KS_PLATFORM, KS_WORKSPACE, KS_ORPHAN, KS_LEGACY}
+KeySources == {KS_SIGSTORE, KS_PLATFORM, KS_WORKSPACE, KS_CUSTOMER_DSSE,
+               KS_ORPHAN, KS_LEGACY}
 
 WSSig == [
     signing_key_fp : Fingerprints,
@@ -302,15 +311,20 @@ Audit(k, q) ==
     THEN "FAILED"
 
     \* Workspace sig: claimed_fp (if present) must match signing_key_fp.
-    \* Skipped for both KS_SIGSTORE and KS_ORPHAN. KS_SIGSTORE: bundle
-    \* is the trust anchor; ws_sig is the issuer's redundant
-    \* notarization, not a customer claim. KS_ORPHAN: the row's
-    \* signing_key_fp is by definition not in the issuer's published
-    \* key set; the verifier surfaces this via the UNRESOLVED branch
-    \* without comparing claimed_fp / signing_key_fp metadata. The
-    \* workspace_fp pin check below still catches orphan + pin (V3).
+    \* Skipped for KS_SIGSTORE, KS_CUSTOMER_DSSE, and KS_ORPHAN.
+    \* KS_SIGSTORE: bundle is the trust anchor; ws_sig is the issuer's
+    \* redundant notarization, not a customer claim. KS_CUSTOMER_DSSE:
+    \* the customer-signed DSSE Statement (verified offline against the
+    \* out-of-band-pinned fingerprint) is the trust anchor; the
+    \* envelope ws_sig is not re-evaluated — same trust-anchor class as
+    \* KS_SIGSTORE. KS_ORPHAN: the row's signing_key_fp is by
+    \* definition not in the issuer's published key set; the verifier
+    \* surfaces this via the UNRESOLVED branch without comparing
+    \* claimed_fp / signing_key_fp metadata. The workspace_fp pin check
+    \* below still catches orphan + pin (V3).
     ELSE IF k.ws_sig # ABSENT
-         /\ k.ws_sig.key_source \notin {KS_SIGSTORE, KS_ORPHAN}
+         /\ k.ws_sig.key_source \notin
+              {KS_SIGSTORE, KS_CUSTOMER_DSSE, KS_ORPHAN}
          /\ k.ws_sig.claimed_fp # NONE
          /\ k.ws_sig.claimed_fp # k.ws_sig.signing_key_fp
     THEN "FAILED"
@@ -335,12 +349,16 @@ Audit(k, q) ==
 
     \* Workspace sig present but invalid.
     \* Skipped for KS_SIGSTORE (the bundle path is the trust anchor —
-    \* the redundant ws_sig signature is not re-verified) and for
-    \* KS_ORPHAN (the row's key was not in the issuer's published
-    \* set, so ws_sig.valid is "unknown" rather than "invalid";
-    \* verdict relies on bundle path or falls to UNVERIFIED).
+    \* the redundant ws_sig signature is not re-verified),
+    \* KS_CUSTOMER_DSSE (the offline-verified customer-signed DSSE
+    \* Statement is the trust anchor — the envelope ws_sig is not
+    \* re-verified), and KS_ORPHAN (the row's key was not in the
+    \* issuer's published set, so ws_sig.valid is "unknown" rather
+    \* than "invalid"; verdict relies on bundle path or falls to
+    \* UNVERIFIED).
     ELSE IF k.ws_sig # ABSENT
-         /\ k.ws_sig.key_source \notin {KS_SIGSTORE, KS_ORPHAN}
+         /\ k.ws_sig.key_source \notin
+              {KS_SIGSTORE, KS_CUSTOMER_DSSE, KS_ORPHAN}
          /\ ~k.ws_sig.valid
     THEN "FAILED"
 
@@ -563,17 +581,20 @@ I8_BundleBoundToBundleBindHash ==
 \*
 \* Refined for the key_source discriminator: when the issuer marks
 \* a ws_sig as KS_SIGSTORE (its validity is redundant — Sigstore is
-\* the trust anchor) or KS_ORPHAN (its validity is not decidable —
-\* the key is not in the issuer's published set), ws_sig.valid is
-\* not part of the VERIFIED preconditions. For KS_PLATFORM,
-\* KS_WORKSPACE, and KS_LEGACY (older envelopes), ws_sig.valid
-\* IS required as before — preserving the original property's
-\* strength on every input shape it covered before.
+\* the trust anchor), KS_CUSTOMER_DSSE (the offline-verified
+\* customer-signed DSSE Statement is the trust anchor — same
+\* trust-anchor class as KS_SIGSTORE), or KS_ORPHAN (its validity is
+\* not decidable — the key is not in the issuer's published set),
+\* ws_sig.valid is not part of the VERIFIED preconditions. For
+\* KS_PLATFORM, KS_WORKSPACE, and KS_LEGACY (older envelopes),
+\* ws_sig.valid IS required as before — preserving the original
+\* property's strength on every input shape it covered before.
 I9_AllPresentSignaturesValid ==
     (Audit(pkg, pins) = "VERIFIED")
     => /\ (pkg.bundle = ABSENT \/ pkg.bundle.valid)
        /\ (pkg.ws_sig = ABSENT
            \/ pkg.ws_sig.key_source = KS_SIGSTORE
+           \/ pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
            \/ pkg.ws_sig.key_source = KS_ORPHAN
            \/ pkg.ws_sig.valid)
 
