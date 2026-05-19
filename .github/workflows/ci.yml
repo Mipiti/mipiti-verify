@@ -20,8 +20,67 @@ on:
       - 'CHANGELOG.md'
 
 jobs:
+  # Single shared inert-path determination, consumed (fail-safe) by the
+  # required formal jobs below. inert=true ONLY when EVERY changed file
+  # is provably inert — path-inert: .github/workflows/**, **/*.md;
+  # content-inert: pyproject.toml version-line only, action.yml Docker
+  # image-line only. Fails OPEN: empty/ambiguous ⇒ inert=false; and on
+  # ANY non-success of this job the consumers' `result != 'success'`
+  # clause forces the formal work to RUN (never skip-and-report). The
+  # step never aborts (set +e; exit 0) so detect-changes stays green
+  # and the verdict is carried by the output, not the job status.
+  detect-changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      inert: ${{ steps.guard.outputs.inert }}
+    steps:
+      - name: Inert-path guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set +e
+          files=$(gh pr view "$PR" --repo "$REPO" --json files \
+            --jq '.files[].path' 2>/dev/null)
+          echo "Changed files:"; printf '%s\n' "$files"
+          inert=true
+          [ -z "$files" ] && inert=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              .github/workflows/*|*.md|*/*.md) ;;
+              pyproject.toml)
+                bad=$(gh pr diff "$PR" --repo "$REPO" --patch 2>/dev/null | awk '
+                  /^diff --git .*pyproject\.toml/ {inf=1; next}
+                  /^diff --git / {inf=0}
+                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
+                    if ($0 !~ /^[+-]version = ".*"$/) print }')
+                [ -n "$bad" ] && inert=false ;;
+              action.yml)
+                bad=$(gh pr diff "$PR" --repo "$REPO" --patch 2>/dev/null | awk '
+                  /^diff --git .*action\.yml/ {inf=1; next}
+                  /^diff --git / {inf=0}
+                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
+                    if ($0 !~ /docker:\/\/|^[+-][ \t]*image:/) print }')
+                [ -n "$bad" ] && inert=false ;;
+              *) inert=false ;;
+            esac
+          done <<< "$files"
+          echo "inert=$inert" >> "$GITHUB_OUTPUT"
+          echo "Inert (skip expensive formal jobs/steps): $inert"
+          exit 0
+
   test:
     runs-on: ubuntu-latest
+    needs: detect-changes
+    # Always run + report (required check). `always()` overrides the
+    # default needs-skip so a detect-changes failure can't bypass the
+    # gate; the expensive formal steps below self-gate fail-safe.
+    if: ${{ always() }}
     # NO `id-token: write` here — many runner tests (e.g.
     # TestChooseAttestation) assume OIDC env vars are absent, and the
     # runner constructor auto-detects ACTIONS_ID_TOKEN_REQUEST_*
@@ -53,9 +112,13 @@ jobs:
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
 
       - name: Formal verification (Python BFS + cross-check)
+        # Fail-safe inert skip: RUN unless detect-changes succeeded AND
+        # judged the diff inert. detect-changes failure ⇒ runs.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: python formal/check_pipeline.py
 
       - name: Download TLC
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
@@ -64,6 +127,7 @@ jobs:
         working-directory: formal
 
       - name: Formal verification (TLC — VerificationPipeline + KeySourceResolver)
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: |
           # JVM tuning is precision-preserving: -Xmx8g for the BFS
           # young-gen, ParallelGC for throughput. State-space verdict
@@ -93,6 +157,12 @@ jobs:
     # TLC (default: run; the guard fails open). The cheap AST proof is
     # left unconditional. See formal/COMPOSITION.md.
     runs-on: ubuntu-latest
+    needs: detect-changes
+    # Always run + report (required check); `always()` overrides the
+    # default needs-skip so a detect-changes failure can't bypass the
+    # gate. The expensive TLC steps self-gate fail-safe on the shared
+    # detect-changes verdict; the cheap AST proof stays unconditional.
+    if: ${{ always() }}
     permissions:
       contents: read
     steps:
@@ -105,57 +175,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Inert-path guard (skip TLC iff PR diff ⊆ inert allowlist)
-        # Fail-open: only sets inert=true when EVERY changed file is
-        # provably inert. Path-inert: .github/workflows/**, **/*.md.
-        # pyproject.toml is inert ONLY when its diff is confined to the
-        # `version = "..."` line; action.yml ONLY when confined to the
-        # Docker image-reference line (the pipeline's auto pin-action
-        # PR). A dependency/entry-point/build or substantive action.yml
-        # edit CAN change behavior and must NOT skip formal checks.
-        # Non-PR events and any ambiguity leave inert unset ⇒ TLC runs.
-        # Uses the preinstalled `gh` + github.token (no 3rd-party action).
-        id: guard
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          files=$(gh pr view "$PR" --repo "$REPO" --json files \
-            --jq '.files[].path')
-          echo "Changed files:"; printf '%s\n' "$files"
-          inert=true
-          [ -z "$files" ] && inert=false
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            case "$f" in
-              .github/workflows/*|*.md|*/*.md) ;;
-              pyproject.toml)
-                # Inert iff the ONLY +/- lines in pyproject.toml's diff
-                # are the version string. Any other changed line ⇒ run.
-                bad=$(gh pr diff "$PR" --repo "$REPO" --patch | awk '
-                  /^diff --git .*pyproject\.toml/ {inf=1; next}
-                  /^diff --git / {inf=0}
-                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
-                    if ($0 !~ /^[+-]version = ".*"$/) print }')
-                [ -n "$bad" ] && inert=false ;;
-              action.yml)
-                # Inert iff the ONLY +/- lines in action.yml's diff are
-                # the Docker image reference (the pipeline's auto
-                # pin-action PR). Any other changed line ⇒ run.
-                bad=$(gh pr diff "$PR" --repo "$REPO" --patch | awk '
-                  /^diff --git .*action\.yml/ {inf=1; next}
-                  /^diff --git / {inf=0}
-                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
-                    if ($0 !~ /docker:\/\/|^[+-][ \t]*image:/) print }')
-                [ -n "$bad" ] && inert=false ;;
-              *) inert=false ;;
-            esac
-          done <<< "$files"
-          echo "inert=$inert" >> "$GITHUB_OUTPUT"
-          echo "Inert (skip formal TLC): $inert"
-
       - name: Formal verification (AuditView faithfulness — AST proof)
         # Gates the lossless `VIEW AuditView` reduction in
         # audit_main.cfg / audit_bundle_bind.cfg. Structurally proves
@@ -167,7 +186,7 @@ jobs:
         run: python formal/check_audit_view_faithful.py
 
       - name: Download TLC
-        if: steps.guard.outputs.inert != 'true'
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
@@ -176,7 +195,7 @@ jobs:
         working-directory: formal
 
       - name: Formal verification (TLC — audit, Config 1, bundle_bind pinned)
-        if: steps.guard.outputs.inert != 'true'
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         # Compositional split per formal/COMPOSITION.md. Config 1 pins
         # bundle_bind to its canonical matching representative and
         # verifies I1-I7, I9-I13, V3, V5a-V5c, plus a machine-checked
@@ -188,7 +207,7 @@ jobs:
         working-directory: formal
 
       - name: Formal verification (TLC — audit, Config 2, bundle_bind explored)
-        if: steps.guard.outputs.inert != 'true'
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         # Config 2 explores the full bundle_bind cross-product with
         # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2, V4.
         # Init_bind excludes customer_dsse rows — lossless, since every
@@ -217,7 +236,13 @@ jobs:
     # check satisfaction is preserved: a job skipped via job-level
     # `if:` reports `conclusion: skipped`, which satisfies a
     # required status check.
-    if: ${{ !startsWith(github.head_ref, 'release/v') }}
+    needs: detect-changes
+    # Skip (reported `skipped` ⇒ required check satisfied) only when
+    # detect-changes succeeded AND judged the diff inert, OR on the
+    # automated version-bump branch. `always()` keeps the job RUNNING
+    # if detect-changes did not succeed — fail-safe: the BFS runs, it
+    # is never bypassed by an infra failure.
+    if: ${{ always() && (needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true') && !startsWith(github.head_ref, 'release/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
