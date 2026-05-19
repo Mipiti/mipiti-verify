@@ -106,28 +106,41 @@ jobs:
           python-version: "3.12"
 
       - name: Inert-path guard (skip TLC iff PR diff ⊆ inert allowlist)
-        # Fail-open: only sets inert=true when EVERY changed file in the
-        # PR matches the provably-inert allowlist. Non-PR events and any
-        # ambiguity leave inert unset ⇒ the TLC steps run. Uses the
-        # preinstalled `gh` + github.token (no third-party action).
+        # Fail-open: only sets inert=true when EVERY changed file is
+        # provably inert. Path-inert: .github/workflows/**, **/*.md.
+        # pyproject.toml is inert ONLY when its diff is confined to the
+        # `version = "..."` line — a dependency/entry-point/build edit
+        # there CAN change behavior and must NOT skip formal checks.
+        # Non-PR events and any ambiguity leave inert unset ⇒ TLC runs.
+        # Uses the preinstalled `gh` + github.token (no 3rd-party action).
         id: guard
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          files=$(gh pr view "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" --json files \
+          files=$(gh pr view "$PR" --repo "$REPO" --json files \
             --jq '.files[].path')
           echo "Changed files:"; printf '%s\n' "$files"
           inert=true
+          [ -z "$files" ] && inert=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              .github/workflows/*|pyproject.toml|*.md|*/*.md) ;;
+              .github/workflows/*|*.md|*/*.md) ;;
+              pyproject.toml)
+                # Inert iff the ONLY +/- lines in pyproject.toml's diff
+                # are the version string. Any other changed line ⇒ run.
+                bad=$(gh pr diff "$PR" --repo "$REPO" --patch | awk '
+                  /^diff --git .*pyproject\.toml/ {inf=1; next}
+                  /^diff --git / {inf=0}
+                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
+                    if ($0 !~ /^[+-]version = ".*"$/) print }')
+                [ -n "$bad" ] && inert=false ;;
               *) inert=false ;;
             esac
           done <<< "$files"
-          [ -z "$files" ] && inert=false
           echo "inert=$inert" >> "$GITHUB_OUTPUT"
           echo "Inert (skip formal TLC): $inert"
 
