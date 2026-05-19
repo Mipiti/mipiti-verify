@@ -84,7 +84,14 @@ jobs:
     # `test` so a long-but-correct audit TLC run never blocks the
     # critical path — it runs in parallel with `test` /
     # `test-spec-invariants`. Still a required check; no gate is
-    # weakened. See formal/COMPOSITION.md.
+    # weakened. The expensive TLC steps are skipped ONLY when a PR's
+    # diff is strictly within a provably-inert allowlist
+    # (.github/workflows/**, pyproject.toml, **/*.md) — none can affect
+    # audit.tla, the cfgs, the AST proof, or the verified
+    # implementation, so the TLC result is provably identical to the
+    # last run. Any change to implementation/tests/formal/** runs full
+    # TLC (default: run; the guard fails open). The cheap AST proof is
+    # left unconditional. See formal/COMPOSITION.md.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,6 +105,32 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Inert-path guard (skip TLC iff PR diff ⊆ inert allowlist)
+        # Fail-open: only sets inert=true when EVERY changed file in the
+        # PR matches the provably-inert allowlist. Non-PR events and any
+        # ambiguity leave inert unset ⇒ the TLC steps run. Uses the
+        # preinstalled `gh` + github.token (no third-party action).
+        id: guard
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --json files \
+            --jq '.files[].path')
+          echo "Changed files:"; printf '%s\n' "$files"
+          inert=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              .github/workflows/*|pyproject.toml|*.md|*/*.md) ;;
+              *) inert=false ;;
+            esac
+          done <<< "$files"
+          [ -z "$files" ] && inert=false
+          echo "inert=$inert" >> "$GITHUB_OUTPUT"
+          echo "Inert (skip formal TLC): $inert"
+
       - name: Formal verification (AuditView faithfulness — AST proof)
         # Gates the lossless `VIEW AuditView` reduction in
         # audit_main.cfg / audit_bundle_bind.cfg. Structurally proves
@@ -109,6 +142,7 @@ jobs:
         run: python formal/check_audit_view_faithful.py
 
       - name: Download TLC
+        if: steps.guard.outputs.inert != 'true'
         run: |
           TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
           TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
@@ -117,6 +151,7 @@ jobs:
         working-directory: formal
 
       - name: Formal verification (TLC — audit, Config 1, bundle_bind pinned)
+        if: steps.guard.outputs.inert != 'true'
         # Compositional split per formal/COMPOSITION.md. Config 1 pins
         # bundle_bind to its canonical matching representative and
         # verifies I1-I7, I9-I13, V3, V5a-V5c, plus a machine-checked
@@ -128,6 +163,7 @@ jobs:
         working-directory: formal
 
       - name: Formal verification (TLC — audit, Config 2, bundle_bind explored)
+        if: steps.guard.outputs.inert != 'true'
         # Config 2 explores the full bundle_bind cross-product with
         # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2, V4.
         # Init_bind excludes customer_dsse rows — lossless, since every
