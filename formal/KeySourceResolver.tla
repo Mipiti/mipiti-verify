@@ -17,7 +17,7 @@
  *   - VerificationPipeline.tla : Tier 1 / Tier 2 assertion-state
  *                              lifecycle.
  *
- * Eight resolver-side invariants pin issuer correctness; see the
+ * Nine resolver-side invariants pin issuer correctness; see the
  * INVARIANTS section below for full statements. Summary:
  *
  *   R1   Soundness of `key_source` declaration
@@ -28,6 +28,7 @@
  *   R5   Orphan honesty
  *   R6   Fingerprint preservation
  *   R10  Key-authority + retired_at correctness per platform sub-case
+ *   R12  Customer-DSSE binding integrity
  *
  * A companion Python BFS in the issuer's repository drives the real
  * resolver implementation against the same finite domain explored
@@ -43,7 +44,12 @@ EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS
     \* Key-source classification values emitted by the resolver.
-    KSSigstore, KSPlatform, KSWorkspace, KSOrphan,
+    \* KSCustomerDsse — a stored workspace key resolves the
+    \* fingerprint AND a valid customer-signed DSSE bundle is present
+    \* (the binding is the customer-signed in-toto Statement, verified
+    \* offline; vendor-independent). An absent or invalid bundle falls
+    \* through to the bare-key KSWorkspace classification.
+    KSSigstore, KSPlatform, KSWorkspace, KSCustomerDsse, KSOrphan,
 
     \* Key-authority sub-classification (for KSPlatform). Three slots
     \* model the case where the issuer publishes more than one
@@ -72,26 +78,37 @@ CONSTANTS
     FP_ACTIVE, FP_PRIOR_PRIMARY, FP_PRIOR_HISTORY, FP_WORKSPACE,
     FP_ORPHAN, FP_NONE,
 
-    \* Valid / invalid bundle markers.
-    BUNDLE_VALID, BUNDLE_INVALID, BUNDLE_ABSENT
+    \* Valid / invalid bundle markers (Sigstore bundle).
+    BUNDLE_VALID, BUNDLE_INVALID, BUNDLE_ABSENT,
+
+    \* Customer-signed DSSE bundle markers. DSSE_VALID = a customer
+    \* DSSE bundle that re-verifies (ECDSA-over-PAE) against the stored
+    \* workspace key; DSSE_INVALID = a bundle that fails that
+    \* re-verification (must fall through to KSWorkspace, NOT
+    \* KSCustomerDsse); DSSE_ABSENT = no bundle on the row.
+    DSSE_VALID, DSSE_INVALID, DSSE_ABSENT
 
 VARIABLES
     \* Resolver inputs (drawn from the finite domain).
     inSignature,        \* raw signature bytes — modeled as TRUE/FALSE for present/absent
     inFingerprint,      \* one of FP_*; FP_NONE = no fingerprint on the row
     inSignedHash,       \* TRUE/FALSE for present/absent
-    inBundle            \* one of BUNDLE_*
+    inBundle,           \* one of BUNDLE_* (Sigstore bundle)
+    inDsseBundle        \* one of DSSE_* (customer-signed DSSE bundle)
 
-vars == <<inSignature, inFingerprint, inSignedHash, inBundle>>
+vars == <<inSignature, inFingerprint, inSignedHash, inBundle,
+          inDsseBundle>>
 
 -----------------------------------------------------------------------------
 (* Domain definitions. *)
 
-KeySources == {KSSigstore, KSPlatform, KSWorkspace, KSOrphan}
+KeySources == {KSSigstore, KSPlatform, KSWorkspace, KSCustomerDsse,
+               KSOrphan}
 KeyAuthorities == {KAActive, KAArchived, KAHistorical, KANone}
 Fingerprints == {FP_ACTIVE, FP_PRIOR_PRIMARY, FP_PRIOR_HISTORY,
                  FP_WORKSPACE, FP_ORPHAN, FP_NONE}
 Bundles == {BUNDLE_VALID, BUNDLE_INVALID, BUNDLE_ABSENT}
+DsseBundles == {DSSE_VALID, DSSE_INVALID, DSSE_ABSENT}
 
 \* Inputs to the resolver. The fingerprint is what the row carries;
 \* the resolver matches it against the issuer's published key set
@@ -100,7 +117,8 @@ ResolverInput == [
     sig_present  : BOOLEAN,
     fp           : Fingerprints,
     hash_present : BOOLEAN,
-    bundle       : Bundles
+    bundle       : Bundles,
+    dsse_bundle  : DsseBundles
 ]
 
 \* Resolver output descriptor. Mirrors KeySourceDescriptor's
@@ -115,15 +133,22 @@ ResolverOutput == [
     signed_hash        : BOOLEAN,
     workspace_id       : BOOLEAN,    \* TRUE = populated (workspace path)
     retired_at         : BOOLEAN,    \* TRUE = populated
-    unavailable_reason : BOOLEAN     \* TRUE = populated (orphan path)
+    unavailable_reason : BOOLEAN,    \* TRUE = populated (orphan path)
+    dsse_bundle        : BOOLEAN     \* TRUE = populated (customer_dsse path)
 ]
 
 -----------------------------------------------------------------------------
 (* The Resolve operator — DESIGN INTENT.                                   *)
 (*                                                                         *)
 (* Walk order: bundle → active → prior-primary → prior-history →          *)
-(* workspace → orphan. Returns a fully-populated ResolverOutput record     *)
-(* for every input.                                                        *)
+(* (customer-DSSE | workspace) → orphan. The Sigstore bundle is checked   *)
+(* first, so a valid Sigstore bundle still wins over the customer-DSSE    *)
+(* path (precedence unchanged). At the workspace fingerprint, a valid     *)
+(* customer-signed DSSE bundle classifies as KSCustomerDsse (the binding  *)
+(* is the customer-signed Statement, verified offline — vendor-           *)
+(* independent); an absent or invalid bundle falls through to the         *)
+(* bare-key KSWorkspace classification. Returns a fully-populated         *)
+(* ResolverOutput record for every input.                                 *)
 (***************************************************************************)
 Resolve(in) ==
     \* Step 1: bundle precedence (R3). Valid bundle wins regardless of fp.
@@ -137,7 +162,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> FALSE
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> FALSE
     ]
 
     \* No fingerprint: orphan with distinct reason ("row_carries_no_fingerprint").
@@ -151,7 +177,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> TRUE
+        unavailable_reason |-> TRUE,
+        dsse_bundle        |-> FALSE
     ]
 
     \* Step 2: active platform signer.
@@ -165,7 +192,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> FALSE
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> FALSE
     ]
 
     \* Step 3: prior-primary platform key (most recently retired).
@@ -179,7 +207,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> TRUE,
-        unavailable_reason |-> FALSE
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> FALSE
     ]
 
     \* Step 4: deeper rotation history.
@@ -193,10 +222,34 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> FALSE
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> FALSE
     ]
 
-    \* Step 5: customer-uploaded workspace ECDSA key.
+    \* Step 5a: customer-keyed offline DSSE. A stored workspace key
+    \* resolves the fingerprint AND a valid customer-signed DSSE bundle
+    \* re-verifies against it — the binding is the customer-signed
+    \* in-toto Statement (vendor-independent), so classify as
+    \* KSCustomerDsse and carry the bundle. Checked before the
+    \* bare-key workspace path: an absent or invalid bundle falls
+    \* through to step 5b (R12).
+    ELSE IF in.fp = FP_WORKSPACE /\ in.dsse_bundle = DSSE_VALID
+    THEN [
+        key_source         |-> KSCustomerDsse,
+        key_authority      |-> KANone,
+        fingerprint        |-> in.fp,
+        public_key_pem     |-> TRUE,
+        signature_b64      |-> in.sig_present,
+        signed_hash        |-> in.hash_present,
+        workspace_id       |-> TRUE,
+        retired_at         |-> FALSE,
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> TRUE
+    ]
+
+    \* Step 5b: customer-uploaded workspace ECDSA key (bare-key path).
+    \* No DSSE bundle (or it failed re-verification) — the binding is
+    \* only the stored row, so the bundle MUST NOT be carried (R12).
     ELSE IF in.fp = FP_WORKSPACE
     THEN [
         key_source         |-> KSWorkspace,
@@ -207,7 +260,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> TRUE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> FALSE
+        unavailable_reason |-> FALSE,
+        dsse_bundle        |-> FALSE
     ]
 
     \* Step 6: orphan with structured reason.
@@ -220,7 +274,8 @@ Resolve(in) ==
         signed_hash        |-> in.hash_present,
         workspace_id       |-> FALSE,
         retired_at         |-> FALSE,
-        unavailable_reason |-> TRUE
+        unavailable_reason |-> TRUE,
+        dsse_bundle        |-> FALSE
     ]
 
 -----------------------------------------------------------------------------
@@ -232,6 +287,7 @@ Init == /\ inSignature \in BOOLEAN
         /\ inFingerprint \in Fingerprints
         /\ inSignedHash \in BOOLEAN
         /\ inBundle \in Bundles
+        /\ inDsseBundle \in DsseBundles
 
 Next == UNCHANGED vars
 
@@ -241,32 +297,35 @@ CurrentInput == [
     sig_present  |-> inSignature,
     fp           |-> inFingerprint,
     hash_present |-> inSignedHash,
-    bundle       |-> inBundle
+    bundle       |-> inBundle,
+    dsse_bundle  |-> inDsseBundle
 ]
 
 CurrentOutput == Resolve(CurrentInput)
 
 -----------------------------------------------------------------------------
-(* Resolver invariants. R1-R5 must hold for every input.                   *)
+(* Resolver invariants. R1-R6, R10, R12 + R3a must hold for every input.   *)
 (***************************************************************************)
 
 \* R1 — Soundness of `key_source` declaration. When the resolver emits
-\* `platform` or `workspace`, the embedded public_key_pem must be
-\* populated AND the row's fingerprint must be the one that actually
-\* matched the published key set. (Modeled here as: pub-pem is
-\* populated and the descriptor's fingerprint equals the input
-\* fingerprint, which by construction was the one that matched.)
+\* `platform`, `workspace`, or `customer_dsse`, the embedded
+\* public_key_pem must be populated AND the row's fingerprint must be
+\* the one that actually matched the published key set. (Modeled here
+\* as: pub-pem is populated and the descriptor's fingerprint equals
+\* the input fingerprint, which by construction was the one that
+\* matched.)
 R1_SoundnessOfKeySource ==
     LET out == CurrentOutput IN
-    out.key_source \in {KSPlatform, KSWorkspace}
+    out.key_source \in {KSPlatform, KSWorkspace, KSCustomerDsse}
     => /\ out.public_key_pem = TRUE
        /\ out.fingerprint = inFingerprint
 
 \* R2 — Resolver totality. Every input produces exactly one of the
-\* four key_source values. (The Resolve operator above is structurally
-\* total — every IF-ELSE-IF branch has an ELSE — so the conclusion
-\* reduces to the type assertion that key_source is one of the
-\* enumerated values.)
+\* five key_source values (sigstore, platform, workspace,
+\* customer_dsse, unverifiable_orphan). (The Resolve operator above is
+\* structurally total — every IF-ELSE-IF branch has an ELSE — so the
+\* conclusion reduces to the type assertion that key_source is one of
+\* the enumerated values.)
 R2_Totality ==
     CurrentOutput.key_source \in KeySources
 
@@ -276,12 +335,15 @@ R3_BundlePrecedence ==
     inBundle = BUNDLE_VALID
     => CurrentOutput.key_source = KSSigstore
 
-\* R4 — Backward-compat envelope. For `platform` and `workspace`
-\* paths, every legacy field that older verifier builds rely on is
-\* populated.
+\* R4 — Backward-compat envelope. For `platform`, `workspace`, and
+\* `customer_dsse` paths, every legacy field that older verifier
+\* builds rely on is populated. (`to_envelope()` remains
+\* backward-compatible: the dsse_bundle field is additive — older
+\* verifier builds ignore it and consume the row via the same legacy
+\* public_key_pem / signature / fingerprint fields.)
 R4_BackwardCompatEnvelope ==
     LET out == CurrentOutput IN
-    out.key_source \in {KSPlatform, KSWorkspace}
+    out.key_source \in {KSPlatform, KSWorkspace, KSCustomerDsse}
     => /\ out.public_key_pem = TRUE
        /\ out.signature_b64 = inSignature
        /\ out.signed_hash = inSignedHash
@@ -334,6 +396,34 @@ R10_KeyAuthorityCorrectness ==
     /\ (out.key_source = KSPlatform /\ inFingerprint = FP_PRIOR_HISTORY)
        => out.retired_at = FALSE
 
+\* R12 — Customer-DSSE binding integrity. The `customer_dsse` class
+\* exists iff a customer-signed DSSE Statement is carried (the
+\* vendor-independent binding): a stored workspace key resolves the
+\* fingerprint AND a valid customer-signed DSSE bundle re-verifies
+\* against it. When it fires, the descriptor MUST carry the
+\* dsse_bundle, the stored public key, and the workspace id, and MUST
+\* NOT be an orphan; conversely the bare-key `workspace` class MUST
+\* NOT carry a dsse_bundle (its binding is only the stored row, not a
+\* customer signature). The iff direction also pins the precedence:
+\* a valid Sigstore bundle still wins (checked first), so
+\* `customer_dsse` is reachable only when no valid Sigstore bundle is
+\* present. Catches a future refactor that emits customer_dsse
+\* without the bundle (vacuous trust), leaks a bundle onto the
+\* bare-key path (mislabelled binding), or lets a customer DSSE
+\* bundle override a valid Sigstore bundle.
+R12_CustomerDsseBindingIntegrity ==
+    LET out == CurrentOutput IN
+    /\ ( out.key_source = KSCustomerDsse
+         => /\ out.dsse_bundle = TRUE
+            /\ out.public_key_pem = TRUE
+            /\ out.workspace_id = TRUE
+            /\ out.unavailable_reason = FALSE )
+    /\ ( out.key_source = KSWorkspace => out.dsse_bundle = FALSE )
+    /\ ( (out.key_source = KSCustomerDsse)
+         <=> ( /\ inBundle # BUNDLE_VALID
+               /\ inFingerprint = FP_WORKSPACE
+               /\ inDsseBundle = DSSE_VALID ) )
+
 \* Conjunction of all invariants — the property TLC checks.
 ResolverInvariants ==
     /\ R1_SoundnessOfKeySource
@@ -344,6 +434,7 @@ ResolverInvariants ==
     /\ R5_OrphanHonesty
     /\ R6_FingerprintPreservation
     /\ R10_KeyAuthorityCorrectness
+    /\ R12_CustomerDsseBindingIntegrity
 
 -----------------------------------------------------------------------------
 (* Type invariant: every reachable state has well-typed inputs.            *)
@@ -353,5 +444,6 @@ TypeOK ==
     /\ inFingerprint \in Fingerprints
     /\ inSignedHash \in BOOLEAN
     /\ inBundle \in Bundles
+    /\ inDsseBundle \in DsseBundles
 
 =============================================================================

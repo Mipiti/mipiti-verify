@@ -255,6 +255,37 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--customer-key",
+    "customer_key_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    envvar="MIPITI_CUSTOMER_SIGNING_KEY",
+    help=(
+        "PEM ECDSA P-256 private key for customer-keyed offline DSSE "
+        "attestation. For air-gapped / non-Sigstore CI (Jenkins, "
+        "self-managed or older GitLab, Buildkite/CircleCI without OIDC, "
+        "regulated networks) that cannot reach Sigstore at sign time. "
+        "Produces a self-contained, customer-controlled, "
+        "offline-verifiable attestation in the standard DSSE / in-toto "
+        "format — no Fulcio, no Rekor, no network. When supplied this "
+        "path is preferred over Sigstore. The matching public key must "
+        "be registered on the Mipiti workspace, and the auditor pins "
+        "its fingerprint out-of-band via --expected-customer-key. "
+        "Reads MIPITI_CUSTOMER_SIGNING_KEY when omitted."
+    ),
+)
+@click.option(
+    "--customer-key-passphrase",
+    "customer_key_passphrase",
+    default=None,
+    envvar="MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE",
+    help=(
+        "Passphrase for an encrypted --customer-key PEM. Reads "
+        "MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE when omitted. Omit for "
+        "an unencrypted key."
+    ),
+)
+@click.option(
     "--signing-prefer",
     default="sigstore",
     type=click.Choice(["sigstore", "workspace"], case_sensitive=False),
@@ -321,6 +352,8 @@ def run(
     sigstore_tuf_url: str | None,
     sigstore_trust_config_path: str | None,
     workspace_signing_key_path: str | None,
+    customer_key_path: str | None,
+    customer_key_passphrase: str | None,
     signing_prefer: str,
     require_attestation: bool,
     output_format: str,
@@ -389,6 +422,8 @@ def run(
             sigstore_tuf_url=sigstore_tuf_url,
             sigstore_trust_config_path=sigstore_trust_config_path,
             workspace_signing_key_path=workspace_signing_key_path,
+            customer_key_path=customer_key_path,
+            customer_key_passphrase=customer_key_passphrase,
             signing_prefer=signing_prefer,
             require_attestation=require_attestation,
             dry_run=dry_run,
@@ -1570,6 +1605,25 @@ def _audit_pdf_report(
     ),
 )
 @click.option(
+    "--expected-customer-key",
+    "expected_customer_key_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Path to the customer's PEM ECDSA P-256 public key, pinned "
+        "out-of-band, for verifying customer-keyed offline DSSE "
+        "attestations (key_source = customer_dsse). The verifier "
+        "reconstructs the DSSE PAE from the embedded payload, checks "
+        "the signature, and requires the SHA-256 fingerprint of this "
+        "pinned key's DER SubjectPublicKeyInfo to equal the key that "
+        "actually signed the bundle — the vendor-independence gate. A "
+        "swapped or vendor-substituted key fails here. Required when "
+        "the package carries a customer_dsse envelope: without the pin "
+        "the bundle's embedded PEM cannot be trusted and the audit "
+        "fails closed."
+    ),
+)
+@click.option(
     "--platform-pubkey",
     "platform_pubkey_path",
     default=None,
@@ -1690,6 +1744,7 @@ def audit(
     ci_identity_from_env: bool,
     expected_issuer: str | None,
     expected_workspace_key_fingerprint: str | None,
+    expected_customer_key_path: str | None,
     platform_pubkey_path: str | None,
     rekor_anchor_url: str | None,
     expected_anchor_identity: str | None,
@@ -1802,15 +1857,25 @@ def audit(
     # defense, so accepting this configuration silently would let
     # misconfiguration ship to production. Same precedent as
     # --expected-issuer alone (which has zero effect): fail closed.
-    if (expected_model_id or expected_commit_sha) and not expected_ci_identity:
+    # --expected-customer-key satisfies the same constraint for the
+    # customer-keyed offline DSSE path: the predicate is signed by the
+    # customer's own key, and the fingerprint pin binds verification to
+    # that exact key. Predicate pins are therefore meaningful (an
+    # attacker cannot mint a predicate the customer's key didn't sign),
+    # so this is the customer-DSSE analogue of a SAN pin.
+    if (
+        (expected_model_id or expected_commit_sha)
+        and not expected_ci_identity
+        and not expected_customer_key_path
+    ):
         console.print(
             "[red]Error:[/red] --expected-model-id / --expected-commit-sha "
             "require --expected-ci-identity (or --ci-identity-from-env / "
-            "MIPITI_VERIFY_CI_IDENTITY). Without a SAN pin constraining whose "
-            "OIDC produced the bundle, an attacker minting under their own "
-            "CI's OIDC can craft any predicate values matching your pins — "
-            "the predicate pins offer no compromised-platform defense on "
-            "their own."
+            "MIPITI_VERIFY_CI_IDENTITY), or --expected-customer-key for the "
+            "customer-keyed offline DSSE path. Without a pin constraining "
+            "whose key produced the attestation, an attacker can craft any "
+            "predicate values matching your pins — the predicate pins offer "
+            "no compromised-platform defense on their own."
         )
         raise SystemExit(2)
 
@@ -2670,7 +2735,21 @@ def audit(
         # report could simply omit the upstream evidence to bypass
         # pinning. Silently passing on a package with no evidence
         # defeats the auditor's intent.
-        if expected_ci_identity or expected_model_id or expected_commit_sha:
+        # A customer-keyed offline DSSE envelope is independent upstream
+        # evidence too: its customer-signed predicate carries model_id /
+        # pipeline.commit_sha, cross-checked in the customer_dsse branch
+        # below. So a package that carries a dsse_bundle is NOT
+        # evidence-free — exempt it from the no-bundle pin gate (the
+        # customer_dsse branch enforces the predicate pins itself).
+        _ci_probe = pkg.get("content_integrity")
+        _has_dsse = bool(
+            isinstance(_ci_probe, dict)
+            and isinstance(_ci_probe.get("dsse_bundle", ""), str)
+            and _ci_probe.get("dsse_bundle", "")
+        )
+        if (
+            expected_ci_identity or expected_model_id or expected_commit_sha
+        ) and not _has_dsse:
             console.print(
                 "  [red]A bundle-binding pin (--expected-ci-identity / "
                 "--expected-model-id / --expected-commit-sha) was set but "
@@ -2773,9 +2852,152 @@ def audit(
     # builds) fall through to the legacy fingerprint-blind PEM
     # verification — same behaviour as before this discriminator was
     # introduced, so older packages continue to verify unchanged.
+    #   "customer_dsse"       — customer-keyed offline DSSE attestation.
+    #                           For air-gapped / non-Sigstore CI: the
+    #                           customer signs a standard DSSE / in-toto
+    #                           Statement with their own ECDSA P-256 key
+    #                           offline (no Fulcio, no Rekor). The
+    #                           customer-signed bundle travels opaquely
+    #                           in content_integrity.dsse_bundle. Trust
+    #                           derives entirely from the auditor pinning
+    #                           the customer's public-key fingerprint
+    #                           out-of-band via --expected-customer-key;
+    #                           the embedded PEM and Mipiti's stored copy
+    #                           are convenience only. Verified fully
+    #                           offline here.
     key_source = ci.get("key_source", "") if ci else ""
 
-    if ci and ci.get("signature"):
+    # Customer-keyed offline DSSE path. The customer-signed bundle is the
+    # trust anchor for this row (not ci["signature"]); verification is the
+    # contract's steps 1,2,4 plus the fingerprint pin (step 3), performed
+    # fully offline. Handled before the generic signature dispatch so the
+    # row's binding is the *customer-signed Statement*, never a DB row.
+    dsse_bundle_raw = ci.get("dsse_bundle", "") if ci else ""
+    if not isinstance(dsse_bundle_raw, str):
+        dsse_bundle_raw = ""
+    customer_dsse_handled = False
+    if key_source == "customer_dsse" or dsse_bundle_raw:
+        customer_dsse_handled = True
+        console.print("\n[bold]Customer-keyed offline DSSE[/bold]")
+        if not dsse_bundle_raw:
+            console.print(
+                "  [red]key_source is customer_dsse but the package carries "
+                "no content_integrity.dsse_bundle — nothing to verify.[/red]"
+            )
+            has_failure = True
+        elif not expected_customer_key_path:
+            # Fail loudly: the fingerprint pin IS the trust basis for
+            # this path. Without --expected-customer-key the bundle's
+            # embedded PEM cannot be trusted, so we never silently accept
+            # it — the audit fails closed.
+            console.print(
+                "  [red]A customer-keyed DSSE envelope is present but "
+                "--expected-customer-key was not supplied. This path's "
+                "trust derives entirely from the auditor pinning the "
+                "customer's public-key fingerprint out-of-band; without "
+                "the pin the embedded key cannot be trusted. Re-run with "
+                "--expected-customer-key <customer-public-key.pem>.[/red]"
+            )
+            has_failure = True
+        else:
+            try:
+                from pathlib import Path
+
+                from .customer_dsse_verifier import (
+                    CustomerDsseVerificationError,
+                    key_fingerprint,
+                    verify_customer_dsse_bundle,
+                )
+
+                expected_pem = Path(expected_customer_key_path).read_text(
+                    encoding="utf-8"
+                )
+                expected_fp = key_fingerprint(expected_pem)
+
+                # Step 4 binds the Statement subject digest to the
+                # report's content hash. The issuer mints that value
+                # into content_integrity.bundle_bind_hash (same envelope
+                # field + same domain the Sigstore path uses for the
+                # Subject-digest binding); fall back to results_hash /
+                # the recovered stored_hash when bundle_bind_hash is
+                # absent on older envelopes.
+                bind_hash = ci.get("bundle_bind_hash", "")
+                if not isinstance(bind_hash, str) or not bind_hash:
+                    bind_hash = (
+                        stored_hash or ci.get("results_hash", "") or ""
+                    )
+
+                result = verify_customer_dsse_bundle(
+                    dsse_bundle_raw,
+                    content_hash=bind_hash,
+                    expected_fingerprint=expected_fp,
+                )
+                content_verified = True
+                console.print(
+                    f"  Pinned key fp:   {expected_fp}"
+                )
+                console.print(
+                    "  DSSE signature:  [green]VALID[/green] "
+                    "(ECDSA P-256/SHA-256 over the DSSE PAE, offline)"
+                )
+                console.print(
+                    f"  Identity pin:    [green]MATCHED[/green] "
+                    f"(customer key = {expected_fp!r})"
+                )
+                console.print(
+                    "  Subject digest:  [green]BOUND[/green] "
+                    "(Statement subject == report content hash)"
+                )
+
+                # Cross-check the auditor's predicate pins against the
+                # customer-signed predicate, mirroring the Sigstore path.
+                pred = result.predicate
+                if expected_model_id:
+                    claimed = pred.get("model_id", "")
+                    if claimed == expected_model_id:
+                        console.print(
+                            f"  Model ID pin:    [green]MATCHED[/green] "
+                            f"({expected_model_id!r})"
+                        )
+                    else:
+                        console.print(
+                            f"  Model ID pin:    [red]MISMATCH[/red] "
+                            f"(expected {expected_model_id!r}, "
+                            f"signed predicate carries {claimed!r})"
+                        )
+                        has_failure = True
+                if expected_commit_sha:
+                    claimed_sha = (
+                        pred.get("pipeline", {}) or {}
+                    ).get("commit_sha", "")
+                    if claimed_sha == expected_commit_sha:
+                        console.print(
+                            f"  Commit SHA pin:  [green]MATCHED[/green] "
+                            f"({expected_commit_sha!r})"
+                        )
+                    else:
+                        console.print(
+                            f"  Commit SHA pin:  [red]MISMATCH[/red] "
+                            f"(expected {expected_commit_sha!r}, "
+                            f"signed predicate carries {claimed_sha!r})"
+                        )
+                        has_failure = True
+            except CustomerDsseVerificationError as e:
+                console.print(
+                    f"  Customer DSSE:   [red]INVALID — {e}[/red]"
+                )
+                has_failure = True
+            except (OSError, ValueError) as e:
+                console.print(
+                    f"  Customer DSSE:   [red]FAILED — {e}[/red]"
+                )
+                has_failure = True
+
+    if customer_dsse_handled:
+        # The customer-signed bundle is authoritative for this row; the
+        # generic ci["signature"] dispatch below is intentionally skipped.
+        pass
+    elif ci and ci.get("signature"):
         try:
             from cryptography.hazmat.primitives import hashes, serialization
             from cryptography.hazmat.primitives.asymmetric import ec

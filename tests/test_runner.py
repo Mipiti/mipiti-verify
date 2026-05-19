@@ -612,10 +612,11 @@ class TestChooseAttestation:
             oidc_token="eyJ.token",
             workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
         )
-        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
         assert bundle == '{"mediaType":"sigstore-bundle"}'
         assert signature == ""
         assert signed_hash == ""
+        assert dsse_bundle == ""
 
     @patch("mipiti_verify.runner.sign_verification_statement")
     def test_workspace_picked_when_no_oidc(
@@ -625,11 +626,12 @@ class TestChooseAttestation:
             oidc_token=None,
             workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
         )
-        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
         mock_sign.assert_not_called()
         assert bundle == ""
         assert signature  # base64 DER
         assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
 
     @patch("mipiti_verify.runner.sign_verification_statement")
     def test_signing_prefer_workspace_skips_sigstore(
@@ -640,11 +642,12 @@ class TestChooseAttestation:
             workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
             signing_prefer="workspace",
         )
-        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
         mock_sign.assert_not_called()
         assert bundle == ""
         assert signature
         assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
 
     @patch("mipiti_verify.runner.sign_verification_statement")
     def test_sigstore_failure_falls_through_to_workspace(
@@ -658,17 +661,19 @@ class TestChooseAttestation:
             oidc_token="eyJ.token",
             workspace_signing_key_path=str(_write_p256_pem(tmp_path)),
         )
-        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
         assert bundle == ""
         assert signature
         assert signed_hash == "ab" * 32
+        assert dsse_bundle == ""
 
     def test_no_signer_returns_all_empty(self) -> None:
         runner = self._runner(oidc_token=None)
-        bundle, signature, signed_hash = runner._choose_attestation(**self._call_kwargs())
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(**self._call_kwargs())
         assert bundle == ""
         assert signature == ""
         assert signed_hash == ""
+        assert dsse_bundle == ""
 
     def test_invalid_signing_prefer_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="signing-prefer must be"):
@@ -720,12 +725,13 @@ class TestChooseAttestation:
             oidc_token="eyJ.token",
             require_attestation=True,
         )
-        bundle, signature, signed_hash = runner._choose_attestation(
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
             **self._call_kwargs()
         )
         assert bundle == '{"mediaType":"sigstore-bundle"}'
         assert signature == ""
         assert signed_hash == ""
+        assert dsse_bundle == ""
 
     def test_require_attestation_default_off_preserves_unsigned_path(
         self,
@@ -735,10 +741,10 @@ class TestChooseAttestation:
         rather than raise."""
         runner = self._runner(oidc_token=None)
         # No exception raised; tuple of empties returned.
-        bundle, signature, signed_hash = runner._choose_attestation(
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
             **self._call_kwargs()
         )
-        assert (bundle, signature, signed_hash) == ("", "", "")
+        assert (bundle, signature, signed_hash, dsse_bundle) == ("", "", "", "")
 
     def test_bad_workspace_key_path_raises(self, tmp_path: Path) -> None:
         bad = tmp_path / "bad.pem"
@@ -753,3 +759,55 @@ class TestChooseAttestation:
         monkeypatch.setenv("MIPITI_WORKSPACE_SIGNING_KEY", str(path))
         runner = self._runner(oidc_token=None)
         assert runner.workspace_signer is not None
+
+    @patch("mipiti_verify.runner.sign_verification_statement")
+    def test_customer_key_preferred_over_sigstore(
+        self, mock_sign: MagicMock, tmp_path: Path
+    ) -> None:
+        """When a customer key is supplied it wins even over an available
+        OIDC token: the operator explicitly opted into the
+        customer-controlled, offline-verifiable attestation."""
+        runner = self._runner(
+            oidc_token="eyJ.token",
+            customer_key_path=str(_write_p256_pem(tmp_path)),
+        )
+        bundle, signature, signed_hash, dsse_bundle = runner._choose_attestation(
+            **self._call_kwargs()
+        )
+        mock_sign.assert_not_called()  # Sigstore path not taken
+        assert bundle == ""
+        assert signature == ""
+        assert signed_hash == ""
+        assert dsse_bundle  # JSON customer-dsse bundle
+        import json as _j
+
+        parsed = _j.loads(dsse_bundle)
+        assert parsed["kind"] == "customer-dsse"
+
+    def test_customer_key_env_var_autodetected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _write_p256_pem(tmp_path)
+        monkeypatch.setenv("MIPITI_CUSTOMER_SIGNING_KEY", str(path))
+        runner = self._runner(oidc_token=None)
+        assert runner.customer_key_path == str(path)
+
+    def test_bad_customer_key_passphrase_raises(self, tmp_path: Path) -> None:
+        """A wrong/missing passphrase is a hard error, not a silent
+        fall-through to unsigned — the operator's signing intent is
+        explicit."""
+        key = ec.generate_private_key(ec.SECP256R1())
+        enc = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"correct"),
+        )
+        kp = tmp_path / "enc.pem"
+        kp.write_bytes(enc)
+        runner = self._runner(
+            oidc_token=None,
+            customer_key_path=str(kp),
+            customer_key_passphrase="wrong",
+        )
+        with pytest.raises(ValueError, match="--customer-key signing failed"):
+            runner._choose_attestation(**self._call_kwargs())

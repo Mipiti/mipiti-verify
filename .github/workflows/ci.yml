@@ -73,14 +73,53 @@ jobs:
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: VerificationPipeline reverify=true ---"
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
-          echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R10) ---"
+          echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R6, R10, R12 + R3a) ---"
           java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
+        working-directory: formal
+
+  audit-tlc:
+    # Dedicated job for the two compositional audit-spec TLC configs
+    # (audit_main.cfg / audit_bundle_bind.cfg) plus the AST-proof gate
+    # that certifies their lossless AuditView reduction. Isolated from
+    # `test` so a long-but-correct audit TLC run never blocks the
+    # critical path — it runs in parallel with `test` /
+    # `test-spec-invariants`. Still a required check; no gate is
+    # weakened. See formal/COMPOSITION.md.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Formal verification (AuditView faithfulness — AST proof)
+        # Gates the lossless `VIEW AuditView` reduction in
+        # audit_main.cfg / audit_bundle_bind.cfg. Structurally proves
+        # every cfg invariant observes the collapsed customer_dsse
+        # fields only via (in)equality, so each factors through the
+        # view ⇒ the reduction loses no invariant violation. Sound
+        # over-approximation; fails closed on any unprovable
+        # reference. See formal/COMPOSITION.md.
+        run: python formal/check_audit_view_faithful.py
+
+      - name: Download TLC
+        run: |
+          TLC_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
+          TLC_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+          curl -sL "$TLC_URL" -o tla2tools.jar
+          echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
         working-directory: formal
 
       - name: Formal verification (TLC — audit, Config 1, bundle_bind pinned)
         # Compositional split per formal/COMPOSITION.md. Config 1 pins
         # bundle_bind to its canonical matching representative and
-        # verifies I1-I7, I9-I13, V3, plus a machine-checked
+        # verifies I1-I7, I9-I13, V3, V5a-V5c, plus a machine-checked
         # composition lemma proving the pinning is precision-
         # preserving. Runs in parallel with Config 2 below.
         run: |
@@ -90,7 +129,10 @@ jobs:
 
       - name: Formal verification (TLC — audit, Config 2, bundle_bind explored)
         # Config 2 explores the full bundle_bind cross-product with
-        # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2.
+        # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2, V4.
+        # Init_bind excludes customer_dsse rows — lossless, since every
+        # Config-2 invariant requires pkg.bundle # ABSENT and a
+        # customer_dsse row has bundle = ABSENT (see COMPOSITION.md).
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
           java $JAVA_OPTS -jar tla2tools.jar -config audit_bundle_bind.cfg -workers auto audit.tla

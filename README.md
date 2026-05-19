@@ -91,7 +91,8 @@ A signed audit package (PDF or JSON) carries the following per-row evidence:
 | `content_integrity.bundle_bind_hash` | Explicit hash the verifier compares to the bundle's Subject digest (no rehashing on either side) | Pinned by `bundle_bind_signature` (platform key) |
 | `content_integrity.bundle_bind_signature` | Platform ECDSA signature over `bundle_bind_hash` | Platform JWKS key (verifies independently of bundle) |
 | `content_integrity.signature` + `public_key_pem` | Workspace-ECDSA signature over the row's content (when key_source is `workspace`) | Customer's workspace ECDSA key |
-| `content_integrity.key_source` | One of `sigstore` / `platform` / `workspace` / `unverifiable_orphan` / `legacy` | Tells the verifier which trust anchor to use for this row |
+| `content_integrity.dsse_bundle` | Self-contained customer-keyed DSSE / in-toto attestation, signed offline with the customer's own ECDSA P-256 key (when key_source is `customer_dsse`) | Customer's own key, pinned out-of-band by fingerprint |
+| `content_integrity.key_source` | One of `sigstore` / `platform` / `workspace` / `customer_dsse` / `unverifiable_orphan` / `legacy` | Tells the verifier which trust anchor to use for this row |
 
 ### Each check the verifier runs
 
@@ -103,6 +104,7 @@ A signed audit package (PDF or JSON) carries the following per-row evidence:
 | **Bundle bind** | `bundle_bind_hash` ↔ bundle in-toto Subject digest (compared directly, no rehashing) | Subject digest doesn't equal `bundle_bind_hash` | Bundle/envelope swap (a real bundle paired with a different envelope's content) |
 | **Bundle-bind signature** | Platform JWKS key (resolved via PDF outer-sig pubkey, `--platform-pubkey`, or envelope `public_key_pem`) | Signature invalid or no key resolvable | Tampering with `bundle_bind_hash` after the platform signed it |
 | **Content-integrity signature** | Workspace ECDSA key embedded in envelope `public_key_pem` | Signature doesn't verify against embedded key | Tampering with `verification_run.results` for workspace-keyed rows |
+| **Customer-keyed DSSE** (when key_source is `customer_dsse`) | The DSSE PAE over the customer-signed in-toto Statement, verified against the auditor-pinned customer public key (`--expected-customer-key`) | DSSE signature invalid, subject digest doesn't bind to the report content hash, or the signing key's fingerprint doesn't match the pinned key | Forgery of the customer-CI-side evidence in air-gapped / non-Sigstore CI; vendor substitution of the signing key |
 | **Identity policy** (when pinned via `--expected-ci-identity`) | Auditor's out-of-band knowledge of the customer's CI workflow | Bundle's Fulcio SAN doesn't equal the pin (or issuer doesn't equal `--expected-issuer`) | Compromised-Mipiti forgery: a real bundle minted under an attacker's CI identity passes Sigstore but fails the pin |
 | **Workspace key pin** (when `--expected-workspace-key`) | Auditor's out-of-band knowledge of the customer's workspace key | Recomputed fingerprint of the public key actually used for verification doesn't match the pin | Forged-key attack: an attacker-held key with `claimed_fp` set to the customer's known fp |
 | **Predicate pins** (when `--expected-model-id` / `--expected-commit-sha`) | Bundle's signed in-toto predicate | Predicate fields don't equal the pins | Replay of an older verification run; cross-model substitution |
@@ -123,7 +125,8 @@ Pins are **out-of-band knowledge** the auditor brings to the verification: they'
 - `--ci-identity-from-env` — auto-derive from `GITHUB_WORKFLOW_REF` when running `audit` inside CI for the same workflow that generated the report.
 - `--expected-issuer` — pin the OIDC issuer. Required for self-hosted GitHub Enterprise / GitLab; auto-derived from SAN prefix for github.com / gitlab.com.
 - `--expected-workspace-key '<fp>'` — pin the workspace ECDSA key fingerprint (SHA-256 hex of DER SubjectPublicKeyInfo).
-- `--expected-model-id`, `--expected-commit-sha` — pin predicate fields signed inside the bundle.
+- `--expected-customer-key '<path-to-pubkey.pem>'` — pin the customer's public key (PEM) for the customer-keyed offline DSSE path. The verifier requires the SHA-256 fingerprint of this key's DER SubjectPublicKeyInfo to equal the key that actually signed the bundle. Source the public key from the customer out-of-band, never from the envelope. Required whenever the package carries a `customer_dsse` envelope — without it, the audit fails closed.
+- `--expected-model-id`, `--expected-commit-sha` — pin predicate fields signed inside the bundle. For `customer_dsse`, `--expected-customer-key` is the analogue of a SAN pin: it makes the predicate pins meaningful (the predicate is signed by the customer's own key), so predicate pins may be used together with it without `--expected-ci-identity`.
 
 The verifier emits a "Trust contract" summary block at the end of each audit listing which pins were enforced and which were skipped, so an auditor can see at a glance what their command actually checked.
 
@@ -149,8 +152,36 @@ Every published audit can be re-checked offline using only:
 - The Mipiti instance's JWKS (`/.well-known/jwks`; pinnable via `--platform-pubkey <pem>` for fully offline runs).
 - The customer's workspace key fingerprint (auditor's out-of-band knowledge).
 - The customer's CI workflow identity (auditor's out-of-band knowledge).
+- For the customer-keyed offline DSSE path: the customer's public key, pinned out-of-band by the auditor via `--expected-customer-key`.
 
 No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
+
+### Customer-keyed offline signing (air-gapped / non-Sigstore CI)
+
+Sigstore signing needs a Fulcio-trusted OIDC token and reachability to public Sigstore infrastructure at sign time. CI that structurally cannot do this — Jenkins, self-managed or older GitLab, Buildkite/CircleCI without OIDC, regulated/air-gapped networks — can instead sign with a **customer-controlled key**, fully offline, and have the result remain independently verifiable in the standard DSSE / in-toto format.
+
+**Producer side (`mipiti-verify run`).** Generate an ECDSA P-256 keypair, keep the private half local, and register the public half on the Mipiti workspace. Then:
+
+```bash
+mipiti-verify run tm-abc123 \
+  --api-key "$MIPITI_API_KEY" \
+  --customer-key ./customer-signing-key.pem \
+  --customer-key-passphrase "$KEY_PASSPHRASE"   # omit for an unencrypted key
+```
+
+`--customer-key` (env: `MIPITI_CUSTOMER_SIGNING_KEY`; passphrase env: `MIPITI_CUSTOMER_SIGNING_KEY_PASSPHRASE`) builds a standard in-toto Statement (same shape as the Sigstore path — assertion specs + verdicts in the predicate), computes the DSSE Pre-Authentication Encoding, and signs it with the customer's key. No Fulcio, no Rekor, no network at sign time. When supplied, this path is preferred over Sigstore. Combine with `--require-attestation` to fail the run if signing did not occur.
+
+**Auditor side (`mipiti-verify audit`).** Obtain the customer's public key out-of-band (release docs / security policy) and pin it:
+
+```bash
+mipiti-verify audit report.json \
+  --expected-customer-key ./customer-public-key.pem \
+  --expected-model-id tm-abc123        # optional predicate pins, now meaningful
+```
+
+The verifier reconstructs the DSSE PAE from the embedded payload, checks the signature, requires the SHA-256 fingerprint of the pinned key's DER SubjectPublicKeyInfo to equal the key that actually signed the bundle (the vendor-independence gate — a swapped key fails here), and binds the Statement subject digest to the report's content hash. Entirely offline. If the package carries a `customer_dsse` envelope but `--expected-customer-key` is not supplied, the audit fails closed and says so — the embedded PEM is never silently trusted.
+
+For this path the vendor-independence property holds without caveat: the auditor verifies the chain from the envelope bytes plus a fingerprint pinned **from the customer**. Mipiti is pure transport — it holds no customer private key and cannot substitute the key without failing the fingerprint gate. Revocation is out-of-band (the customer tells auditors to stop trusting a fingerprint), the same as any pinned key.
 
 ## API Key Scopes
 

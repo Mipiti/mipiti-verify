@@ -76,8 +76,9 @@ These invariants explicitly reference `bundle_bind_hash` and/or
 |---|---|
 | `I8_BundleBoundToBundleBindHash` | Conclusion: `bundle.bound_hash = bundle_bind_hash`. Must explore states where they differ. |
 | `I14_BundleBindExplicit` | Conclusion: `bundle_bind_hash ≠ NONE` AND `bundle.bound_hash = bundle_bind_hash`. Same. |
-| `V1_SigstoreSkipSoundness` | Premise: `bundle_bind_hash = bundle.bound_hash` AND `bundle_bind_signature ≠ FALSE`. Must explore the full domain to confirm the conclusion holds on all premise-satisfying states. |
+| `V1_SigstoreSkipSoundness` | Premise: `bundle ≠ ABSENT` AND `bundle_bind_hash = bundle.bound_hash` AND `bundle_bind_signature ∉ {INVALID, KEY_UNRESOLVABLE}`. Must explore the full domain to confirm the conclusion holds on all premise-satisfying states. |
 | `V2_OrphanWithBundleVerified` | Same as V1 with `KS_ORPHAN`. |
+| `V4_BundleBindSigKeyResolutionExplicit` | Premise: `bundle ≠ ABSENT` AND `bundle_bind_signature = KEY_UNRESOLVABLE`. Conclusion: `Audit ∈ {FAILED, USAGE_ERROR}`. Directly references the `bundle_bind_signature` domain. |
 
 Config 2 pins all auditor pins (`pins.san`, `issuer_explicit`,
 `workspace_fp`, `model_id`, `commit_sha`) to `NONE`. Reason: V1/V2's
@@ -130,3 +131,380 @@ on `audit.tla`'s reachable state space.
 The original `audit.cfg` is retained for backward compatibility and
 periodic soundness verification (manual or scheduled run); it is not
 required on every CI tick.
+
+## Config-2 customer_dsse exclusion (lossless)
+
+`Init_bind` (Config 2's init operator, selected by
+`audit_bundle_bind.cfg` via `SPECIFICATION Spec_bind`) calls the
+parameterised `InitBase(genCustomerDsse)` with `genCustomerDsse =
+FALSE`. `InitBase(FALSE)` enumerates `pkg \in PackageGen(FALSE)`,
+whose `WSSigGen(FALSE)` generator **drops `KS_CUSTOMER_DSSE` from the
+`key_source` domain and pins the three customer_dsse-only WSSig
+fields to singletons**:
+
+```tla
+key_source                : KeySources \ {KS_CUSTOMER_DSSE}
+dsse_predicate_model_id   : {NONE}
+dsse_predicate_commit_sha : {NONE}
+customer_key_fp_match     : {TRUE}
+```
+
+i.e. **Config 2 never generates a customer_dsse row** — and, because
+this is a smaller *enumerated set* (not a post-`\in` filter), TLC's
+init-state generator never materialises the customer_dsse
+sub-product (~18× fewer WSSig records: `3·3·2` collapsed to `1·1·1`,
+`KeySources` 6→5). `Init_main` (Config 1) and the legacy `Init` call
+`InitBase(TRUE)`, where `PackageGen(TRUE)` is byte-equivalent to the
+original `Package` (customer_dsse fully generated). Note
+`PackageGen(FALSE) ⊆ Package`, so `TypeOK == pkg \in Package` still
+holds on every Config-2 state. A *bare conjunctive* exclusion
+(`… /\ pkg.ws_sig.key_source # KS_CUSTOMER_DSSE`) layered after an
+unparameterised `pkg \in Package` was measured **not** to prune
+generation — TLC iterates the full record product first and only
+then discards — which is the init-generation blow-up the AuditView /
+InitBase-canon work documents; the generator-set restriction is what
+actually prunes.
+
+This is *lossless* — it removes only states on which every invariant
+Config 2 checks is vacuously true:
+
+- The exact invariant set Config 2 verifies is
+  `ConfigBindInvariants` = **`I8`, `I14`, `V1`, `V2`, `V4`** (plus
+  `TypeOK`). This is the machine-checked list — `audit.tla`'s
+  `ConfigBindInvariants` body — not a prose restatement.
+- **Every one of `I8`, `I14`, `V1`, `V2`, `V4` has a premise conjunct
+  requiring `pkg.bundle # ABSENT`** (I8: `… /\ pkg.bundle # ABSENT`;
+  I14: `Audit = VERIFIED /\ pkg.bundle # ABSENT`; V1/V2:
+  `… /\ pkg.bundle # ABSENT /\ pkg.bundle.valid …`; V4:
+  `pkg.bundle # ABSENT /\ bundle_bind_signature = KEY_UNRESOLVABLE`).
+  `TypeOK` is a pure type predicate that holds on every well-typed
+  state regardless.
+- A customer_dsse row has **`pkg.bundle = ABSENT`** — the
+  KeySourceResolver `R12` producer constraint imported into
+  `InitBase` (the clause `pkg.ws_sig.key_source = KS_CUSTOMER_DSSE
+  => pkg.bundle = ABSENT /\ pkg.ws_sig.valid = TRUE`).
+- Therefore on **every** customer_dsse state, all five Config-2
+  invariant premises are vacuously false ⇒ each invariant holds
+  trivially. Customer_dsse states contribute **zero** invariant
+  coverage to Config 2.
+
+This is the *same* partition argument that already places the
+customer_dsse positive properties (`V5a`/`V5b`/`V5c`) in **Config
+1's** partition: customer_dsse rows are bundle-absent, hence
+`bundle_bind`-pinned `NONE/NONE`, hence Config-1 territory.
+`Init_main` (Config 1) is **unchanged** and still generates
+customer_dsse — `V5a`/`V5b`/`V5c` legitimately need it, and Config
+1's sound full run stands.
+
+**Soundness gate (verified before adopting the exclusion).** The
+transitive operator closure of `ConfigBindInvariants`/`TypeOK` (the
+same call-graph the AST proof in `check_audit_view_faithful.py`
+walks) reaches `KS_CUSTOMER_DSSE` / `dsse_predicate_*` /
+`customer_key_fp_match` / `IsCustomerDsse` **only** through the
+shared, invariant-agnostic `Audit` / `WSSig` / `KeySources`
+infrastructure. **No Config-2 invariant body itself** references any
+customer_dsse symbol, nor does any Config-2 invariant observe the
+customer_dsse `Audit` terminal-dispatch outcome (each requires
+`bundle # ABSENT`, which customer_dsse — being bundle-absent — can
+never satisfy, so the customer_dsse branch of `Audit` is unreachable
+on any state where a Config-2 premise is non-vacuous). The exclusion
+is sound.
+
+Effect (measured, `eclipse-temurin:21-jre`, `-Xmx8g -workers auto`,
+TLC 2.19): Config 2 (`audit_bundle_bind.cfg`) **completes** —
+`Model checking completed. No error has been found.` — in
+**3 min 37 s**, **142,743 distinct states** (1,272,102 generated).
+Before this change Config 2 did not terminate (stuck in init-state
+generation past 2 h with the customer_dsse cross-product
+materialised). Config 1 (`audit_main.cfg`) is byte-unchanged and its
+prior sound ~1 h run stands (its spec call `InitBase(TRUE)` is
+provably a no-op refactor: `PackageGen(TRUE) ≡ Package`).
+
+The reduction is orthogonal to (and composes with) the `AuditView`
+VIEW and the `InitBase` relation-class canonicalisation: those make
+the *retained* customer_dsse states tractable for Config 1; this
+exclusion removes the *vacuous* ones from Config 2 entirely.
+
+## CI job split
+
+The audit-spec TLC work runs in a **dedicated `audit-tlc` job** in
+`.github/workflows/ci.yml`, parallel to `test` and
+`test-spec-invariants`:
+
+- `audit-tlc` owns the `check_audit_view_faithful.py` AST-proof gate
+  (it certifies the lossless `AuditView` reduction these two configs
+  depend on), the TLC download, and the two `audit.tla` configs
+  (`audit_main.cfg` Config 1 + `audit_bundle_bind.cfg` Config 2),
+  both with `-workers auto`.
+- `test` keeps the Python BFS cross-check and the
+  `VerificationPipeline` / `KeySourceResolver` TLC runs.
+
+Rationale: a long-but-correct audit TLC run no longer sits on the
+critical path of the fast unit/BFS suite. No gate is weakened — every
+job (`test`, `audit-tlc`, `test-spec-invariants`) remains a required
+status check; the AST proof still fails closed; `-workers auto` and
+the JVM tuning are unchanged.
+
+## Companion: resolver-side invariant index
+
+The issuer-side `KeySourceResolver.tla` carries its own invariant set
+(`R1`–`R6`, `R10`, `R12` + `R3a`), indexed in that module's header.
+The `customer_dsse` key-source classification adds **`R12` —
+Customer-DSSE binding integrity**: the `customer_dsse` class fires iff
+a stored workspace key resolves the fingerprint AND a valid
+customer-signed DSSE bundle re-verifies against it (and no valid
+Sigstore bundle is present, which still wins by precedence); it must
+carry the dsse_bundle, stored public key, and workspace id and must
+not be an orphan, while the bare-key `workspace` class must never
+carry a dsse_bundle. This is a resolver invariant, not part of the
+`audit.tla` `bundle_bind` partition above — it is checked by
+`KeySourceResolver.cfg` (and the companion Python BFS), independently
+of the two audit configs.
+
+On the verifier side, `audit.tla` adds `KS_CUSTOMER_DSSE` to
+`KeySources` in the same trust-anchor class as `KS_SIGSTORE` (the
+customer-signed DSSE Statement, verified offline against an
+out-of-band-pinned fingerprint, is the anchor — the envelope ws_sig
+is not re-evaluated). It is added to the `KS_SIGSTORE`-style ws_sig
+skip sets and to `I9`'s skip set.
+
+### Customer-DSSE identity-pin scoping
+
+The customer-keyed offline DSSE path gates identity **solely** on the
+auditor's `--expected-customer-key` fingerprint pin (the
+vendor-independence gate, `customer_dsse_verifier.py` step 3). It does
+**not** engage the Sigstore-SAN identity pins (`--expected-ci-identity`
+/ the resolved-issuer pin) nor the `--expected-workspace-key` pin —
+there is no Sigstore bundle to bind a SAN to, and the customer-DSSE
+CLI branch never consults the workspace-key pin. The model_id /
+commit_sha predicate pins ARE enforced, but against the
+customer-signed DSSE predicate, not a Sigstore bundle.
+
+`audit.tla` models this with a key_source-aware refinement that is
+**additive** (no behaviour change for sigstore / platform / workspace
+/ orphan / legacy):
+
+- A `KS_CUSTOMER_DSSE` *terminal dispatch* in the `Audit` operator
+  (placed after the `I2` workspace-pin fail, mirroring the CLI's
+  `customer_dsse_handled` branch): an `--expected-customer-key`
+  fingerprint mismatch ⇒ `FAILED`; a model_id / commit_sha pin not
+  matching the customer-signed predicate ⇒ `FAILED`; otherwise the
+  key_source-independent canonical-hash check decides
+  (`VERIFIED` / `FAILED`).
+- The Sigstore-identity pin clauses are scoped out of customer_dsse:
+  `I1` (bundle-binding-pin-is-binding) and `I7`'s predicate-co-pin
+  clause carve out customer_dsse; `I4` (workspace-fp bound) carves it
+  out; the `Audit` operator's SAN-less-co-pin / I1-omission /
+  SAN-match / workspace-fp branches all gain `~IsCustomerDsse(k)`
+  guards. `I7`'s **issuer-explicit-alone** clause stays
+  key_source-unconditional (a bare `--expected-issuer` is a usage
+  error regardless of key_source).
+- Three new invariants positively state the customer_dsse pinned
+  property: **`V5a`** (a customer-key fingerprint-pin mismatch must
+  FAIL), **`V5b`** (a match + a producer-valid customer-signed DSSE
+  row + intact canonical hash + matching predicate pins ⇒ VERIFIED,
+  *even when* a SAN or workspace-fp pin is set), and **`V5c`** (a
+  customer_dsse row's verdict is invariant under the SAN pin — the
+  Sigstore-identity pins provably do not gate it).
+
+The `KS_CUSTOMER_DSSE` producer contract from `KeySourceResolver.tla`
+`R12` (the class fires only when no valid Sigstore bundle is present
+and a valid customer-signed DSSE bundle re-verifies) is imported into
+`InitBase`: a customer_dsse row has `bundle = ABSENT` and a
+producer-valid envelope ws_sig (`valid = TRUE`). Because
+`bundle = ABSENT`, `bundle_bind` is pinned `NONE/NONE` and the
+customer_dsse invariants are `bundle_bind`-independent — they live in
+Config 1's partition, and `ConfigMainCompositionLemma` (premise
+`pkg.bundle # ABSENT`) is vacuous on customer_dsse rows. The
+refinement therefore introduces no new `bundle_bind`-dependent premise
+or conclusion, so the partition argument and
+`ConfigMainCompositionLemma` above remain sound unchanged.
+
+## `AuditView` — lossless two-sided Rel3 state-space reduction
+
+The `customer_dsse` modeling added three `WSSig` fields —
+`customer_key_fp_match : BOOLEAN`,
+`dsse_predicate_model_id : ModelIds ∪ {NONE}`,
+`dsse_predicate_commit_sha : CommitShas ∪ {NONE}`. On a customer_dsse
+row the auditor's `model_id` / `commit_sha` pins are cross-checked
+against the customer-signed DSSE predicate (the `dsse_predicate_*`
+fields), so the reachable state space carries the **full
+cross-product**
+
+```
+(dsse_predicate_model_id × pins.model_id)
+  × (dsse_predicate_commit_sha × pins.commit_sha)
+  × customer_key_fp_match
+= 3·3 · 3·3 · 2 = 162 raw combinations
+```
+
+multiplied into the rest of the audit space, on top of the already
+symmetry-reduced graph. With this product present, TLC on
+`audit_main.cfg` / `audit_bundle_bind.cfg` ran 2h+ with no progress
+checkpoint (effectively non-terminating in CI).
+
+### The reduction
+
+`AuditView` (defined in `audit.tla`, wired via `VIEW AuditView` in
+both cfgs) is a **key-source-conditional** TLC view:
+
+- **On a `customer_dsse` row** (`IsCustomerDsse(pkg)`, THEN branch):
+  it projects the pair `(dsse_predicate_model_id, pins.model_id)` to
+  a 3-valued relation token via `Rel3` — `q_none` (pin unset) /
+  `match` / `mismatch` — does the same for
+  `(dsse_predicate_commit_sha, pins.commit_sha)`, keeps
+  `customer_key_fp_match` verbatim (a boolean), and keeps **every
+  other observable field of `pkg`/`pins` verbatim**. The 162-way raw
+  product collapses to `2·3·3 = 18` observable classes.
+- **On a NON-customer_dsse row with `bundle # ABSENT`** (the
+  Sigstore / bundle class, ELSE-then branch): it projects the pair
+  `(pkg.bundle.predicate_model_id, pins.model_id)` to a 3-valued
+  `Rel3` token, does the same for
+  `(pkg.bundle.predicate_commit_sha, pins.commit_sha)`, drops those
+  four identities, and keeps **every other field of
+  `pkg`/`bundle`/`pins` verbatim**. The `3·3·3·3` predicate × pin
+  raw cross-product collapses to `3·3 = 9` observable classes. This
+  is the **two-sided extension**: the symmetric twin of the
+  customer_dsse collapse, on the previously-identity Sigstore class
+  that was the dominant Config-1 state-mass bottleneck.
+- **On a NON-customer_dsse row with `bundle = ABSENT`** (and when
+  `ws_sig = ABSENT`): the view is the **identity** `<<pkg, pins>>`,
+  bit-for-bit unchanged from the pre-extension view on this subcase.
+
+### Why the two-sided collapse is sound
+
+Both branches discharge the **same** factor-through obligation.
+Across the `Audit` operator and **every** cfg invariant — every
+`Audit` invocation is `Audit(pkg, pins)`, so `q ≡ pins` — the bundle
+predicate fields are observed **only** through (in)equality against
+the pins or the `NONE` sentinel:
+
+- `pkg.bundle.predicate_model_id # q.model_id` (`Audit`:481–482),
+  guarded by `q.model_id # NONE`;
+- `pkg.bundle.predicate_model_id = pins.model_id` (`I12`), guarded
+  by `pins.model_id # NONE`;
+- symmetric for `predicate_commit_sha` (`Audit`:486–487, `I13`);
+- `pins.model_id` / `pins.commit_sha` are otherwise read **only**
+  via `# NONE` / `= NONE` (`I1`/`I7`/`V3` …) — a relation the
+  `Rel3` token's `q_none` class preserves exactly.
+
+So a bundle-present non-customer_dsse row's contribution to every
+invariant **factors through**
+`<Rel3(bundle.predicate_model_id, pins.model_id),
+Rel3(bundle.predicate_commit_sha, pins.commit_sha)>` exactly as a
+customer_dsse row factors through the `dsse_predicate_*` tokens —
+collapsing it is lossless, not merely dedup-equivalent.
+
+The **bundle-absent** non-customer_dsse subcase stays the literal
+identity: there is no bundle predicate (every bundle-predicate /
+`I12` / `I13` read is guarded by `bundle # ABSENT` and is vacuous),
+and `pins.model_id` / `pins.commit_sha` are observed there only via
+`# NONE` / `= NONE` with no predicate to fold them into — so keeping
+them verbatim is the only sound choice and preserves behaviour
+exactly. A *global* (bundle-absent included) pins collapse would be
+**unsound** for the same reason it was before the extension; the
+extension narrows the identity region to exactly that subcase rather
+than the whole Sigstore class.
+
+### Lossless by construction — the AST proof
+
+A TLC `VIEW` is lossless iff every checked invariant *factors
+through* the view (two states with the same view agree on every
+invariant). `formal/check_audit_view_faithful.py` **proves** this by
+a stdlib-only structural analysis of `audit.tla`:
+
+1. Parse every top-level operator; resolve the operator-call graph
+   transitively from the `INVARIANTS` roots of both cfgs (an
+   invariant calling a helper that touches a collapsed field counts).
+2. For every reference to a collapsed field
+   (`dsse_predicate_model_id`, `dsse_predicate_commit_sha`, the
+   Sigstore bundle `predicate_model_id` / `predicate_commit_sha`,
+   `customer_key_fp_match`, and the `.model_id` / `.commit_sha`
+   pins) inside any invariant-reachable operator body, classify its
+   immediate syntactic context and **assert** it is an operand of an
+   (in)equality operator (`=`, `#`, `/=`) or — for the boolean —
+   used as a boolean. Arithmetic, ordering (`<`,`>`,`<=`,`>=`),
+   function application exposing identity, and identity-distinguishing
+   set membership all FAIL. Any reference not *positively* provable
+   safe FAILS (sound over-approximation: unprovable ⇒ unsafe).
+
+Because every invariant observes the collapsed quantities **only via
+(in)equality / boolean-as-boolean**, each invariant's truth value is
+a function of the 3-valued relation token and the kept boolean —
+i.e. it factors through `AuditView`. The reduction therefore loses
+no invariant violation: it is **lossless by construction**, and the
+script is the machine-checked proof. The AST analyzer is a sound
+over-approximation (it never passes a reference it cannot prove
+safe) and is non-vacuous (a negative self-test confirms it flags an
+injected arithmetic/ordering use of a collapsed field).
+
+### Generation-time twin: the InitBase relation-class canonicalisation
+
+A TLC `VIEW` collapses the *seen / state-queue* set but TLC still
+**generates** every raw `InitBase` tuple before applying the view —
+so the customer_dsse predicate × pin cross-product remained the
+residual *generation* blow-up (init-state enumeration never reached
+the BFS phase where the view's benefit applies). `InitBase`
+therefore also pins the customer_dsse predicate fields to a
+**canonical representative of each reachable relation class**, by the
+*same* faithfulness property the AST proof establishes:
+
+- `pins.model_id = NONE` ⇒ the relation is `q_none` for every
+  predicate value ⇒ `dsse_predicate_model_id = NONE` (1 generated
+  rep, was 3).
+- `pins.model_id # NONE` ⇒ only `match`
+  (`dsse_predicate_model_id = pins.model_id`) and `mismatch` are
+  reachable; `NONE` is a canonical mismatch witness
+  (`NONE # any non-NONE pin`), so the predicate ranges over
+  `{pins.model_id, NONE}` — exactly the two classes (2 reps, was 3).
+- Symmetric for `commit_sha`.
+
+This is **lossless, not merely dedup-equivalent**: because every
+invariant's verdict is a proven function of
+`Rel3(dsse_predicate_*, pins.*)` alone (the AST proof), every dropped
+predicate value is relation-equivalent to a retained representative
+and yields an identical verdict on every invariant — so omitting it
+from *generation* changes no checked property. It is the standard
+canonical-representative `InitBase` pruning (same pattern as the
+pre-existing dead-field pins), certified by
+`check_audit_view_faithful.py` rather than asserted. The `VIEW`
+is retained — it is the formal lossless artifact under review and
+still collapses the residual successor/seen-set space; the
+`InitBase` canonicalisation is its generation-time twin so TLC
+actually terminates in tractable time.
+
+### Corroborated by a mutation test
+
+As an independent empirical check that the view does not mask
+regressions: a customer_dsse invariant is deliberately broken (the
+`Audit` terminal-dispatch clause `~customer_key_fp_match ⇒ FAILED`
+weakened so a mismatched customer key no longer fails) and TLC is
+re-run **with the view active**. TLC still reports an invariant
+violation (`V5a_CustomerDssePinMismatchFails` counterexample),
+proving the view did not hide the regression. Reverting the mutation
+restores a clean run. See the final-report record of the
+before/after TLC output.
+
+The two-sided extension adds a proof-side non-vacuity check: a
+structural (`\in`) use of the newly-collapsed
+`pkg.bundle.predicate_model_id` is transiently injected into `I12`
+and `check_audit_view_faithful.py` is confirmed to **FAIL** within
+seconds (it flags the non-(in)equality use of a collapsed field),
+then reverted. This proves the extended AST proof actually
+constrains the bundle predicate fields rather than passing them
+vacuously.
+
+### Residual soundness assumption
+
+The faithfulness proof reasons over `audit.tla`'s source structure:
+it assumes the spec uses the standard TLA+ operators it tokenizes
+(`=`, `#`, `/=`, `\/`, `/\`, `~`, `=>`, `\in`, etc.) and does not
+hide an identity-exposing observation of a collapsed field behind a
+construct the tokenizer does not model (e.g. a user-defined operator
+that returns one of the collapsed fields unequal-tested). The
+call-graph closure and the conservative "unprovable ⇒ unsafe" rule
+bound this: a new helper that touched a collapsed field unsafely
+would have to do so via one of the classified syntactic shapes (and
+fail) or via an unmodeled construct (and the analyzer, being
+conservative on unknown contexts, fails closed). The mutation test
+provides orthogonal empirical assurance.

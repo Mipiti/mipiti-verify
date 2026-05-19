@@ -3338,3 +3338,176 @@ class TestKeySourceDiscriminator:
         ])
         assert result.exit_code == 1
         assert "UNRESOLVED" in result.output
+
+
+class TestCustomerDsseAudit:
+    """`mipiti-verify audit` customer-keyed offline DSSE branch.
+
+    The package carries a real customer-signed DSSE bundle in
+    `content_integrity.dsse_bundle` with `key_source: "customer_dsse"`.
+    Trust derives from the auditor pinning the customer's public key via
+    `--expected-customer-key` (the fingerprint gate). Fully offline.
+    """
+
+    def _customer_dsse_pkg(
+        self, tmp_path, *, model_id="m1", commit_sha="abc123",
+        tamper_bind=False,
+    ):
+        """Build an audit package whose content_integrity carries a real
+        customer-DSSE bundle. Returns (pkg_path, public_key_pem_path)."""
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from mipiti_verify.customer_dsse_signer import (
+            sign_verification_statement,
+        )
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        key_path = tmp_path / "customer.pem"
+        key_path.write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+        pub_path = tmp_path / "customer-pub.pem"
+        pub_path.write_bytes(
+            key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+
+        # results_hash binds to canonical-serialised
+        # verification_run.results (empty list here, matching the other
+        # audit fixtures).
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+        dsse_bundle = sign_verification_statement(
+            model_id=model_id,
+            tier=1,
+            content_hash=stored,
+            pipeline={"provider": "jenkins", "commit_sha": commit_sha},
+            assertions=[],
+            results=[],
+            key_path=str(key_path),
+        )
+        bind_hash = (
+            "sha256:" + "00" * 32 if tamper_bind else stored
+        )
+        pkg = {
+            "model": {"id": model_id, "title": "t",
+                      "feature_description": "fd", "version": 1,
+                      "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [],
+                "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "key_source": "customer_dsse",
+                "results_hash": stored,
+                "bundle_bind_hash": bind_hash,
+                "dsse_bundle": dsse_bundle,
+                "public_key_pem": "",
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path), str(pub_path)
+
+    def test_customer_dsse_verifies_with_pin(self, tmp_path):
+        path, pub = self._customer_dsse_pkg(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", path, "--expected-customer-key", pub,
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Customer-keyed offline DSSE" in result.output
+        assert "DSSE signature:" in result.output and "VALID" in result.output
+        assert "MATCHED" in result.output
+
+    def test_customer_dsse_without_pin_fails_loudly(self, tmp_path):
+        path, _ = self._customer_dsse_pkg(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out = " ".join(result.output.split())
+        assert "--expected-customer-key was not supplied" in out
+
+    def test_customer_dsse_wrong_pinned_key_fails(self, tmp_path):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        path, _ = self._customer_dsse_pkg(tmp_path)
+        other = ec.generate_private_key(ec.SECP256R1())
+        other_pub = tmp_path / "other-pub.pem"
+        other_pub.write_bytes(
+            other.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", path, "--expected-customer-key", str(other_pub),
+        ])
+        assert result.exit_code == 1
+        assert "step 3" in result.output  # fingerprint-pin gate
+
+    def test_customer_dsse_predicate_model_pin(self, tmp_path):
+        path, pub = self._customer_dsse_pkg(tmp_path, model_id="m1")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", path,
+            "--expected-customer-key", pub,
+            "--expected-model-id", "m1",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Model ID pin:" in result.output
+
+    def test_customer_dsse_predicate_commit_mismatch_fails(self, tmp_path):
+        path, pub = self._customer_dsse_pkg(tmp_path, commit_sha="abc123")
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", path,
+            "--expected-customer-key", pub,
+            "--expected-commit-sha", "deadbeef",
+        ])
+        assert result.exit_code == 1
+        assert "Commit SHA pin:" in result.output
+        assert "MISMATCH" in result.output
+
+    def test_customer_dsse_tampered_bind_hash_fails(self, tmp_path):
+        """Subject digest no longer matches the (tampered) bind hash."""
+        path, pub = self._customer_dsse_pkg(tmp_path, tamper_bind=True)
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "audit", path, "--expected-customer-key", pub,
+        ])
+        assert result.exit_code == 1
+        assert "step 4" in result.output
+
+    def test_run_help_lists_customer_key_flags(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "--customer-key" in result.output
+        assert "--customer-key-passphrase" in result.output
+
+    def test_audit_help_lists_expected_customer_key(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "--help"])
+        assert result.exit_code == 0
+        assert "--expected-customer-key" in result.output
