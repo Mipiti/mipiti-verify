@@ -29,3 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "Docs-only PR, skipping spec-invariants"
+
+  # Required check (ruleset). Markdown-only changes are provably inert
+  # to audit.tla / the cfgs / the AST proof / the verified
+  # implementation, so the formal result is unchanged — report a
+  # trivial pass so docs-only PRs aren't blocked waiting on a status
+  # ci.yml's paths-ignore prevents from ever being posted.
+  audit-tlc:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Docs-only PR, skipping audit-spec TLC + AST proof"
