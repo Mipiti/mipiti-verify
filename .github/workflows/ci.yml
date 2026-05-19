@@ -109,8 +109,10 @@ jobs:
         # Fail-open: only sets inert=true when EVERY changed file is
         # provably inert. Path-inert: .github/workflows/**, **/*.md.
         # pyproject.toml is inert ONLY when its diff is confined to the
-        # `version = "..."` line — a dependency/entry-point/build edit
-        # there CAN change behavior and must NOT skip formal checks.
+        # `version = "..."` line; action.yml ONLY when confined to the
+        # Docker image-reference line (the pipeline's auto pin-action
+        # PR). A dependency/entry-point/build or substantive action.yml
+        # edit CAN change behavior and must NOT skip formal checks.
         # Non-PR events and any ambiguity leave inert unset ⇒ TLC runs.
         # Uses the preinstalled `gh` + github.token (no 3rd-party action).
         id: guard
@@ -137,6 +139,16 @@ jobs:
                   /^diff --git / {inf=0}
                   inf && /^[+-]/ && !/^(\+\+\+|---)/ {
                     if ($0 !~ /^[+-]version = ".*"$/) print }')
+                [ -n "$bad" ] && inert=false ;;
+              action.yml)
+                # Inert iff the ONLY +/- lines in action.yml's diff are
+                # the Docker image reference (the pipeline's auto
+                # pin-action PR). Any other changed line ⇒ run.
+                bad=$(gh pr diff "$PR" --repo "$REPO" --patch | awk '
+                  /^diff --git .*action\.yml/ {inf=1; next}
+                  /^diff --git / {inf=0}
+                  inf && /^[+-]/ && !/^(\+\+\+|---)/ {
+                    if ($0 !~ /docker:\/\/|^[+-][ \t]*image:/) print }')
                 [ -n "$bad" ] && inert=false ;;
               *) inert=false ;;
             esac
