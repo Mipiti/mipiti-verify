@@ -93,27 +93,79 @@ def _extract_key_sources(tla_text: str) -> set[str]:
     return values
 
 
+# Hardcoded mapping from specialized generator names to their fixed
+# `allowedKS`. Add a new entry here when a new specialized PackageGen*
+# is introduced (e.g., a future PackageGenForOrphan that pins specific
+# fields). The mapping captures the contract the specialized generator
+# carries — extracting it from the .tla body itself would require a
+# full parser; this list is the explicit, reviewable surface.
+_SPECIALIZED_GENERATORS: dict[str, frozenset[str]] = {
+    # PackageGenForCdsse — bundle pinned to {ABSENT} per R12, WSSig
+    # generator restricted to {KS_CUSTOMER_DSSE}. See audit.tla.
+    "PackageGenForCdsse": frozenset({"KS_CUSTOMER_DSSE"}),
+}
+
+
 def _extract_init_operators(tla_text: str) -> dict[str, set[str]]:
-    """Find every `Init_main_<class>` operator and the literal set it
-    passes to `InitBaseFor`.
+    """Find every `Init_main_<class>` operator and the `allowedKS` it
+    enumerates over.
+
+    Two recognized body shapes:
+      - `/\\ InitBaseFor({KS_..., KS_...})` — generic per-key_source
+        sub-config; allowedKS = the literal set.
+      - `/\\ pkg \\in <SpecializedGenerator>` — specialized generator;
+        allowedKS = the hardcoded mapping in _SPECIALIZED_GENERATORS.
 
     Returns {operator_name: {key_source literal, ...}}.
     """
-    pattern = re.compile(
+    out: dict[str, set[str]] = {}
+
+    # Shape 1: InitBaseFor({...}) calls.
+    generic_pattern = re.compile(
         r"^(Init_main_\w+)\s*==\s*\n"
         r"\s*/\\\s*InitBaseFor\s*\(\s*\{([^}]*)\}\s*\)",
         re.MULTILINE,
     )
-    out: dict[str, set[str]] = {}
-    for m in pattern.finditer(tla_text):
+    for m in generic_pattern.finditer(tla_text):
         name = m.group(1)
         raw = m.group(2)
         literals = {tok.strip() for tok in raw.split(",") if tok.strip()}
         if not literals:
             _die(f"{name} calls InitBaseFor with empty set")
         out[name] = literals
+
+    # Shape 2: `pkg \in <SpecializedGenerator>` calls — lift the
+    # generator's hardcoded allowedKS from _SPECIALIZED_GENERATORS.
+    specialized_pattern = re.compile(
+        r"^(Init_main_\w+)\s*==\s*\n"
+        r"\s*/\\\s*pkg\s*\\in\s*(\w+)",
+        re.MULTILINE,
+    )
+    for m in specialized_pattern.finditer(tla_text):
+        name = m.group(1)
+        gen = m.group(2)
+        if name in out:
+            # Already matched by generic_pattern — Init_main_<class>
+            # uses BOTH InitBaseFor and a specialized gen? That's a
+            # spec inconsistency; flag rather than silently merge.
+            _die(
+                f"{name} matches BOTH shapes (InitBaseFor + pkg \\in {gen}). "
+                f"Each Init_main_<class> must use exactly one allowedKS source."
+            )
+        if gen not in _SPECIALIZED_GENERATORS:
+            _die(
+                f"{name} uses specialized generator `{gen}` which is not in "
+                f"_SPECIALIZED_GENERATORS. Add `{gen}` to that mapping with "
+                f"its allowedKS (the set of key_source values its WSSig "
+                f"generator enumerates over)."
+            )
+        out[name] = set(_SPECIALIZED_GENERATORS[gen])
+
     if not out:
-        _die("no Init_main_<class> operators found that call InitBaseFor({...})")
+        _die(
+            "no Init_main_<class> operators found (either `InitBaseFor({...})` "
+            "or `pkg \\in <SpecializedGenerator>` shape)"
+        )
     return out
 
 

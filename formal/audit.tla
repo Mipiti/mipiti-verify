@@ -233,6 +233,34 @@ PackageGenFor(allowedKS) ==
       bundle_bind_hash       : (Hashes \cup {NONE}),
       bundle_bind_signature  : (BundleBindSigOutcomes \cup {NONE}) ]
 
+\* CDSSE-specific generator — lifts the R12 producer constraint
+\* (a customer_dsse row has bundle = ABSENT) into generation so TLC
+\* never materialises the ~325-element Bundle cross-product on a
+\* sub-config whose every row will fail the post-enumeration R12
+\* filter for bundle ≠ ABSENT. Saves ~3,800× the Package cardinality
+\* on the cdsse sub-config (the residual init-generation bottleneck
+\* after the per-key_source sub-split). bundle_bind_hash /
+\* bundle_bind_signature are pinned to {NONE} for the same reason
+\* (universal dead-field pin when bundle = ABSENT). Soundness:
+\*   - For ws_sig with key_source = KS_CUSTOMER_DSSE, R12 mandates
+\*     bundle = ABSENT — lifting it into generation just elides
+\*     enumeration of states the post-filter would have discarded.
+\*   - For ws_sig = ABSENT rows: this generator excludes them from
+\*     the bundle ≠ ABSENT branch, but the other four Config-1
+\*     sub-configs (sigstore / platform / workspace / orphan_legacy)
+\*     each include ws_sig = ABSENT × bundle ≠ ABSENT in their own
+\*     PackageGenFor enumeration (ws_sig: WSSigGenFor(allowedKS) ∪
+\*     {ABSENT}, bundle: Bundle ∪ {ABSENT}). So the "no-ws_sig +
+\*     bundle present" universe is covered there — no coverage loss.
+\* See formal/COMPOSITION.md.
+PackageGenForCdsse ==
+    [ bundle                 : {ABSENT},
+      ws_sig                 : (WSSigGenFor({KS_CUSTOMER_DSSE}) \cup {ABSENT}),
+      results_hash           : (Hashes \cup {NONE}),
+      results_canonical_hash : Hashes,
+      bundle_bind_hash       : {NONE},
+      bundle_bind_signature  : {NONE} ]
+
 \* Legacy boolean wrappers — preserved byte-equivalently so Init /
 \* Init_bind callers continue to work unchanged. gen=TRUE → all 6
 \* key_source values; gen=FALSE → all except KS_CUSTOMER_DSSE.
@@ -621,16 +649,15 @@ Audit(k, q) ==
 \*     (I8/I14/V1/V2/V4) requires pkg.bundle # ABSENT, and a
 \*     customer_dsse row has bundle = ABSENT (R12), so every excluded
 \*     state is vacuously-true for all Config-2 invariants.
-\* Set-parameterized init — the underlying implementation. Takes an
-\* explicit set of allowed `key_source` values; the per-class Config-1
-\* sub-config Inits below call this with singletons / small subsets
-\* to prune InitBase enumeration by key_source at generation time
-\* (the bulk of the sub-split speedup). Every producer-side
-\* constraint below is per-(pkg,pins)-row, so restricting allowedKS
+\* Shared init constraints — everything except the `pkg ∈ <generator>`
+\* enumeration choice. Factored out so InitBaseFor (set-parameterized
+\* PackageGenFor) and Init_main_cdsse (cdsse-specific
+\* PackageGenForCdsse) can BOTH apply the same producer-side
+\* constraints without duplication. Every constraint below is per-
+\* (pkg, pins)-row, so the partition into per-key_source sub-configs
 \* simply enumerates a subset of rows — every constraint still holds
 \* on each restricted row.
-InitBaseFor(allowedKS) ==
-    /\ pkg \in PackageGenFor(allowedKS)
+InitBaseConstraints ==
     /\ pins \in Pins
     \* When the envelope carries no bundle, bundle_bind_hash and
     \* bundle_bind_signature describe the bundle-bind relationship
@@ -788,6 +815,15 @@ InitBaseFor(allowedKS) ==
                => pkg.bundle.predicate_commit_sha
                     \in {pins.commit_sha, NONE}))
 
+\* Set-parameterized init wrapper. Picks the appropriate Package
+\* generator for `allowedKS` and applies the shared constraints.
+\* The per-class Config-1 sub-config Inits below call this (except
+\* Init_main_cdsse, which uses the tighter PackageGenForCdsse but
+\* shares the constraints — see InitBaseConstraints above).
+InitBaseFor(allowedKS) ==
+    /\ pkg \in PackageGenFor(allowedKS)
+    /\ InitBaseConstraints
+
 \* Legacy boolean wrapper. Preserves the original InitBase(genCustomerDsse)
 \* API byte-equivalently so Init / Init_bind (which call InitBase(TRUE)
 \* / InitBase(FALSE)) continue to work unchanged. New per-class
@@ -897,11 +933,17 @@ Init_main_workspace ==
         => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
            /\ pkg.bundle_bind_signature = "VALID")
 
+\* Uses PackageGenForCdsse (bundle pinned to {ABSENT}, bundle_bind_*
+\* pinned to {NONE}) instead of the generic PackageGenFor — lifts the
+\* R12 producer constraint and the bundle-absent dead-field pin into
+\* generation, eliminating the ~3,800× Bundle × bundle_bind_*
+\* cross-product enumeration. The bundle_bind pinning that the other
+\* Init_main_<class> Inits apply ("bundle # ABSENT ⇒ bind matches +
+\* signature = VALID") is vacuous here (bundle = ABSENT for every
+\* state in PackageGenForCdsse), so it's omitted.
 Init_main_cdsse ==
-    /\ InitBaseFor({KS_CUSTOMER_DSSE})
-    /\ (pkg.bundle # ABSENT
-        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
-           /\ pkg.bundle_bind_signature = "VALID")
+    /\ pkg \in PackageGenForCdsse
+    /\ InitBaseConstraints
 
 \* Orphan + legacy grouped: both are no-canonical-bundle-path terminal
 \* classes (per KeySourceResolver) and share invariant structure

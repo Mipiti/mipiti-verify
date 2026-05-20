@@ -284,6 +284,54 @@ operators are preserved byte-equivalently as thin boolean wrappers,
 so `Init` (legacy `audit.cfg`) and `Init_bind` (Config 2) continue
 to work unchanged.
 
+### Cdsse generator pre-pinning (`PackageGenForCdsse`)
+
+`Init_main_cdsse` is the exception: instead of
+`InitBaseFor({KS_CUSTOMER_DSSE})` it uses a specialized
+`PackageGenForCdsse` that lifts the R12 producer constraint
+(a customer_dsse row has `bundle = ABSENT`) and the bundle-absent
+dead-field pins (`bundle_bind_hash = NONE`, `bundle_bind_signature
+= NONE` when `bundle = ABSENT`) into the row generator instead of
+post-enumeration filters. This eliminates ~3,800× the Package
+cross-product on the cdsse sub-config (the residual init-generation
+bottleneck after the per-`key_source` split), taking it from
+~270k generated / 26k distinct / ~9 min to ~108k generated / 9k
+distinct / ~1 s locally.
+
+**Soundness — what `PackageGenForCdsse` does and doesn't change:**
+
+| `ws_sig` | `bundle` | Generic cdsse | Pre-pinned cdsse | Covered elsewhere? |
+|---|---|---|---|---|
+| `cdsse` (`key_source = KS_CUSTOMER_DSSE`) | `ABSENT` (R12) | yes | yes | only cdsse — preserved |
+| `cdsse` | `≠ ABSENT` | rejected by R12 post-filter | rejected by gen | n/a (never reachable) |
+| `ABSENT` | `ABSENT` | yes | yes | also covered by all 4 other sub-configs |
+| `ABSENT` | `≠ ABSENT` | yes | **dropped** | **covered by sigstore + platform + workspace + orphan_legacy** |
+
+The only case actually removed from cdsse enumeration is
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`). These are NOT customer_dsse
+rows — `ws_sig = ABSENT` has no `key_source` field, so R12's premise
+(`ws_sig ≠ ABSENT ∧ key_source = KS_CUSTOMER_DSSE`) is false on
+them, and the customer_dsse-specific invariants V5a/V5b/V5c are
+vacuous there anyway. The universal invariants (I1–I13, V3) on
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`) rows are still checked — by
+each of the four non-cdsse sub-configs, whose
+`PackageGenFor(<class>)` includes `ws_sig: WSSigGenFor(<class>) ∪
+{ABSENT}` and `bundle: Bundle ∪ {ABSENT}` and therefore enumerates
+the cross-product (`ws_sig = ABSENT`, `bundle = anything`). The
+empirical proof: sigstore's distinct-state count (179,064) is
+bit-exact unchanged before and after introducing the cdsse
+pre-pinning, confirming its enumeration of the
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`) rows is intact.
+
+The mechanical totality check `check_audit_partition_total.py`
+recognizes `Init_main_cdsse`'s specialized generator via a small
+hardcoded mapping (`_SPECIALIZED_GENERATORS`); the totality +
+disjointness assertions still cover the partition exactly. Adding
+a new specialized generator in the future requires extending that
+mapping — a single explicit, reviewable surface that prevents an
+unaccounted-for generator from silently breaking the partition
+claim.
+
 **Lossless by construction.** Every invariant in
 `ConfigMainInvariants` (and `TypeOK`) is a per-`(pkg, pins)`-row
 predicate — its truth value on a given row depends only on that
