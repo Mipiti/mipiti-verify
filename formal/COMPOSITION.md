@@ -3,11 +3,22 @@
 The audit-envelope verifier's correctness is verified compositionally
 across two TLC configurations:
 
-- **`audit_main.cfg`** — pins `bundle_bind_hash` and `bundle_bind_signature`
+- **Config 1** — pins `bundle_bind_hash` and `bundle_bind_signature`
   to their canonical "matching, valid" representative (`bundle_bind_hash =
   bundle.bound_hash`, `bundle_bind_signature = TRUE`). Verifies invariants
   whose truth value is independent of `bundle_bind_*` on that
-  representative: I1–I7, I9–I13, V3.
+  representative: I1–I7, I9–I13, V3, V5a–V5c. Realized as **five
+  per-`key_source` sub-configs** (`audit_main_sigstore.cfg`,
+  `audit_main_platform.cfg`, `audit_main_workspace.cfg`,
+  `audit_main_cdsse.cfg`, `audit_main_orphan_legacy.cfg`) whose
+  `allowedKS` sets union to `KeySources` exactly and are pairwise
+  disjoint (mechanically checked by
+  `formal/check_audit_partition_total.py`). Each sub-config invokes
+  the same `ConfigMainInvariants`, `AuditView`, and bundle_bind
+  pinning; the partition is lossless because every invariant is a
+  per-`(pkg, pins)`-row predicate and `key_source` is a property of
+  the row. See **"Config-1 per-`key_source` sub-split (lossless)"**
+  below for the per-invariant × per-sub-config coverage argument.
 - **`audit_bundle_bind.cfg`** — explores the full `bundle_bind_*` cross-
   product AND the full `ws_sig` variation (V1/V2's preconditions
   require `ws_sig` present with specific `key_source` values). Pins
@@ -124,13 +135,22 @@ on `audit_main.cfg`, both:
 
 ## Equivalence claim
 
-If TLC accepts both `audit_main.cfg` and `audit_bundle_bind.cfg`,
-then the conjunction of all invariants in `SecurityInvariants` holds
-on `audit.tla`'s reachable state space.
+If TLC accepts all five `audit_main_*.cfg` sub-configs **and**
+`audit_bundle_bind.cfg`, then the conjunction of all invariants in
+`SecurityInvariants` holds on `audit.tla`'s reachable state space.
+(The five sub-configs realize Config 1's per-`key_source` partition;
+their union — total + disjoint, mechanically verified by
+`formal/check_audit_partition_total.py` — covers `audit_main.cfg`'s
+historical state space exactly.)
 
-The original `audit.cfg` is retained for backward compatibility and
-periodic soundness verification (manual or scheduled run); it is not
-required on every CI tick.
+The original un-split `audit.cfg` (full-domain `Init == InitBase(TRUE)`,
+all invariants in one run) has been **deleted** along with its
+now-dead `Init` / `Spec` operators in `audit.tla`. The five
+`audit_main_*.cfg` sub-configs + `audit_bundle_bind.cfg` collectively
+cover its state space exactly (totality + disjointness mechanically
+verified); keeping an unexercised aggregate cfg invited silent rot —
+no CI ran it, so a future change that broke it without breaking the
+sub-configs would never be detected.
 
 ## Config-2 customer_dsse exclusion (lossless)
 
@@ -216,14 +236,145 @@ TLC 2.19): Config 2 (`audit_bundle_bind.cfg`) **completes** —
 **3 min 37 s**, **142,743 distinct states** (1,272,102 generated).
 Before this change Config 2 did not terminate (stuck in init-state
 generation past 2 h with the customer_dsse cross-product
-materialised). Config 1 (`audit_main.cfg`) is byte-unchanged and its
-prior sound ~1 h run stands (its spec call `InitBase(TRUE)` is
-provably a no-op refactor: `PackageGen(TRUE) ≡ Package`).
+materialised). Config 1 at that time was the monolithic
+`audit_main.cfg` (~1 h run, byte-unchanged by the customer_dsse
+exclusion since its spec call `InitBase(TRUE)` is a no-op refactor:
+`PackageGen(TRUE) ≡ Package`). Config 1 has since been further
+sub-split per `key_source` (see "Config-1 per-`key_source` sub-split"
+below); `audit_main.cfg` is deleted and the five
+`audit_main_*.cfg` sub-configs run in parallel.
 
 The reduction is orthogonal to (and composes with) the `AuditView`
 VIEW and the `InitBase` relation-class canonicalisation: those make
 the *retained* customer_dsse states tractable for Config 1; this
 exclusion removes the *vacuous* ones from Config 2 entirely.
+
+## Config-1 per-`key_source` sub-split (lossless)
+
+Even after the AuditView reduction + the generation-time canonical-
+representative pinning, Config 1 still enumerates every `key_source`
+class together — so the bundle/ws_sig cross-product for
+`{KS_SIGSTORE, KS_PLATFORM, KS_WORKSPACE, KS_CUSTOMER_DSSE,
+KS_ORPHAN, KS_LEGACY}` is realized in a single TLC run. The
+dominant cost in that run is the multi-class `ws_sig.key_source`
+enumeration: each `key_source` value multiplies the WSSig × Package
+cross-product, and the AuditView only collapses *observation* — it
+does not reduce *generation*.
+
+Config 1 is partitioned by `pkg.ws_sig.key_source` into five
+sub-configs, each invoked with the same `ConfigMainInvariants`,
+`AuditView`, and bundle_bind pinning as the original
+`audit_main.cfg`:
+
+| Sub-config                          | `allowedKS`                       |
+|-------------------------------------|-----------------------------------|
+| `audit_main_sigstore.cfg`           | `{KS_SIGSTORE}`                   |
+| `audit_main_platform.cfg`           | `{KS_PLATFORM}`                   |
+| `audit_main_workspace.cfg`          | `{KS_WORKSPACE}`                  |
+| `audit_main_cdsse.cfg`              | `{KS_CUSTOMER_DSSE}`              |
+| `audit_main_orphan_legacy.cfg`      | `{KS_ORPHAN, KS_LEGACY}`          |
+
+Each `audit_main_<class>.cfg` selects a `Spec_main_<class>` →
+`Init_main_<class>`, which calls `InitBaseFor(<allowedKS>)`.
+`InitBaseFor` is the set-parameterized generalization of the
+original boolean `InitBase(genCustomerDsse)`; `PackageGenFor` /
+`WSSigGenFor` likewise generalize the row generators. The original
+`InitBase(genCustomerDsse)` / `PackageGen(gen)` / `WSSigGen(gen)`
+operators are preserved byte-equivalently as thin boolean wrappers,
+so `Init` (legacy `audit.cfg`) and `Init_bind` (Config 2) continue
+to work unchanged.
+
+### Cdsse generator pre-pinning (`PackageGenForCdsse`)
+
+`Init_main_cdsse` is the exception: instead of
+`InitBaseFor({KS_CUSTOMER_DSSE})` it uses a specialized
+`PackageGenForCdsse` that lifts the R12 producer constraint
+(a customer_dsse row has `bundle = ABSENT`) and the bundle-absent
+dead-field pins (`bundle_bind_hash = NONE`, `bundle_bind_signature
+= NONE` when `bundle = ABSENT`) into the row generator instead of
+post-enumeration filters. This eliminates ~3,800× the Package
+cross-product on the cdsse sub-config (the residual init-generation
+bottleneck after the per-`key_source` split), taking it from
+~270k generated / 26k distinct / ~9 min to ~108k generated / 9k
+distinct / ~1 s locally.
+
+**Soundness — what `PackageGenForCdsse` does and doesn't change:**
+
+| `ws_sig` | `bundle` | Generic cdsse | Pre-pinned cdsse | Covered elsewhere? |
+|---|---|---|---|---|
+| `cdsse` (`key_source = KS_CUSTOMER_DSSE`) | `ABSENT` (R12) | yes | yes | only cdsse — preserved |
+| `cdsse` | `≠ ABSENT` | rejected by R12 post-filter | rejected by gen | n/a (never reachable) |
+| `ABSENT` | `ABSENT` | yes | yes | also covered by all 4 other sub-configs |
+| `ABSENT` | `≠ ABSENT` | yes | **dropped** | **covered by sigstore + platform + workspace + orphan_legacy** |
+
+The only case actually removed from cdsse enumeration is
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`). These are NOT customer_dsse
+rows — `ws_sig = ABSENT` has no `key_source` field, so R12's premise
+(`ws_sig ≠ ABSENT ∧ key_source = KS_CUSTOMER_DSSE`) is false on
+them, and the customer_dsse-specific invariants V5a/V5b/V5c are
+vacuous there anyway. The universal invariants (I1–I13, V3) on
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`) rows are still checked — by
+each of the four non-cdsse sub-configs, whose
+`PackageGenFor(<class>)` includes `ws_sig: WSSigGenFor(<class>) ∪
+{ABSENT}` and `bundle: Bundle ∪ {ABSENT}` and therefore enumerates
+the cross-product (`ws_sig = ABSENT`, `bundle = anything`). The
+empirical proof: sigstore's distinct-state count (179,064) is
+bit-exact unchanged before and after introducing the cdsse
+pre-pinning, confirming its enumeration of the
+(`ws_sig = ABSENT`, `bundle ≠ ABSENT`) rows is intact.
+
+The mechanical totality check `check_audit_partition_total.py`
+recognizes `Init_main_cdsse`'s specialized generator via a small
+hardcoded mapping (`_SPECIALIZED_GENERATORS`); the totality +
+disjointness assertions still cover the partition exactly. Adding
+a new specialized generator in the future requires extending that
+mapping — a single explicit, reviewable surface that prevents an
+unaccounted-for generator from silently breaking the partition
+claim.
+
+**Lossless by construction.** Every invariant in
+`ConfigMainInvariants` (and `TypeOK`) is a per-`(pkg, pins)`-row
+predicate — its truth value on a given row depends only on that
+row's own fields and the auditor's pins, never on other rows or
+on rows' pairings. (This is the same per-row property that
+`check_audit_view_faithful.py` mechanically verifies as the
+prerequisite for the AuditView reduction; it is intrinsic to the
+invariants' shape, not a partition-specific premise.) Because
+`key_source` is a property of the row, partitioning by
+`pkg.ws_sig.key_source`:
+
+  1. enumerates each reachable row in **exactly one** sub-config —
+     the one whose `allowedKS` contains the row's class;
+  2. checks **every** invariant in `ConfigMainInvariants` on each
+     enumerated row — invariants whose premise excludes the class
+     are vacuously true on those rows, contributing zero coverage
+     but not changing the verdict.
+
+Item (1) is the *partition* property; item (2) is the *coverage*
+property. Together they make the union of the five sub-configs'
+state-spaces equivalent — under the per-row invariant property —
+to the historical un-split `audit_main.cfg` state-space (now
+deleted).
+
+The partition mechanics (totality of `allowedKS` union over
+`KeySources`, pairwise disjointness of the per-sub-config
+`allowedKS` sets) are mechanically verified by
+**`formal/check_audit_partition_total.py`**. The check fails closed
+with a precise diagnostic if any `key_source` value is uncovered
+(a row of that class would never be enumerated by any sub-config)
+or if two sub-configs share a class (wasted coverage). Non-vacuity
+is established empirically by an operator-injected gap (deleting a
+sub-config, or removing a class from an `Init_main_<class>`'s
+`allowedKS`) firing the corresponding assertion.
+
+**The original `audit_main.cfg` has been deleted**, along with its
+now-dead `Init_main` / `Spec_main` operators in `audit.tla`. The five
+sub-configs **are** Config 1 — keeping an unexercised aggregate cfg
+around invites silent rot (no CI exercises it, so a future change
+that breaks the aggregate but not the sub-configs is undetected).
+The mechanical totality + disjointness check + the per-row invariant
+property are what make the sub-split sound; re-running the aggregate
+would only duplicate work the partition already provably covers.
 
 ## CI job split
 
