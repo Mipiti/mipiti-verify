@@ -142,29 +142,51 @@ jobs:
         working-directory: formal
 
   audit-tlc:
-    # Dedicated job for the two compositional audit-spec TLC configs
-    # (audit_main.cfg / audit_bundle_bind.cfg) plus the AST-proof gate
-    # that certifies their lossless AuditView reduction. Isolated from
-    # `test` so a long-but-correct audit TLC run never blocks the
-    # critical path — it runs in parallel with `test` /
-    # `test-spec-invariants`. Still a required check; no gate is
-    # weakened. The expensive TLC steps are skipped ONLY when a PR's
-    # diff is strictly within a provably-inert allowlist
-    # (.github/workflows/**, pyproject.toml, **/*.md) — none can affect
-    # audit.tla, the cfgs, the AST proof, or the verified
-    # implementation, so the TLC result is provably identical to the
-    # last run. Any change to implementation/tests/formal/** runs full
-    # TLC (default: run; the guard fails open). The cheap AST proof is
-    # left unconditional. See formal/COMPOSITION.md.
+    # Audit-spec TLC verification — matrix over the 6 compositional
+    # cfgs: the 5 Config-1 per-key_source sub-configs
+    # (audit_main_sigstore / _platform / _workspace / _cdsse /
+    # _orphan_legacy) + Config-2 (audit_bundle_bind). Each matrix
+    # instance runs the cheap static checks (AuditView AST
+    # faithfulness + Config-1 partition totality) then its one TLC
+    # config. Wall-clock = max(per-cfg time); cdsse is the slow one
+    # (~9 min in local validation, dominated by customer_dsse
+    # predicate-canonicalisation per-state cost), other sub-configs
+    # ~1-5 min. ~7× wall-clock improvement vs the previous monolithic
+    # Config-1 (~1 h+).
+    #
+    # Each matrix instance reports as `audit-tlc (<cfg>)`. Required-
+    # check ruleset rules referring to plain `audit-tlc` must be
+    # updated to require each `audit-tlc (<cfg>)` context (or an
+    # aggregate gate) — see formal/COMPOSITION.md "CI job split".
+    #
+    # Skip-gating identical to before: expensive TLC step skipped
+    # only when detect-changes succeeded AND judged the diff inert
+    # (path-inert: .github/workflows/**, pyproject.toml, **/*.md);
+    # any change to implementation / tests / formal/** runs full
+    # TLC. Cheap static checks (AST proof + totality) stay
+    # unconditional — they take seconds.
     runs-on: ubuntu-latest
     needs: detect-changes
-    # Always run + report (required check); `always()` overrides the
-    # default needs-skip so a detect-changes failure can't bypass the
-    # gate. The expensive TLC steps self-gate fail-safe on the shared
-    # detect-changes verdict; the cheap AST proof stays unconditional.
+    # `always()` keeps the matrix running even if detect-changes
+    # failed (fail-safe: TLC step inside re-evaluates the verdict and
+    # defaults to running). Each matrix instance is a required check.
     if: ${{ always() }}
     permissions:
       contents: read
+    strategy:
+      # fail-fast: false so all matrix instances run to completion —
+      # if one sub-config fails (real spec break or new vulnerability
+      # introduced), we want to see whether ONLY that one fails or
+      # whether multiple do. Per-cfg diagnostics on every PR.
+      fail-fast: false
+      matrix:
+        cfg:
+          - audit_main_sigstore
+          - audit_main_platform
+          - audit_main_workspace
+          - audit_main_cdsse
+          - audit_main_orphan_legacy
+          - audit_bundle_bind
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -176,14 +198,24 @@ jobs:
           python-version: "3.12"
 
       - name: Formal verification (AuditView faithfulness — AST proof)
-        # Gates the lossless `VIEW AuditView` reduction in
-        # audit_main.cfg / audit_bundle_bind.cfg. Structurally proves
-        # every cfg invariant observes the collapsed customer_dsse
-        # fields only via (in)equality, so each factors through the
-        # view ⇒ the reduction loses no invariant violation. Sound
-        # over-approximation; fails closed on any unprovable
-        # reference. See formal/COMPOSITION.md.
+        # ~seconds. Gates the lossless `VIEW AuditView` reduction in
+        # every audit-spec cfg. Structurally proves every cfg invariant
+        # observes the collapsed customer_dsse fields only via
+        # (in)equality, so each factors through the view ⇒ the
+        # reduction loses no invariant violation. Sound over-
+        # approximation; fails closed on any unprovable reference.
+        # Cheap to run per-matrix-instance.
         run: python formal/check_audit_view_faithful.py
+
+      - name: Config-1 partition totality + disjointness check
+        # ~seconds. Asserts the 5 audit_main_*.cfg sub-configs'
+        # `allowedKS` sets union to KeySources exactly and are
+        # pairwise disjoint. Fails closed with a precise diagnostic
+        # if any key_source value is uncovered (a row of that class
+        # would never be enumerated by any sub-config) or if two
+        # sub-configs share a class (wasted coverage). Cheap to run
+        # per-matrix-instance.
+        run: python formal/check_audit_partition_total.py
 
       - name: Download TLC
         if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
@@ -194,28 +226,18 @@ jobs:
           echo "$TLC_SHA  tla2tools.jar" | sha256sum -c
         working-directory: formal
 
-      - name: Formal verification (TLC — audit, Config 1, bundle_bind pinned)
+      - name: Formal verification (TLC — ${{ matrix.cfg }})
         if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
-        # Compositional split per formal/COMPOSITION.md. Config 1 pins
-        # bundle_bind to its canonical matching representative and
-        # verifies I1-I7, I9-I13, V3, V5a-V5c, plus a machine-checked
-        # composition lemma proving the pinning is precision-
-        # preserving. Runs in parallel with Config 2 below.
+        # One TLC run per matrix instance. The 5 Config-1 sub-configs
+        # pin bundle_bind to "matching, valid" (canonical
+        # representative) and partition the key_source space; their
+        # union covers Config 1's reachable state space (mechanically
+        # checked by the totality step above). audit_bundle_bind
+        # explores the full bundle_bind cross-product with pins=NONE.
+        # See formal/COMPOSITION.md.
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
-          java $JAVA_OPTS -jar tla2tools.jar -config audit_main.cfg -workers auto audit.tla
-        working-directory: formal
-
-      - name: Formal verification (TLC — audit, Config 2, bundle_bind explored)
-        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
-        # Config 2 explores the full bundle_bind cross-product with
-        # auditor pins narrowed to NONE. Verifies I8, I14, V1, V2, V4.
-        # Init_bind excludes customer_dsse rows — lossless, since every
-        # Config-2 invariant requires pkg.bundle # ABSENT and a
-        # customer_dsse row has bundle = ABSENT (see COMPOSITION.md).
-        run: |
-          JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
-          java $JAVA_OPTS -jar tla2tools.jar -config audit_bundle_bind.cfg -workers auto audit.tla
+          java $JAVA_OPTS -jar tla2tools.jar -config ${{ matrix.cfg }}.cfg -workers auto audit.tla
         working-directory: formal
 
   test-spec-invariants:

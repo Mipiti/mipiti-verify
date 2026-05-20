@@ -71,7 +71,19 @@ from dataclasses import dataclass, field
 
 _FORMAL = os.path.dirname(os.path.abspath(__file__))
 _AUDIT_TLA = os.path.join(_FORMAL, "audit.tla")
-_CFGS = ("audit_main.cfg", "audit_bundle_bind.cfg")
+_CFGS = (
+    # Config 1's per-key_source sub-split (5 cfgs; all use the same
+    # ConfigMainInvariants, so reading any one would suffice — but
+    # listing them all is robust to a sub-config drifting its
+    # INVARIANTS list independently). See formal/COMPOSITION.md.
+    "audit_main_sigstore.cfg",
+    "audit_main_platform.cfg",
+    "audit_main_workspace.cfg",
+    "audit_main_cdsse.cfg",
+    "audit_main_orphan_legacy.cfg",
+    # Config 2.
+    "audit_bundle_bind.cfg",
+)
 
 # ---------------------------------------------------------------------------
 # The collapsed quantities. AuditView replaces these (on customer_dsse

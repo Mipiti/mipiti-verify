@@ -202,26 +202,45 @@ Package == [
 \* dead-field pin already canonicalises them there). Config 1
 \* (Init_main) uses gen = TRUE and keeps customer_dsse — V5a/V5b/V5c
 \* live in its partition and need it.
-WSSigGen(gen) ==
+\* Set-parameterized row generators. Take an explicit set of allowed
+\* `key_source` values so each Config-1 sub-config (audit_main_*.cfg)
+\* can pin enumeration to its own key_source class — the bulk of the
+\* Config-1 sub-split speedup. customer_dsse-specific fields are
+\* dead-field-pinned when KS_CUSTOMER_DSSE is excluded from
+\* allowedKS, identical semantics to the legacy boolean form's
+\* pinning when gen=FALSE.
+WSSigGenFor(allowedKS) ==
     [ signing_key_fp : Fingerprints,
       claimed_fp     : Fingerprints \cup {NONE},
       message_hash   : Hashes,
       valid          : BOOLEAN,
-      key_source     : IF gen THEN KeySources
-                              ELSE KeySources \ {KS_CUSTOMER_DSSE},
-      dsse_predicate_model_id   : IF gen THEN ModelIds \cup {NONE}
-                                         ELSE {NONE},
-      dsse_predicate_commit_sha : IF gen THEN CommitShas \cup {NONE}
-                                         ELSE {NONE},
-      customer_key_fp_match     : IF gen THEN BOOLEAN ELSE {TRUE} ]
+      key_source     : allowedKS,
+      dsse_predicate_model_id   : IF KS_CUSTOMER_DSSE \in allowedKS
+                                  THEN ModelIds \cup {NONE}
+                                  ELSE {NONE},
+      dsse_predicate_commit_sha : IF KS_CUSTOMER_DSSE \in allowedKS
+                                  THEN CommitShas \cup {NONE}
+                                  ELSE {NONE},
+      customer_key_fp_match     : IF KS_CUSTOMER_DSSE \in allowedKS
+                                  THEN BOOLEAN
+                                  ELSE {TRUE} ]
 
-PackageGen(gen) ==
+PackageGenFor(allowedKS) ==
     [ bundle                 : (Bundle \cup {ABSENT}),
-      ws_sig                 : (WSSigGen(gen) \cup {ABSENT}),
+      ws_sig                 : (WSSigGenFor(allowedKS) \cup {ABSENT}),
       results_hash           : (Hashes \cup {NONE}),
       results_canonical_hash : Hashes,
       bundle_bind_hash       : (Hashes \cup {NONE}),
       bundle_bind_signature  : (BundleBindSigOutcomes \cup {NONE}) ]
+
+\* Legacy boolean wrappers — preserved byte-equivalently so Init /
+\* Init_bind callers continue to work unchanged. gen=TRUE → all 6
+\* key_source values; gen=FALSE → all except KS_CUSTOMER_DSSE.
+WSSigGen(gen) ==
+    WSSigGenFor(IF gen THEN KeySources ELSE KeySources \ {KS_CUSTOMER_DSSE})
+
+PackageGen(gen) ==
+    PackageGenFor(IF gen THEN KeySources ELSE KeySources \ {KS_CUSTOMER_DSSE})
 
 Pins == [
     san             : Identities \cup {NONE},
@@ -602,8 +621,16 @@ Audit(k, q) ==
 \*     (I8/I14/V1/V2/V4) requires pkg.bundle # ABSENT, and a
 \*     customer_dsse row has bundle = ABSENT (R12), so every excluded
 \*     state is vacuously-true for all Config-2 invariants.
-InitBase(genCustomerDsse) ==
-    /\ pkg \in PackageGen(genCustomerDsse)
+\* Set-parameterized init — the underlying implementation. Takes an
+\* explicit set of allowed `key_source` values; the per-class Config-1
+\* sub-config Inits below call this with singletons / small subsets
+\* to prune InitBase enumeration by key_source at generation time
+\* (the bulk of the sub-split speedup). Every producer-side
+\* constraint below is per-(pkg,pins)-row, so restricting allowedKS
+\* simply enumerates a subset of rows — every constraint still holds
+\* on each restricted row.
+InitBaseFor(allowedKS) ==
+    /\ pkg \in PackageGenFor(allowedKS)
     /\ pins \in Pins
     \* When the envelope carries no bundle, bundle_bind_hash and
     \* bundle_bind_signature describe the bundle-bind relationship
@@ -761,25 +788,19 @@ InitBase(genCustomerDsse) ==
                => pkg.bundle.predicate_commit_sha
                     \in {pins.commit_sha, NONE}))
 
-\* Init_main — Config 1 init for audit_main.cfg.
-\*
-\* Pins bundle_bind to the canonical "matching, valid" representative:
-\*   - bundle present  ⇒ bundle_bind_hash = bundle.bound_hash AND
-\*                       bundle_bind_signature = "VALID"
-\*   - bundle absent   ⇒ already pinned to NONE/NONE by InitBase
-\*
-\* Composition argument (formal/COMPOSITION.md): every invariant in
-\* this config — I1–I7, I9–I13, V3 — is bundle_bind-independent on
-\* states where Audit's verdict survives the bundle-bind branches.
-\* Pinning bundle_bind to "matching, valid" is the canonical
-\* representative for the equivalence class.
-Init_main ==
-    /\ InitBase(TRUE)
-    /\ (pkg.bundle # ABSENT
-        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
-           /\ pkg.bundle_bind_signature = "VALID")
+\* Legacy boolean wrapper. Preserves the original InitBase(genCustomerDsse)
+\* API byte-equivalently so Init / Init_bind (which call InitBase(TRUE)
+\* / InitBase(FALSE)) continue to work unchanged. New per-class
+\* Config-1 sub-config Inits below call InitBaseFor directly.
+InitBase(genCustomerDsse) ==
+    InitBaseFor(IF genCustomerDsse THEN KeySources
+                                   ELSE KeySources \ {KS_CUSTOMER_DSSE})
 
-\* Init_bind — Config 2 init for audit_bundle_bind.cfg.
+\* Init_bind — init for audit_bundle_bind.cfg, the **Config 2** half
+\* of the compositional split (bundle_bind cross-product explored, vs
+\* Config 1's bundle_bind-pinned half realized as the 5 per-key_source
+\* sub-configs audit_main_*.cfg). "Config 2" is a conceptual label for
+\* the bundle_bind-explored partition, not a sibling cfg filename.
 \*
 \* Full bundle_bind cross-product preserved (this is what Config 2
 \* exists to verify) and full ws_sig variation preserved (V1/V2
@@ -827,19 +848,77 @@ Init_bind ==
     /\ pins.model_id = NONE
     /\ pins.commit_sha = NONE
 
-\* Backward-compatible Init: the original full-domain enumeration
-\* (customer_dsse generated). Kept so audit.cfg (the un-split config)
-\* continues to work.
-Init == InitBase(TRUE)
-
 Next == UNCHANGED vars
 
-\* Spec_main / Spec_bind — selected per .cfg via SPECIFICATION.
-Spec_main == Init_main /\ [][Next]_vars
+\* Spec_bind — selected by audit_bundle_bind.cfg's SPECIFICATION.
+\* Config-1's Spec_main_<class> operators are defined below in the
+\* per-key_source sub-split block.
 Spec_bind == Init_bind /\ [][Next]_vars
 
-\* Default Spec retained for the original audit.cfg.
-Spec == Init /\ [][Next]_vars
+(*--------------------------------------------------------------------*)
+(* Config 1 per-key_source sub-split — Init / Spec operators.        *)
+(*                                                                    *)
+(* Splits the original Init_main key_source enumeration (all 6 KS    *)
+(* values) into per-class sub-configs whose union covers KeySources  *)
+(* exactly once. Because every invariant in ConfigMainInvariants is  *)
+(* a per-(pkg, pins)-row predicate and key_source is a property of  *)
+(* the row, partitioning by pkg.ws_sig.key_source is lossless by    *)
+(* construction: every row is enumerated in exactly one sub-config, *)
+(* every invariant whose premise can fire on a row's class is       *)
+(* checked there, and invariants whose premise excludes a class are *)
+(* vacuously true on that sub-config's states.                      *)
+(*                                                                    *)
+(* Bundle-bind pinning is preserved (matching, valid representative *)
+(* — same as Init_main) so each sub-config exercises the same       *)
+(* bundle_bind-pinned slice of the original Config-1 space. Each    *)
+(* sub-config also inherits the orphan/legacy slot of the partition *)
+(* where appropriate.                                                *)
+(*                                                                    *)
+(* See formal/COMPOSITION.md for the per-invariant × per-sub-config *)
+(* coverage matrix and the totality proof                            *)
+(* (formal/check_audit_partition_total.py).                          *)
+(*--------------------------------------------------------------------*)
+
+Init_main_sigstore ==
+    /\ InitBaseFor({KS_SIGSTORE})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+Init_main_platform ==
+    /\ InitBaseFor({KS_PLATFORM})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+Init_main_workspace ==
+    /\ InitBaseFor({KS_WORKSPACE})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+Init_main_cdsse ==
+    /\ InitBaseFor({KS_CUSTOMER_DSSE})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+\* Orphan + legacy grouped: both are no-canonical-bundle-path terminal
+\* classes (per KeySourceResolver) and share invariant structure
+\* (V3 fires on orphan-with-workspace-pin; legacy keeps the
+\* pre-discriminator universe). Combined here so the 5 sub-configs
+\* (vs 6 individual) keep CI matrix fan-out modest.
+Init_main_orphan_legacy ==
+    /\ InitBaseFor({KS_ORPHAN, KS_LEGACY})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+Spec_main_sigstore       == Init_main_sigstore       /\ [][Next]_vars
+Spec_main_platform       == Init_main_platform       /\ [][Next]_vars
+Spec_main_workspace      == Init_main_workspace      /\ [][Next]_vars
+Spec_main_cdsse          == Init_main_cdsse          /\ [][Next]_vars
+Spec_main_orphan_legacy  == Init_main_orphan_legacy  /\ [][Next]_vars
 
 (***************************************************************************)
 (* Security invariants. Each is a property the implementation must hold    *)
