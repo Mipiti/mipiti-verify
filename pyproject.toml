@@ -56,3 +56,14 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Transitive CVE floors (pinned at compile time only — uv's
+# constraint-dependencies don't ship in the published wheel's metadata,
+# they just force the lockfile resolution). Refresh the four lockfiles
+# (requirements.lock, requirements-all.lock, requirements-build.lock,
+# and re-run pip-audit) when bumping these.
+[tool.uv]
+constraint-dependencies = [
+    "idna>=3.15",      # CVE-2026-45409 (idna<3.15 vulnerable; transitive via httpx / sigstore / requests)
+    "urllib3>=2.7.0",  # CVE-2026-44431 + CVE-2026-44432 (urllib3<2.7.0 vulnerable; transitive via requests)
+]

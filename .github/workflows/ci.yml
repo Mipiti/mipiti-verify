@@ -105,6 +105,19 @@ jobs:
       - name: Install pinned dependencies
         run: pip install --require-hashes -r requirements.lock
 
+      - name: pip-audit (all three lockfiles)
+        # Catches newly-published CVEs against already-pinned versions at
+        # PR time. --disable-pip audits the lockfile directly without a
+        # separate venv install. Pinned tool version; floats only via an
+        # explicit bump in this same step. Runs on every PR including
+        # docs-only — new CVEs are disclosed continuously and the inert
+        # guard would mask them.
+        run: |
+          pip install --quiet pip-audit==2.10.0
+          pip-audit -r requirements.lock --disable-pip
+          pip-audit -r requirements-build.lock --disable-pip
+          pip-audit -r requirements-all.lock --disable-pip
+
       - name: Install package and dev extras
         run: pip install --no-deps -e . && pip install pytest pytest-mock respx
 
