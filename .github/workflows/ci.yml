@@ -108,15 +108,29 @@ jobs:
       - name: pip-audit (all three lockfiles)
         # Catches newly-published CVEs against already-pinned versions at
         # PR time. --disable-pip audits the lockfile directly without a
-        # separate venv install. Pinned tool version; floats only via an
-        # explicit bump in this same step. Runs on every PR including
-        # docs-only — new CVEs are disclosed continuously and the inert
-        # guard would mask them.
+        # separate venv install. The audit tool itself is installed
+        # hash-pinned via requirements-audit.lock (consistent with
+        # requirements.lock / requirements-build.lock) so a swapped
+        # pip-audit wheel can't compromise the audit step. Runs on
+        # every PR including docs-only — new CVEs are disclosed
+        # continuously and the inert guard would mask them.
+        #
+        # --ignore-vuln PYSEC-2025-183: pyjwt "weak encryption"
+        # advisory — disputed by the pyjwt maintainer (per the OSV
+        # entry: "the key length is chosen by the application that
+        # uses the library"). All pyjwt versions are flagged (affected
+        # from 0; no fix exists or is planned). pyjwt enters our
+        # lockfile transitively via sigstore, which selects its own
+        # well-vetted key strengths/algorithms — the small-key edge
+        # case the disputed advisory is about does not apply to this
+        # usage. Re-evaluate if pyjwt's maintainers later accept the
+        # claim and ship a hardened release; remove the ignore then.
         run: |
-          pip install --quiet pip-audit==2.10.0
-          pip-audit -r requirements.lock --disable-pip
-          pip-audit -r requirements-build.lock --disable-pip
-          pip-audit -r requirements-all.lock --disable-pip
+          pip install --require-hashes -r requirements-audit.lock
+          IGNORE='--ignore-vuln PYSEC-2025-183'
+          pip-audit -r requirements.lock       --disable-pip $IGNORE
+          pip-audit -r requirements-build.lock --disable-pip $IGNORE
+          pip-audit -r requirements-all.lock   --disable-pip $IGNORE
 
       - name: Install package and dev extras
         run: pip install --no-deps -e . && pip install pytest pytest-mock respx

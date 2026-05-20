@@ -1,0 +1,7 @@
+# Pinned CI security-audit tooling. Compiled to requirements-audit.lock
+# (universal, hash-pinned via uv pip compile) so ci.yml installs the
+# audit tool itself with `pip install --require-hashes` — consistent
+# with how requirements.lock / requirements-build.lock are installed.
+# Avoids an unhashed `pip install pip-audit==X` that would otherwise
+# trust whatever PyPI returns for the version pin.
+pip-audit==2.10.0
