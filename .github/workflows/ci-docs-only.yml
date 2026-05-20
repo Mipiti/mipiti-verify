@@ -30,12 +30,25 @@ jobs:
     steps:
       - run: echo "Docs-only PR, skipping spec-invariants"
 
-  # Required check (ruleset). Markdown-only changes are provably inert
-  # to audit.tla / the cfgs / the AST proof / the verified
-  # implementation, so the formal result is unchanged — report a
-  # trivial pass so docs-only PRs aren't blocked waiting on a status
-  # ci.yml's paths-ignore prevents from ever being posted.
+  # Required-check stubs (ruleset). Markdown-only changes are
+  # provably inert to audit.tla / the cfgs / the AST proof / the
+  # verified implementation, so each formal-TLC matrix instance's
+  # result is unchanged — report a trivial pass so docs-only PRs
+  # aren't blocked waiting on a status that ci.yml's paths-ignore
+  # prevents from ever being posted. The matrix dimension MUST mirror
+  # ci.yml's audit-tlc matrix exactly so the same `audit-tlc (<cfg>)`
+  # check contexts the ruleset requires are produced here too.
   audit-tlc:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+          - audit_main_sigstore
+          - audit_main_platform
+          - audit_main_workspace
+          - audit_main_cdsse
+          - audit_main_orphan_legacy
+          - audit_bundle_bind
     steps:
-      - run: echo "Docs-only PR, skipping audit-spec TLC + AST proof"
+      - run: echo "Docs-only PR, skipping audit-spec ${{ matrix.cfg }}"
