@@ -648,17 +648,35 @@ class Runner:
             return {"status": "fail", "details": f"Verifier error: {e}"}
 
     def _verify_tier2(self, assertion: dict) -> dict[str, Any]:
-        """Run Tier 2 semantic verification using AI provider."""
-        tier2_prompt = assertion.get("tier2_prompt", "")
-        if not tier2_prompt:
-            return {"status": "skipped", "details": "No tier2_prompt provided"}
+        """Run Tier 2 semantic verification using AI provider.
 
+        The backend payload MUST carry the structured ``type`` +
+        ``params`` fields. The runner renders its own per-type
+        template locally with a fresh per-call boundary token —
+        there is no legacy path that consumes a backend-rendered
+        prompt. A payload missing these fields surfaces a clear
+        version-mismatch error so operators running mismatched
+        CLI/backend versions can upgrade.
+        """
         if self.tier2_provider_name is None:
             return {"status": "skipped", "details": "No --tier2-provider specified"}
 
+        a_type = assertion.get("type", "") or ""
+        a_params = assertion.get("params", {})
+        if not a_type or not isinstance(a_params, dict) or not a_params:
+            return {
+                "status": "fail",
+                "details": (
+                    "Backend payload missing required `type` / `params` "
+                    "fields. This mipiti-verify release requires a backend "
+                    "that ships the structured tier-2 payload. Upgrade the "
+                    "platform, or pin mipiti-verify to a release matching "
+                    "your backend."
+                ),
+            }
+
         # Read source content for context
-        params = assertion.get("params", {})
-        a_type = assertion.get("type", "")
+        params = a_params
         # For file_hash, tier 2 reviews the code that pins the hash (scope_file),
         # not the hashed file itself.
         if a_type == "file_hash":
@@ -759,8 +777,17 @@ class Runner:
                 api_key=self.tier2_api_key,
                 ollama_url=self.ollama_url,
             )
-            boundary_token = assertion.get("tier2_boundary_token", "")
-            passed, reasoning = provider.evaluate(tier2_prompt, source_code, boundary_token)
+            # Single-path runner-side rendering. The runner loads its
+            # own per-type Jinja template from ``templates/`` and
+            # renders it with a fresh per-call boundary token (see
+            # ``tier2._build_message`` and ``_prompt_renderer``).
+            # The token is minted at the call site, never crosses the
+            # network, and is never persisted.
+            passed, reasoning = provider.evaluate(
+                assertion_type=a_type,
+                assertion_params=a_params,
+                source_code=source_code,
+            )
             return {
                 "status": "pass" if passed else "fail",
                 "details": reasoning,

@@ -1,22 +1,54 @@
-"""Tier 2 AI provider abstraction for semantic verification."""
+"""Tier 2 AI provider abstraction for semantic verification.
+
+Single-path runner-side rendering. The caller passes ``assertion_type``
++ ``assertion_params``; the runner loads the matching per-type Jinja
+template from ``templates/`` and renders it locally via the vendored
+``_prompt_renderer``. A fresh boundary token is minted at the call
+site (in ``_prompt_renderer._mint_boundary_token``), used once for
+that one render, and discarded. The token never crosses the network
+and is never persisted. The instruction preamble lives in the
+templates (trusted runner code) and sits outside the boundary;
+assertion params and source code are wrapped inside via the
+``| untrusted`` Jinja filter.
+
+There is no legacy fallback. The runner refuses to evaluate when the
+backend payload is missing ``type`` / ``params``, returning a clear
+version-mismatch error rather than degrading to a less-defended path.
+"""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Tuple
+from pathlib import Path
+from typing import Any, Mapping, Tuple
+
+# Resolve the templates directory once at import time. The package
+# layout is ``mipiti_verify/templates/tier2_<type>.j2`` and we read
+# templates via the filesystem (not importlib.resources) so the
+# vendored Jinja Environment can render from a string. importlib
+# would work too, but this is simpler given templates are tiny.
+_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
 class Tier2Provider(ABC):
     """Abstract base for Tier 2 semantic verification providers."""
 
     @abstractmethod
-    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
+    def evaluate(
+        self,
+        *,
+        assertion_type: str,
+        assertion_params: Mapping[str, Any],
+        source_code: str = "",
+    ) -> Tuple[bool, str]:
         """Evaluate an assertion semantically.
 
-        Returns (passed, reasoning).
-        If boundary_token is provided, source code is wrapped in boundary guards.
+        Returns ``(passed, reasoning)``. The runner picks the per-type
+        template, renders it with a fresh boundary token, and submits
+        the rendered message to the configured LLM provider.
         """
 
 
@@ -32,8 +64,19 @@ class OpenAIProvider(Tier2Provider):
         self.model = model or "gpt-4o"
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
 
-    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
-        messages = [{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}]
+    def evaluate(
+        self,
+        *,
+        assertion_type: str,
+        assertion_params: Mapping[str, Any],
+        source_code: str = "",
+    ) -> Tuple[bool, str]:
+        message = _build_message(
+            assertion_type=assertion_type,
+            assertion_params=assertion_params,
+            source_code=source_code,
+        )
+        messages = [{"role": "user", "content": message}]
         # Newer OpenAI models (o-series, gpt-5+) require max_completion_tokens
         # instead of max_tokens.  Try the new param first, fall back on error.
         try:
@@ -60,11 +103,22 @@ class AnthropicProvider(Tier2Provider):
         self.model = model or "claude-sonnet-4-5-20250514"
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
-    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
+    def evaluate(
+        self,
+        *,
+        assertion_type: str,
+        assertion_params: Mapping[str, Any],
+        source_code: str = "",
+    ) -> Tuple[bool, str]:
+        content = _build_message(
+            assertion_type=assertion_type,
+            assertion_params=assertion_params,
+            source_code=source_code,
+        )
         message = self.client.messages.create(
             model=self.model,
             max_tokens=8192,  # Anthropic requires max_tokens; high ceiling, model finishes naturally
-            messages=[{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}],
+            messages=[{"role": "user", "content": content}],
         )
         text = message.content[0].text if message.content else ""
         return _parse_response(text)
@@ -88,12 +142,23 @@ class OllamaProvider(Tier2Provider):
             verify=tls_context(),
         )
 
-    def evaluate(self, prompt: str, source_code: str, boundary_token: str = "") -> Tuple[bool, str]:
+    def evaluate(
+        self,
+        *,
+        assertion_type: str,
+        assertion_params: Mapping[str, Any],
+        source_code: str = "",
+    ) -> Tuple[bool, str]:
+        content = _build_message(
+            assertion_type=assertion_type,
+            assertion_params=assertion_params,
+            source_code=source_code,
+        )
         resp = self._client.post(
             f"{self.url}/api/chat",
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": _build_message(prompt, source_code, boundary_token)}],
+                "messages": [{"role": "user", "content": content}],
                 "stream": False,
                 "options": {"temperature": 0},
             },
@@ -121,18 +186,59 @@ def get_provider(
         raise ValueError(f"Unknown Tier 2 provider: {name}. Choose: openai, anthropic, ollama")
 
 
-def _build_message(prompt: str, source_code: str, boundary_token: str = "") -> str:
-    """Build the full prompt message with source code context.
+class UnknownAssertionTypeError(ValueError):
+    """Raised when the assertion ``type`` has no matching tier-2 template.
 
-    If a boundary_token is provided, wraps the source code in the same
-    boundary guards used for assertion descriptions in the prompt.
+    Surfaces a clear "the runner does not know how to evaluate this
+    type semantically" error instead of silently degrading. Operators
+    upgrading the platform ahead of the runner will see this and know
+    to upgrade the runner.
     """
-    if source_code:
-        if boundary_token:
-            wrapped = f"<{boundary_token}>\n{source_code}\n</{boundary_token}>"
-            return f"{prompt}\n\n--- Source Code ---\n{wrapped}"
-        return f"{prompt}\n\n--- Source Code ---\n{source_code}"
-    return prompt
+
+
+def _build_message(
+    *,
+    assertion_type: str,
+    assertion_params: Mapping[str, Any],
+    source_code: str = "",
+) -> str:
+    """Build the LLM input message via runner-side template rendering.
+
+    The runner loads ``templates/tier2_<assertion_type>.j2`` and
+    renders it with a fresh per-call boundary token. The instruction
+    preamble lives in the template (trusted runner code) and sits
+    outside the boundary; ``assertion_params`` and ``source_code``
+    are wrapped inside via the ``| untrusted`` filter.
+
+    Raises :class:`UnknownAssertionTypeError` when no template exists
+    for the given type — the runner refuses to evaluate rather than
+    falling back to a less-defended path.
+    """
+    template_path = _TEMPLATES_DIR / f"tier2_{assertion_type}.j2"
+    if not template_path.is_file():
+        raise UnknownAssertionTypeError(
+            f"No tier 2 template for assertion type {assertion_type!r}. "
+            "The runner does not know how to evaluate this type "
+            "semantically. Upgrade mipiti-verify to a release that "
+            "ships a template for this type."
+        )
+    from ._prompt_renderer import render_prompt
+
+    template_text = template_path.read_text(encoding="utf-8")
+    params_json = json.dumps(
+        dict(assertion_params) if assertion_params else {},
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return render_prompt(
+        template_text,
+        {
+            "ASSERTION_TYPE": assertion_type,
+            "ASSERTION_PARAMS": params_json,
+            "SOURCE_CODE": source_code,
+        },
+    )
 
 
 def _parse_response(text: str) -> Tuple[bool, str]:

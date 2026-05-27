@@ -6,6 +6,7 @@ on its own TLA+ spec + Python BFS implementation check:
 | Artefact | Specifies | Detailed README |
 |---|---|---|
 | **Assertion verification pipeline** (`VerificationPipeline.tla`) | The lifecycle of an assertion through Tier 1 (mechanical) and Tier 2 (semantic/LLM) checks, plus reverify-mode semantics. | This README. |
+| **Tier-2 runner-side rendering** (`Tier2RunnerSide.tla`) | The single-path tier-2 prompt-injection defense: per-call boundary token freshness + secrecy, trusted instruction placement outside the boundary, data-isolation of attacker-controlled inputs inside the boundary, and the absence of any legacy tier2_prompt / tier2_boundary_token wire fields. Five invariants T1–T5. | This README. |
 | **Audit verifier** (`audit.tla`) | The compromised-platform threat model for `mipiti-verify audit`: identity pinning, predicate pinning, fail-closed validations, and 13 invariants over the verifier's verdict function. | [`audit-README.md`](./audit-README.md) |
 
 The rest of this README covers the assertion-verification-pipeline
@@ -88,6 +89,8 @@ Both run automatically in CI on every commit (see `.github/workflows/ci.yml`).
 | `VerificationPipeline.tla` | TLA+ specification — the formal design (both modes) |
 | `VerificationPipeline.cfg` | TLC configuration — default mode (reverify=false) |
 | `VerificationPipeline_reverify.cfg` | TLC configuration — reverify mode (reverify=true) |
+| `Tier2RunnerSide.tla` | TLA+ specification — tier-2 runner-side rendering invariants T1–T5 (freshness, secrecy, trusted instructions, data isolation, no legacy fields) |
+| `Tier2RunnerSide.cfg` | TLC configuration for `Tier2RunnerSide.tla` |
 | `check_pipeline.py` | Python checker — BFS + cross-checks + model-based testing + AST proofs (runs both modes) |
 | `audit.tla` | TLA+ specification — audit verifier's compromised-platform defense (13 invariants I1–I13) |
 | `audit.cfg` | TLC configuration for `audit.tla` |
