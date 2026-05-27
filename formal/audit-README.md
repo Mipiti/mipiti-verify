@@ -20,11 +20,24 @@ present.
 
 - `audit.tla` — TLA+ module. Models the verifier as a pure function
   `Audit(Package, Pins) → Verdict` with cryptographic primitives
-  abstracted as oracles. Invariants `I1`–`I7` encode the security
-  properties.
-- `audit.cfg` — TLC config. Pins finite domains for the constants
-  (3 SANs, 2 issuers, 2 fingerprints, 2 hashes) and lists the
-  invariants to check.
+  abstracted as oracles. Invariants `I1`–`I14` encode the security
+  properties of the **legacy** `results_hash`-scoped inline signature
+  path.
+- `audit_main_*.cfg` / `audit_bundle_bind.cfg` — TLC configs for the
+  6-way compositional split of the legacy path (see
+  `COMPOSITION.md`).
+- `audit_manifest.tla` — TLA+ module for the **manifest signature
+  path** (Option β; `docs/audit-pack-signing.md` in the parent
+  repo). Models the verifier as a pure function
+  `AuditManifest(Pack) → Verdict` over packs carrying the new
+  `content_integrity.manifest` block. Invariants `B1`–`B7` encode
+  authenticity, per-section integrity, tamper detection, backward
+  compatibility, and selective-disclosure soundness.
+- `audit_manifest_platform.cfg` / `audit_manifest_workspace.cfg` —
+  TLC configs for the per-key_source slices of the manifest path
+  (KS_PLATFORM / KS_WORKSPACE — the two classes where the manifest
+  signature is the trust anchor; Sigstore and customer_dsse cover
+  the whole body via DSSE and don't need the manifest).
 - `../tests/test_spec_invariants.py` — Python BFS. Enumerates the
   same finite cross-product `Package × Pins`, runs the actual
   Python `audit()` Click command on each materialised package, and
@@ -40,11 +53,16 @@ Requires the TLA+ Toolbox or the `tla2tools.jar` distribution
 on the classpath:
 
 ```bash
-java -cp tla2tools.jar tlc2.TLC -config audit.cfg audit.tla
+# Legacy results_hash path (one per key_source class):
+java -cp tla2tools.jar tlc2.TLC -config audit_main_platform.cfg audit.tla
+# Manifest signature path (one per key_source class):
+java -cp tla2tools.jar tlc2.TLC -config audit_manifest_platform.cfg audit_manifest.tla
+java -cp tla2tools.jar tlc2.TLC -config audit_manifest_workspace.cfg audit_manifest.tla
 ```
 
-State space is small (a few thousand states); TLC finishes in
-seconds. A successful run reports `Model checking completed.
+State spaces are small to medium (manifest sub-configs ~221K
+distinct states each, ~1-2 s of TLC time; legacy sub-configs
+1-9 min). A successful run reports `Model checking completed.
 No error has been found.` and one or more states with each
 invariant satisfied.
 

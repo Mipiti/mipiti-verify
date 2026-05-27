@@ -170,16 +170,22 @@ jobs:
 
   audit-tlc:
     # Audit-spec TLC verification — matrix over the 6 compositional
-    # cfgs: the 5 Config-1 per-key_source sub-configs
-    # (audit_main_sigstore / _platform / _workspace / _cdsse /
-    # _orphan_legacy) + Config-2 (audit_bundle_bind). Each matrix
+    # cfgs covering the legacy results_hash signature path plus 2
+    # cfgs covering the manifest signature path (Option β; see
+    # docs/audit-pack-signing.md in the parent repo and
+    # formal/audit_manifest.tla in this submodule). The 5 Config-1
+    # per-key_source sub-configs (audit_main_sigstore / _platform /
+    # _workspace / _cdsse / _orphan_legacy) + Config-2
+    # (audit_bundle_bind) cover the legacy path; audit_manifest_platform
+    # and audit_manifest_workspace cover the manifest path on the two
+    # key_source classes where it is the trust anchor. Each matrix
     # instance runs the cheap static checks (AuditView AST
     # faithfulness + Config-1 partition totality) then its one TLC
     # config. Wall-clock = max(per-cfg time); cdsse is the slow one
     # (~9 min in local validation, dominated by customer_dsse
     # predicate-canonicalisation per-state cost), other sub-configs
-    # ~1-5 min. ~7× wall-clock improvement vs the previous monolithic
-    # Config-1 (~1 h+).
+    # ~1-5 min; audit_manifest_* run in ~1-2s locally. ~7× wall-clock
+    # improvement vs the previous monolithic Config-1 (~1 h+).
     #
     # Each matrix instance reports as `audit-tlc (<cfg>)`. Required-
     # check ruleset rules referring to plain `audit-tlc` must be
@@ -214,6 +220,11 @@ jobs:
           - audit_main_cdsse
           - audit_main_orphan_legacy
           - audit_bundle_bind
+          # Manifest-signature path (Option β) per-key_source slices.
+          # See formal/audit_manifest.tla module comment for the
+          # KS_PLATFORM / KS_WORKSPACE partition argument.
+          - audit_manifest_platform
+          - audit_manifest_workspace
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -261,10 +272,17 @@ jobs:
         # union covers Config 1's reachable state space (mechanically
         # checked by the totality step above). audit_bundle_bind
         # explores the full bundle_bind cross-product with pins=NONE.
-        # See formal/COMPOSITION.md.
+        # audit_manifest_platform / audit_manifest_workspace use the
+        # standalone audit_manifest.tla module which models the
+        # manifest signature path (Option β) independently of audit.tla.
+        # See formal/COMPOSITION.md and formal/audit_manifest.tla.
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
-          java $JAVA_OPTS -jar tla2tools.jar -config ${{ matrix.cfg }}.cfg -workers auto audit.tla
+          case "${{ matrix.cfg }}" in
+            audit_manifest_*) TLA_MODULE=audit_manifest.tla ;;
+            *)                TLA_MODULE=audit.tla ;;
+          esac
+          java $JAVA_OPTS -jar tla2tools.jar -config ${{ matrix.cfg }}.cfg -workers auto "$TLA_MODULE"
         working-directory: formal
 
   test-spec-invariants:
