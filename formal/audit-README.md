@@ -26,6 +26,19 @@ present.
 - `audit_main_*.cfg` / `audit_bundle_bind.cfg` — TLC configs for the
   6-way compositional split of the legacy path (see
   `COMPOSITION.md`).
+- `audit_main_orphan_results_blocked.cfg` /
+  `audit_main_orphan_results_allowed.cfg` /
+  `audit_main_model_only.cfg` /
+  `audit_main_sufficiency.cfg` — TLC configs for the four
+  scenario-knob slices. Each varies a single new state variable
+  (`has_orphan_results`, `is_model_only`, `sufficiency_state`) and
+  checks the `ConfigScenarioInvariants` set (V6..V12). Each runs
+  in <10s on the configured constants. The orphan-results scenario
+  is split across two cfgs by the `AllowOrphanResults` CONSTANT
+  (FALSE = fail-closed default → FAILED; TRUE = override active →
+  PARTIALLY_VERIFIED), since pinning a BOOLEAN scenario value via
+  the .cfg's CONSTANTS block is cheaper than letting TLC explore
+  both values in one run.
 - `audit_manifest.tla` — TLA+ module for the **manifest signature
   path** (Option β; `docs/audit-pack-signing.md` in the parent
   repo). Models the verifier as a pure function
@@ -245,6 +258,28 @@ or by reading the bundle's predicate out-of-band.
       match anything the envelope explicitly commits to;
     - tampered `bundle_bind_hash` (caught by the platform
       signature when populated).
+- Pending / insufficient sufficiency demotes a flat VERIFIED to
+  PARTIALLY_VERIFIED (`V6` / `V7`). Pending = the backend's
+  LLM-collective sufficiency check is still queued; insufficient =
+  the controls do not adequately mitigate the threats. Neither is a
+  failure — but the proof is incomplete, so claiming VERIFIED
+  would overstate. Closes the verdict-side gap from the
+  comprehensive envelope-consumer rewrite.
+- Orphan results fail-close by default (`V8`); the auditor's
+  `--allow-orphan-results` flag demotes to PARTIALLY_VERIFIED
+  rather than overriding to VERIFIED (`V9`). An orphan result is
+  a verdict whose assertion_id appears in neither the controls
+  nor the assumptions block — the cryptographic chain may be
+  intact, but the package's INTERNAL CONSISTENCY is broken. Same
+  fail-closed precedent as bundle signature INVALID / unbindable
+  bundle.
+- PDF model-only export emits MODEL_ONLY (`V10` / `V12`) and
+  rejects identity-pinning flags with USAGE_ERROR (`V11`). The
+  PDF carries no envelope (or `envelope.scope == "model_only"`)
+  so identity pins have no upstream evidence to bind to. Without
+  the explicit verdict, "Report integrity verified" reads as
+  "the model has been verified" — auditor deception. MODEL_ONLY
+  surfaces the gap honestly.
 
 **Abstracted away (oracles)**:
 - The Sigstore trust chain (Fulcio CA + Rekor inclusion proof + SCT)

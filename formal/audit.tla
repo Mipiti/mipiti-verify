@@ -51,13 +51,59 @@ CONSTANTS
                            \* for the issuer-side contract.
     KS_ORPHAN,             \* fingerprint did not resolve in issuer's
                            \* published key set; ws_sig.valid is unknown.
-    KS_LEGACY              \* envelope without key_source field
+    KS_LEGACY,             \* envelope without key_source field
                            \* (older issuer build) — ws_sig.valid required
                            \* per pre-discriminator semantics.
 
-VARIABLES pkg, pins
+    \* Sufficiency-state discriminator. The verifier's per-pkg
+    \* aggregate over the sufficiency map. SUFF_ALL = every control
+    \* sufficient; SUFF_INSUFFICIENT = at least one insufficient (any
+    \* further state is irrelevant); SUFF_PENDING = no insufficient,
+    \* but at least one pending (evaluation not finished); SUFF_NA =
+    \* no controls (model has none, e.g. a customer DSSE-anchored
+    \* pack with no sufficiency block). Folds the cli.py
+    \* {ctrl_count, suff_count, insuff_count, pending_count} tuple
+    \* into the 4-class equivalence relation the verdict actually
+    \* observes.
+    SUFF_ALL,
+    SUFF_INSUFFICIENT,
+    SUFF_PENDING,
+    SUFF_NA,
 
-vars == <<pkg, pins>>
+    \* Operator scenario knobs — BOOLEAN-valued CONSTANTS pinned per
+    \* cfg, NEVER mutated. Modeled as scenario selectors rather than
+    \* per-step state so the state-space cost is borne by the .cfg
+    \* matrix, not by TLC enumeration.
+    \*
+    \* AllowOrphanResults: the auditor's --allow-orphan-results flag.
+    \*   FALSE (default) — fail-closed on orphan results.
+    \*   TRUE — auditor has acknowledged the orphan set; verdict
+    \*     drops to PARTIALLY_VERIFIED instead of FAILED.
+    AllowOrphanResults
+
+VARIABLES pkg, pins,
+          \* Per-package boolean: does verification_run.results contain
+          \* any assertion_id that appears in neither the controls nor
+          \* the assumptions block? Pinned FALSE in cfgs that pre-date
+          \* orphan modeling; varied in audit_main_orphan_results.cfg.
+          has_orphan_results,
+          \* Per-package boolean: is the input a PDF model-only export
+          \* (no audit envelope / scope == "model_only")? Pinned FALSE
+          \* in cfgs that pre-date the model-only modeling; varied in
+          \* audit_main_model_only.cfg. Mutually exclusive with all
+          \* other pkg shape variation: when is_model_only = TRUE the
+          \* envelope generator pins pkg to a canonical absent-evidence
+          \* shape since cli.py's PDF model-only branch returns before
+          \* envelope dispatch.
+          is_model_only,
+          \* Per-package sufficiency-state enum (SUFF_ALL /
+          \* SUFF_INSUFFICIENT / SUFF_PENDING / SUFF_NA). Pinned to
+          \* SUFF_NA in cfgs that pre-date sufficiency modeling
+          \* (sufficiency doesn't gate the verdict when no controls
+          \* are present); varied in audit_main_sufficiency.cfg.
+          sufficiency_state
+
+vars == <<pkg, pins, has_orphan_results, is_model_only, sufficiency_state>>
 
 (***************************************************************************)
 (* Domain definitions.                                                     *)
@@ -278,8 +324,22 @@ Pins == [
     commit_sha      : CommitShas \cup {NONE}
 ]
 
+\* SufficiencyStates: the 4-class equivalence relation the verdict
+\* observes over the cli.py {ctrl_count, suff_count, insuff_count,
+\* pending_count} tuple. See the VARIABLES declaration above.
+SufficiencyStates == {SUFF_ALL, SUFF_INSUFFICIENT, SUFF_PENDING, SUFF_NA}
+
+\* Verdict — the closed set of values the audit operator may return.
+\* MODEL_ONLY (added 2026-05-27, gap #254 backfill) is the verdict
+\* emitted when the input is a PDF model-only export: the document
+\* signature passes but no CI verification evidence is present in
+\* the report (no envelope, or envelope.scope == "model_only"). The
+\* cli.py branch returns before envelope dispatch with exit 0,
+\* surfacing MODEL_ONLY as the verdict line. USAGE_ERROR preempts
+\* MODEL_ONLY when an identity-pinning flag is set (pinning has no
+\* upstream evidence to bind to on a model-only export).
 Verdict == {"VERIFIED", "PARTIALLY_VERIFIED", "UNVERIFIED",
-            "FAILED", "USAGE_ERROR"}
+            "FAILED", "USAGE_ERROR", "MODEL_ONLY"}
 
 (***************************************************************************)
 (* Symmetry — TLC state-space reduction.                                   *)
@@ -366,12 +426,42 @@ IsCustomerDsse(k) ==
     k.ws_sig # ABSENT /\ k.ws_sig.key_source = KS_CUSTOMER_DSSE
 
 (***************************************************************************)
+(* PinningRequested: TRUE iff any identity-pinning flag is set. Used by   *)
+(* the PDF model-only branch (cli.py line ~2497) which rejects pinning     *)
+(* with USAGE_ERROR when no envelope is present to bind the pin to.       *)
+(***************************************************************************)
+PinningRequested(q) ==
+    \/ q.san             # NONE
+    \/ q.workspace_fp    # NONE
+    \/ q.model_id        # NONE
+    \/ q.commit_sha      # NONE
+
+(***************************************************************************)
+(* AuditPdfModelOnly: cli.py PDF model-only branch (#254 backfill).        *)
+(* When the input is a PDF whose envelope is absent or scope ==            *)
+(* "model_only", the verifier returns BEFORE the envelope-dispatch path.   *)
+(* Identity pinning has no upstream evidence to bind to ⇒ USAGE_ERROR.    *)
+(* Otherwise the verdict is MODEL_ONLY — the document signature passes    *)
+(* but no CI verification ran, so the auditor is told explicitly.         *)
+(***************************************************************************)
+AuditPdfModelOnly(q) ==
+    IF PinningRequested(q)
+    THEN "USAGE_ERROR"
+    ELSE "MODEL_ONLY"
+
+(***************************************************************************)
 (* Audit: the abstract specification of what the verifier should compute.  *)
 (* The actual Python implementation is checked against this in the BFS     *)
 (* test. The cases are listed in the same order as the implementation      *)
 (* evaluates them.                                                         *)
+(*                                                                         *)
+(* AuditFull threads the (pkg, pins, scenario) state to produce the        *)
+(* whole verdict, including the PDF-only / orphan / sufficiency branches.  *)
+(* Audit (the unchanged-signature operator below) preserves backwards-     *)
+(* compatibility for existing callers (every existing invariant body       *)
+(* invokes Audit(pkg, pins) — those calls are rewired to AuditFull below). *)
 (***************************************************************************)
-Audit(k, q) ==
+AuditEnvelope(k, q) ==
     \* I7 case: pinning issuer alone, or predicate pins (model_id /
     \* commit_sha) without a SAN pin, is a usage error. The predicate
     \* pins are signed by Fulcio, but Fulcio signs whatever predicate
@@ -617,6 +707,69 @@ Audit(k, q) ==
     ELSE "VERIFIED"
 
 (***************************************************************************)
+(* DemoteForOrphans / DemoteForSufficiency — verdict post-processing      *)
+(* mirroring cli.py lines ~4055-4141.                                      *)
+(*                                                                          *)
+(* Both demotions apply ONLY on the success path (positive verdict        *)
+(* class). They never RAISE a negative verdict to positive; they never    *)
+(* override USAGE_ERROR. Their composition is associative and commutes    *)
+(* with USAGE_ERROR.                                                        *)
+(*                                                                          *)
+(* Orphan demotion (gap #258 1b):                                           *)
+(*   - has_orphan_results /\ ~AllowOrphanResults                          *)
+(*       ⇒ FAILED (auditor has not acknowledged the inconsistency).       *)
+(*   - has_orphan_results /\ AllowOrphanResults                            *)
+(*       ⇒ PARTIALLY_VERIFIED (override active, integrity gap surfaced).  *)
+(*                                                                          *)
+(* Sufficiency demotion (gap #258 1a):                                     *)
+(*   - sufficiency_state \in {SUFF_INSUFFICIENT, SUFF_PENDING}             *)
+(*       ⇒ PARTIALLY_VERIFIED (any non-sufficient control — insufficient  *)
+(*         OR pending — demotes; pending = sufficiency evaluation hasn't  *)
+(*         completed yet so VERIFIED would overstate).                    *)
+(*                                                                          *)
+(* Order matters: orphan demotion fires BEFORE sufficiency in cli.py      *)
+(* (the orphan branch is checked first; if it fires, the sufficiency     *)
+(* branch is not reached). The wrappers below preserve that order.        *)
+(***************************************************************************)
+DemoteForOrphans(v, orphan, allow) ==
+    IF v \in {"VERIFIED", "PARTIALLY_VERIFIED", "UNVERIFIED"} /\ orphan
+    THEN IF allow THEN "PARTIALLY_VERIFIED" ELSE "FAILED"
+    ELSE v
+
+DemoteForSufficiency(v, s) ==
+    IF v = "VERIFIED" /\ s \in {SUFF_INSUFFICIENT, SUFF_PENDING}
+    THEN "PARTIALLY_VERIFIED"
+    ELSE v
+
+(***************************************************************************)
+(* AuditFull(k, q, orphan, allow, model_only, suff) — full verdict        *)
+(* operator covering all five branches: model-only short-circuit, orphan  *)
+(* demotion, sufficiency demotion, and the envelope dispatch.             *)
+(*                                                                          *)
+(* Order (mirrors cli.py):                                                 *)
+(*   1. model_only ⇒ AuditPdfModelOnly (USAGE_ERROR or MODEL_ONLY).        *)
+(*      The PDF model-only branch RETURNS before envelope dispatch        *)
+(*      (cli.py line ~2538), so orphan and sufficiency never apply.       *)
+(*   2. Envelope dispatch ⇒ AuditEnvelope.                                *)
+(*   3. Orphan demotion (precedes sufficiency in cli.py).                 *)
+(*   4. Sufficiency demotion.                                              *)
+(***************************************************************************)
+AuditFull(k, q, orphan, allow, model_only, suff) ==
+    IF model_only
+    THEN AuditPdfModelOnly(q)
+    ELSE DemoteForSufficiency(
+             DemoteForOrphans(AuditEnvelope(k, q), orphan, allow),
+             suff)
+
+\* Audit — backwards-compatible 2-arg alias. Existing invariants (I1..V5c,
+\* C1, AuditView) call Audit(pkg, pins); rewiring it to thread the new
+\* state variables keeps the existing invariants' bodies unchanged while
+\* extending their semantics to the full verdict.
+Audit(k, q) ==
+    AuditFull(k, q, has_orphan_results, AllowOrphanResults,
+              is_model_only, sufficiency_state)
+
+(***************************************************************************)
 (* State machine: TLC enumerates every (pkg, pins) at Init (21M tuples on  *)
 (* the configured constants), then `Next == UNCHANGED vars` makes each      *)
 (* state self-loop. TLC checks invariants on every initial state and       *)
@@ -657,8 +810,28 @@ Audit(k, q) ==
 \* (pkg, pins)-row, so the partition into per-key_source sub-configs
 \* simply enumerates a subset of rows — every constraint still holds
 \* on each restricted row.
+\* Scenario-default constraints — pin the three new state variables to
+\* their canonical "nominal" values (no orphan results, not a PDF
+\* model-only export, no sufficiency demotion). Used by every existing
+\* cfg so the existing state spaces are byte-equivalent to the
+\* pre-extension run; new cfgs override these per-variable to vary the
+\* scenario. Each override is a single Init clause in the new cfg's
+\* Init operator (additive, no edit to the existing operators).
+DefaultScenarioPins ==
+    /\ has_orphan_results = FALSE
+    /\ is_model_only       = FALSE
+    /\ sufficiency_state   = SUFF_NA
+
 InitBaseConstraints ==
     /\ pins \in Pins
+    \* Scenario-knob defaults are folded in here so every existing
+    \* Init operator (Init_main_<class>, Init_bind) byte-equivalently
+    \* inherits "no orphan results / not a PDF model-only export /
+    \* sufficiency-irrelevant" — preserving each existing cfg's TLC
+    \* state space exactly. New scenario cfgs (Init_main_orphan_results,
+    \* Init_main_model_only, Init_main_sufficiency) DO NOT call
+    \* InitBaseConstraints so they can vary the relevant knob.
+    /\ DefaultScenarioPins
     \* When the envelope carries no bundle, bundle_bind_hash and
     \* bundle_bind_signature describe the bundle-bind relationship
     \* for an absent bundle and have no observable behaviour — the
@@ -961,6 +1134,95 @@ Spec_main_platform       == Init_main_platform       /\ [][Next]_vars
 Spec_main_workspace      == Init_main_workspace      /\ [][Next]_vars
 Spec_main_cdsse          == Init_main_cdsse          /\ [][Next]_vars
 Spec_main_orphan_legacy  == Init_main_orphan_legacy  /\ [][Next]_vars
+
+(*--------------------------------------------------------------------*)
+(* Scenario-knob sub-configs (gap #249 / #254 / #258 backfill).       *)
+(*                                                                    *)
+(* Each scenario cfg varies ONE scenario knob and pins the other two *)
+(* to their canonical defaults — keeping the matrix flat (3 new      *)
+(* dedicated cfgs vs scenario × key_source = 15) and per-cfg wall-   *)
+(* clock low. The envelope state space is tightly constrained to a   *)
+(* single canonical representative per scenario, since the new       *)
+(* invariants observe envelope structure only via Audit's verdict,   *)
+(* not via individual envelope fields. Per-cfg wall-clock target:    *)
+(* <10s.                                                              *)
+(*--------------------------------------------------------------------*)
+
+\* Init_main_orphan_results — V8 / V9 (gap #258 1b). Varies
+\* has_orphan_results across {FALSE, TRUE}; the AllowOrphanResults
+\* knob is BOOLEAN-valued and bound by the cfg's CONSTANT
+\* assignment (one cfg per value, separate scenarios). The envelope
+\* is pinned to a canonical KS_PLATFORM bundle-absent shape whose
+\* envelope-side verdict is independent of the orphan dimension —
+\* exercising V8/V9's positive-class demotion targets without
+\* exploring the bundle / pin cross-product.
+Init_main_orphan_results ==
+    /\ pkg \in PackageGenFor({KS_PLATFORM})
+    /\ pins \in Pins
+    \* Canonical bundle-absent envelope: bundle = ABSENT (so
+    \* bundle_bind_hash / bundle_bind_signature are NONE per the
+    \* InitBaseConstraints dead-field pin), ws_sig present, valid,
+    \* claimed_fp = signing_key_fp, no pin-mismatch shenanigans
+    \* (pin clauses are exercised in the existing per-key_source
+    \* cfgs; orphan modeling exercises the demotion shape).
+    /\ pkg.bundle = ABSENT
+    /\ pkg.ws_sig # ABSENT
+    /\ pkg.ws_sig.valid = TRUE
+    /\ pkg.ws_sig.claimed_fp = pkg.ws_sig.signing_key_fp
+    /\ pkg.results_hash # NONE
+    /\ pkg.results_hash = pkg.results_canonical_hash
+    \* Sufficiency knob pinned to SUFF_NA so V8/V9 fire on a clean
+    \* positive-class envelope verdict (which sufficiency would
+    \* otherwise demote independently).
+    /\ sufficiency_state = SUFF_NA
+    /\ is_model_only = FALSE
+    \* Vary has_orphan_results across {FALSE, TRUE}. The other state
+    \* variables stay pinned; AllowOrphanResults rides in via CONSTANT
+    \* assignment (one cfg-pair: allow_off + allow_on).
+    /\ has_orphan_results \in BOOLEAN
+
+\* Init_main_model_only — V10 / V11 / V12 (gap #254). Varies
+\* is_model_only across {FALSE, TRUE}; envelope canonical (the
+\* MODEL_ONLY branch short-circuits before envelope dispatch, so
+\* envelope shape doesn't affect verdict — but pkg must satisfy
+\* TypeOK + the InitBaseConstraints producer pins). Pins vary fully
+\* to exercise V11's "any pin set ⇒ USAGE_ERROR" coverage.
+Init_main_model_only ==
+    /\ pkg \in PackageGenFor({KS_PLATFORM})
+    /\ pins \in Pins
+    \* Canonical envelope: bundle-absent + valid ws_sig (same
+    \* canonical shape as Init_main_orphan_results above).
+    /\ pkg.bundle = ABSENT
+    /\ pkg.ws_sig # ABSENT
+    /\ pkg.ws_sig.valid = TRUE
+    /\ pkg.ws_sig.claimed_fp = pkg.ws_sig.signing_key_fp
+    /\ pkg.results_hash # NONE
+    /\ pkg.results_hash = pkg.results_canonical_hash
+    /\ has_orphan_results = FALSE
+    /\ sufficiency_state = SUFF_NA
+    /\ is_model_only \in BOOLEAN
+
+\* Init_main_sufficiency — V6 / V7 (gap #258 1a). Varies
+\* sufficiency_state across SufficiencyStates; envelope canonical
+\* (positive-class verdict), pins fully varied to confirm sufficiency
+\* demotion composes correctly with the existing pin-dispatch
+\* verdicts (USAGE_ERROR / FAILED preempt the demotion).
+Init_main_sufficiency ==
+    /\ pkg \in PackageGenFor({KS_PLATFORM})
+    /\ pins \in Pins
+    /\ pkg.bundle = ABSENT
+    /\ pkg.ws_sig # ABSENT
+    /\ pkg.ws_sig.valid = TRUE
+    /\ pkg.ws_sig.claimed_fp = pkg.ws_sig.signing_key_fp
+    /\ pkg.results_hash # NONE
+    /\ pkg.results_hash = pkg.results_canonical_hash
+    /\ has_orphan_results = FALSE
+    /\ is_model_only = FALSE
+    /\ sufficiency_state \in SufficiencyStates
+
+Spec_main_orphan_results == Init_main_orphan_results /\ [][Next]_vars
+Spec_main_model_only     == Init_main_model_only     /\ [][Next]_vars
+Spec_main_sufficiency    == Init_main_sufficiency    /\ [][Next]_vars
 
 (***************************************************************************)
 (* Security invariants. Each is a property the implementation must hold    *)
@@ -1336,6 +1598,95 @@ V5c_CustomerDsseSanPinDoesNotGate ==
          Audit(pkg, [pins EXCEPT !.san = alt_san])
            = Audit(pkg, [pins EXCEPT !.san = NONE])
 
+\* V6 — Pending sufficiency blocks a flat VERIFIED. The cli.py branch
+\* at line ~4115 demotes any positive-class verdict to PARTIALLY_VERIFIED
+\* when at least one control's sufficiency evaluation has not completed
+\* (pending) or has resolved insufficient. The proof is incomplete, so
+\* a flat VERIFIED would overstate. Closes gap #258 1a (pending-
+\* sufficiency).
+\*
+\* Stated as a safety property over the existing state space (no new
+\* per-pkg dimension other than the scenario knob sufficiency_state,
+\* which is pinned to SUFF_NA in every non-sufficiency cfg — so the
+\* invariant is vacuously true there). State-space cost is borne only
+\* by audit_main_sufficiency.cfg.
+V6_PendingSufficiencyBlocksFlatVerified ==
+    (Audit(pkg, pins) = "VERIFIED")
+    => sufficiency_state # SUFF_PENDING
+
+\* V7 — Insufficient sufficiency also blocks a flat VERIFIED.
+\* Symmetric to V6 but for the resolved-insufficient case. Together
+\* V6 and V7 enforce the cli.py rule "any non-sufficient control
+\* (insufficient OR pending) demotes the verdict to PARTIALLY VERIFIED."
+V7_InsufficientSufficiencyBlocksFlatVerified ==
+    (Audit(pkg, pins) = "VERIFIED")
+    => sufficiency_state # SUFF_INSUFFICIENT
+
+\* V8 — Orphan results fail-close by default. Closes gap #258 1b.
+\* When the package contains assertion results whose assertion_id
+\* appears in neither the controls block nor the assumptions block,
+\* the cli.py default is FAILED (cli.py line ~4055 — package is
+\* internally inconsistent; the cryptographic chain may be intact but
+\* at least one verdict floats free of any controlled or assumed
+\* property, so the audit cannot be trusted holistically). The
+\* --allow-orphan-results flag is the auditor's explicit
+\* acknowledgement and demotes the verdict to PARTIALLY_VERIFIED
+\* instead.
+\*
+\* Allows USAGE_ERROR alongside FAILED: a SAN-less co-pin
+\* (--expected-model-id / --expected-commit-sha without
+\* --expected-ci-identity) or a bare --expected-issuer raises
+\* USAGE_ERROR before the envelope/orphan dispatch fires.
+V8_OrphanResultsFailClosedByDefault ==
+    (has_orphan_results /\ ~AllowOrphanResults)
+    => Audit(pkg, pins) \in {"FAILED", "USAGE_ERROR"}
+
+\* V9 — --allow-orphan-results downgrades positive verdict to
+\* PARTIALLY_VERIFIED (never raises a negative verdict to positive).
+\* The override is the auditor's acknowledgement of an integrity gap;
+\* it must surface as PARTIALLY_VERIFIED so the orphan count remains
+\* visible in the verdict line (cli.py line ~4089 — overriding the
+\* fail-close shouldn't make the inconsistency invisible).
+\*
+\* Allows {USAGE_ERROR, FAILED, UNVERIFIED} on the right: USAGE_ERROR
+\* preempts via I7; an envelope-side FAILED (bad signature etc.)
+\* survives the demotion (DemoteForOrphans only fires on a positive-
+\* class result); UNVERIFIED with orphan + allow demotes to
+\* PARTIALLY_VERIFIED but cli.py emits UNVERIFIED earlier when no
+\* cryptographic verification ran — the implementation's branch
+\* order is captured by the conjunction below.
+V9_AllowOrphanResultsDemotes ==
+    (has_orphan_results /\ AllowOrphanResults)
+    => Audit(pkg, pins) \in {"PARTIALLY_VERIFIED", "FAILED",
+                              "USAGE_ERROR", "UNVERIFIED"}
+
+\* V10 — PDF model-only export with no pinning ⇒ MODEL_ONLY.
+\* Closes gap #254 (verdict-emission). When the input is a model-only
+\* PDF (no audit envelope or envelope.scope == "model_only") and the
+\* auditor did NOT supply any identity-pinning flag, cli.py line ~2522
+\* emits "Verdict: MODEL ONLY" and exits 0. The auditor is told
+\* explicitly that the document signature passed but no CI
+\* verification ran — distinct from VERIFIED and from FAILED.
+V10_ModelOnlyEmitsModelOnly ==
+    (is_model_only /\ ~PinningRequested(pins))
+    => Audit(pkg, pins) = "MODEL_ONLY"
+
+\* V11 — PDF model-only export WITH pinning ⇒ USAGE_ERROR.
+\* The model-only PDF carries no upstream evidence; pinning has
+\* nothing to bind to (cli.py line ~2497 raises SystemExit(2)). Same
+\* fail-closed precedent as --expected-issuer alone on a JSON package.
+V11_ModelOnlyWithPinningIsUsageError ==
+    (is_model_only /\ PinningRequested(pins))
+    => Audit(pkg, pins) = "USAGE_ERROR"
+
+\* V12 — MODEL_ONLY is emitted ONLY on a PDF model-only input. The
+\* verdict value is reserved for that branch; no envelope-dispatch
+\* code path may produce it. Symmetric to "VERIFIED ⇒ evidence ran"
+\* (I5) but in the opposite direction: MODEL_ONLY ⇒ model-only input.
+V12_ModelOnlyOnlyOnModelOnlyInput ==
+    (Audit(pkg, pins) = "MODEL_ONLY")
+    => is_model_only
+
 \* C1 — Composition lemma for Config 1.
 \*
 \* Asserts that, on every state in Config 1's pinned domain, Audit's
@@ -1401,6 +1752,31 @@ SecurityInvariants ==
     /\ V5a_CustomerDssePinMismatchFails
     /\ V5b_CustomerDsseKeyMatchVerifies
     /\ V5c_CustomerDsseSanPinDoesNotGate
+    /\ V6_PendingSufficiencyBlocksFlatVerified
+    /\ V7_InsufficientSufficiencyBlocksFlatVerified
+    /\ V8_OrphanResultsFailClosedByDefault
+    /\ V9_AllowOrphanResultsDemotes
+    /\ V10_ModelOnlyEmitsModelOnly
+    /\ V11_ModelOnlyWithPinningIsUsageError
+    /\ V12_ModelOnlyOnlyOnModelOnlyInput
+
+\* ConfigScenarioInvariants — the V6..V12 invariants that fire only on
+\* the scenario-knob settings (has_orphan_results / is_model_only /
+\* sufficiency_state). Checked by the three new dedicated cfgs
+\* (audit_main_orphan_results / audit_main_model_only /
+\* audit_main_sufficiency). Excluded from ConfigMainInvariants and
+\* ConfigBindInvariants because the existing cfgs pin every scenario
+\* knob to its canonical default (DefaultScenarioPins) — checking
+\* V6..V12 there is correct but vacuously true on every state, adding
+\* zero coverage and a small TLC overhead per state.
+ConfigScenarioInvariants ==
+    /\ V6_PendingSufficiencyBlocksFlatVerified
+    /\ V7_InsufficientSufficiencyBlocksFlatVerified
+    /\ V8_OrphanResultsFailClosedByDefault
+    /\ V9_AllowOrphanResultsDemotes
+    /\ V10_ModelOnlyEmitsModelOnly
+    /\ V11_ModelOnlyWithPinningIsUsageError
+    /\ V12_ModelOnlyOnlyOnModelOnlyInput
 
 \* Config 1's invariant set: the subset of SecurityInvariants whose
 \* truth value is independent of bundle_bind on the pinned-matching
@@ -1449,6 +1825,9 @@ ConfigBindInvariants ==
 TypeOK ==
     /\ pkg \in Package
     /\ pins \in Pins
+    /\ has_orphan_results \in BOOLEAN
+    /\ is_model_only \in BOOLEAN
+    /\ sufficiency_state \in SufficiencyStates
 
 (***************************************************************************)
 (* AuditView — a provably lossless TLC VIEW that collapses the             *)

@@ -69,7 +69,20 @@ SUBCONFIG_GLOB = "audit_main_*.cfg"
 # audit_main.cfg (the un-split full-domain Config-1) is intentionally
 # excluded — the sub-split's totality argument is about the per-class
 # Inits, not the original aggregate config.
-EXCLUDED_CFGS = {"audit_main.cfg"}
+#
+# The scenario-knob cfgs (added 2026-05-27, gap #249 / #254 / #258
+# backfill) are also excluded: they partition a DIFFERENT dimension
+# (the orphan-results / model-only / sufficiency scenario knobs) and
+# pin key_source to a single canonical class (KS_PLATFORM). They are
+# not contributors to the key_source partition; their own scenario
+# partition is enforced by Init pinning per-cfg.
+EXCLUDED_CFGS = {
+    "audit_main.cfg",
+    "audit_main_orphan_results_blocked.cfg",
+    "audit_main_orphan_results_allowed.cfg",
+    "audit_main_model_only.cfg",
+    "audit_main_sufficiency.cfg",
+}
 
 
 def _die(msg: str) -> None:
@@ -93,6 +106,56 @@ def _extract_key_sources(tla_text: str) -> set[str]:
     return values
 
 
+# Verdict values the Audit operator may return. Mirrors the
+# enumeration in audit.tla's `Verdict == { ... }` set declaration.
+# Used by the verdict-partition-totality check: every value the
+# spec's `Audit` operator can produce must appear in `Verdict`
+# (otherwise TLC's type check fails) AND `Verdict` must enumerate
+# every value the real-code mirror in cli.py can return.
+#
+# Maintained as the explicit-list authoritative spec; the script
+# extracts the audit.tla declaration and asserts set equality.
+_EXPECTED_VERDICTS = frozenset({
+    "VERIFIED",
+    "PARTIALLY_VERIFIED",
+    "UNVERIFIED",
+    "FAILED",
+    "USAGE_ERROR",
+    "MODEL_ONLY",  # added 2026-05-27, gap #254 backfill
+})
+
+
+def _extract_verdict_values(tla_text: str) -> set[str]:
+    """Find `Verdict == { ... }` and return the set of quoted
+    string literals it enumerates.
+
+    The audit.tla declaration spans multiple lines and may be
+    interleaved with line comments; this extractor strips comments
+    line-by-line before parsing the brace-enclosed string list.
+    """
+    m = re.search(
+        r"^Verdict\s*==\s*\{((?:[^{}]|\{[^{}]*\})*)\}",
+        tla_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not m:
+        _die("could not find `Verdict == { ... }` in audit.tla")
+    raw = m.group(1)
+    # Strip TLA+ line comments (`\* ...`) so embedded text doesn't
+    # confuse the literal extraction.
+    cleaned_lines = []
+    for line in raw.splitlines():
+        idx = line.find("\\*")
+        if idx >= 0:
+            line = line[:idx]
+        cleaned_lines.append(line)
+    cleaned = " ".join(cleaned_lines)
+    values = set(re.findall(r'"([^"]+)"', cleaned))
+    if not values:
+        _die("Verdict is empty — nothing to enumerate")
+    return values
+
+
 # Hardcoded mapping from specialized generator names to their fixed
 # `allowedKS`. Add a new entry here when a new specialized PackageGen*
 # is introduced (e.g., a future PackageGenForOrphan that pins specific
@@ -104,6 +167,25 @@ _SPECIALIZED_GENERATORS: dict[str, frozenset[str]] = {
     # generator restricted to {KS_CUSTOMER_DSSE}. See audit.tla.
     "PackageGenForCdsse": frozenset({"KS_CUSTOMER_DSSE"}),
 }
+
+
+# Init operators that look like key_source-partition members
+# (Init_main_<name>) but actually partition a different dimension
+# (the scenario knobs — has_orphan_results / is_model_only /
+# sufficiency_state). Their cfgs are already in EXCLUDED_CFGS so
+# they never feed cfg_to_allowedKS, but the body-shape walk reaches
+# them too. Listed here so they're skipped at extraction time and
+# don't trip the `_SPECIALIZED_GENERATORS` membership check.
+#
+# Each entry must be paired with the corresponding EXCLUDED_CFGS
+# entry (the cfg whose SPECIFICATION selects it). The two lists are
+# the explicit, reviewable surface for "this Init_main_<name> is
+# scenario-side, not key_source-side."
+_SCENARIO_INIT_OPERATORS = frozenset({
+    "Init_main_orphan_results",
+    "Init_main_model_only",
+    "Init_main_sufficiency",
+})
 
 
 def _extract_init_operators(tla_text: str) -> dict[str, set[str]]:
@@ -128,6 +210,8 @@ def _extract_init_operators(tla_text: str) -> dict[str, set[str]]:
     )
     for m in generic_pattern.finditer(tla_text):
         name = m.group(1)
+        if name in _SCENARIO_INIT_OPERATORS:
+            continue
         raw = m.group(2)
         literals = {tok.strip() for tok in raw.split(",") if tok.strip()}
         if not literals:
@@ -143,6 +227,8 @@ def _extract_init_operators(tla_text: str) -> dict[str, set[str]]:
     )
     for m in specialized_pattern.finditer(tla_text):
         name = m.group(1)
+        if name in _SCENARIO_INIT_OPERATORS:
+            continue
         gen = m.group(2)
         if name in out:
             # Already matched by generic_pattern — Init_main_<class>
@@ -269,6 +355,41 @@ def main() -> None:
         print(f"  {cfg}: {sorted(ks)}")
     print("=" * 70)
     print("PARTITION SOUND (totality + disjointness mechanically verified)")
+
+    # 3. VERDICT-VALUE PARTITION — the closed set of values
+    # audit.tla's `Audit` operator may return. Asserts the audit.tla
+    # `Verdict == { ... }` set equals the expected set, so:
+    #   - Every value the spec mirror in tests/test_spec_invariants.py
+    #     can return is declared (TLC's type system would otherwise
+    #     accept an unexpected literal and trip TypeOK at run time).
+    #   - No stale value remains after a verdict was retired.
+    # Adding a new verdict requires updating BOTH audit.tla and
+    # _EXPECTED_VERDICTS in this script in one PR — a single source
+    # of staleness on either side fails the check loudly.
+    verdict_values = _extract_verdict_values(tla_text)
+    missing = _EXPECTED_VERDICTS - verdict_values
+    extra_v = verdict_values - _EXPECTED_VERDICTS
+    if missing:
+        _die(
+            f"VERDICT PARTITION VIOLATED — value(s) {sorted(missing)} "
+            f"are expected (per _EXPECTED_VERDICTS) but NOT in audit.tla's "
+            f"`Verdict` set. The spec mirror in tests/test_spec_invariants.py "
+            f"can produce a verdict TLC will reject as ill-typed. Add the "
+            f"value to audit.tla's `Verdict == { '{' } ... { '}' }`."
+        )
+    if extra_v:
+        _die(
+            f"VERDICT PARTITION VIOLATED — value(s) {sorted(extra_v)} appear "
+            f"in audit.tla's `Verdict` set but are not in _EXPECTED_VERDICTS. "
+            f"Likely a stale value left after a verdict was retired. Drop it "
+            f"from audit.tla, or — if newly introduced — add it to "
+            f"_EXPECTED_VERDICTS in this script."
+        )
+    print(
+        f"VERDICT PARTITION TOTAL: {sorted(verdict_values)} "
+        f"(audit.tla `Verdict` set matches _EXPECTED_VERDICTS)"
+    )
+    print("=" * 70)
     sys.exit(0)
 
 

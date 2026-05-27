@@ -376,6 +376,64 @@ The mechanical totality + disjointness check + the per-row invariant
 property are what make the sub-split sound; re-running the aggregate
 would only duplicate work the partition already provably covers.
 
+## Scenario-knob slices (V6..V12)
+
+Three new state variables — `has_orphan_results`, `is_model_only`,
+`sufficiency_state` — model the verdict-affecting behaviour added
+across PR #249 (require-attestation flag — runner-side only, no
+audit-side invariant), PR #254 (MODEL_ONLY verdict for unverified-
+model PDFs), and PR #258 (orphan-results fail-close + pending-
+sufficiency demotion). Each variable is pinned to a canonical
+"nominal" default (`FALSE` / `FALSE` / `SUFF_NA`) in every existing
+cfg via `DefaultScenarioPins` in `InitBaseConstraints`, so the
+existing Config-1 and Config-2 state spaces are byte-equivalent to
+the pre-extension TLC runs.
+
+The new invariants V6..V12 are verified in four dedicated cfgs that
+each vary ONE scenario variable and pin the others to defaults:
+
+| cfg                                          | varies            | `AllowOrphanResults` | invariants exercised |
+|---|---|---|---|
+| `audit_main_orphan_results_blocked.cfg`      | `has_orphan_results` | `FALSE`              | V8, V9 (fail-closed branch) |
+| `audit_main_orphan_results_allowed.cfg`      | `has_orphan_results` | `TRUE`               | V9 (override branch) |
+| `audit_main_model_only.cfg`                  | `is_model_only`     | `FALSE`              | V10, V11, V12 |
+| `audit_main_sufficiency.cfg`                 | `sufficiency_state` | `FALSE`              | V6, V7 |
+
+Splitting the orphan-results scenario across two cfgs by
+`AllowOrphanResults` value follows the "BOOLEAN scenarios live in
+separate .cfgs" pattern — cheaper than letting TLC explore both
+flag values in one run. The envelope state space is tightly
+constrained in each scenario cfg (bundle = ABSENT, ws_sig present
+and valid, results_hash bound) since the scenario invariants
+observe envelope state only via the abstract `AuditEnvelope`
+verdict, never via individual envelope fields. Per-cfg wall-clock
+is ~4–5s.
+
+Soundness of the partition (the scenario knobs vs the existing
+cfgs): every existing cfg pins `has_orphan_results = FALSE`,
+`is_model_only = FALSE`, `sufficiency_state = SUFF_NA` via
+`DefaultScenarioPins` — so V6..V12 are vacuously true on every
+state those cfgs explore. The scenario cfgs vary exactly one knob
+at a time with the others pinned to defaults, so V6..V12 fire
+non-vacuously where each one's premise matches its target
+scenario. The product space `(envelope, has_orphan_results,
+is_model_only, sufficiency_state)` is therefore covered
+exhaustively in its INVARIANT-RELEVANT subspace:
+
+  - envelope dimension exhaustively covered by the existing
+    Config-1 sub-split + Config-2 (every `key_source` × bundle ×
+    pins combination);
+  - scenario dimension covered by the four scenario cfgs (each
+    scenario value, on a representative envelope).
+
+The scenario cfgs do NOT declare `VIEW AuditView` (their state
+spaces are small enough not to need the reduction). The new
+invariants' call graphs still obey the AuditView (in)equality
+discipline — `check_audit_view_faithful.py` walks them too via
+`_SCENARIO_CFGS`, so a future cfg that combines scenario
+variation WITH the VIEW reduction inherits the proven faithfulness
+without script edit.
+
 ## CI job split
 
 The audit-spec TLC work runs in a **dedicated `audit-tlc` job** in

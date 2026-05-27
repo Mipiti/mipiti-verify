@@ -369,9 +369,68 @@ def audit_spec(pkg: dict, pins: dict) -> str:
     """Python mirror of the TLA+ Audit operator.
 
     Returns one of: VERIFIED, PARTIALLY_VERIFIED, UNVERIFIED, FAILED,
-    USAGE_ERROR. Branch order matches `cli.py` exactly so a divergence
-    between this function and the implementation surfaces as a
-    parametrised test failure with the offending (pkg, pins) named.
+    USAGE_ERROR, MODEL_ONLY. Branch order matches `cli.py` exactly so a
+    divergence between this function and the implementation surfaces as
+    a parametrised test failure with the offending (pkg, pins) named.
+
+    Scenario-knob extension (gap #249 / #254 / #258 backfill): pkg may
+    optionally carry `is_model_only`, `has_orphan_results`, and
+    `sufficiency_state` (4-class enum) keys; pins may optionally carry
+    `allow_orphan_results`. Default values mirror the cli.py default
+    behaviour (no orphan results, not a model-only PDF, sufficiency
+    irrelevant). The BFS rows materialised in this file all use the
+    defaults; the scenario invariants are verified at the TLA+ level
+    (audit_main_orphan_results_*.cfg / audit_main_model_only.cfg /
+    audit_main_sufficiency.cfg). This guard keeps the spec mirror
+    forward-compatible for any future BFS row that varies a scenario
+    knob without forcing the existing rows to declare default fields.
+    """
+    # Scenario knobs — default to cli.py's nominal "no scenario" state.
+    is_model_only = pkg.get("is_model_only", False)
+    has_orphan_results = pkg.get("has_orphan_results", False)
+    allow_orphan_results = pins.get("allow_orphan_results", False)
+    sufficiency_state = pkg.get("sufficiency_state", "SUFF_NA")
+
+    # PDF model-only short-circuit (cli.py line ~2497 / ~2522). Returns
+    # BEFORE envelope dispatch, so orphan / sufficiency demotion never
+    # apply on this branch.
+    if is_model_only:
+        pinning_requested = (
+            pins["san"] is not None
+            or pins["workspace_fp"] is not None
+            or pins.get("model_id") is not None
+            or pins.get("commit_sha") is not None
+        )
+        if pinning_requested:
+            return "USAGE_ERROR"
+        return "MODEL_ONLY"
+
+    envelope_verdict = _audit_spec_envelope(pkg, pins)
+
+    # Orphan demotion (cli.py line ~4055). Fires on positive-class
+    # envelope verdict only; never raises a negative verdict.
+    if has_orphan_results and envelope_verdict in (
+        "VERIFIED", "PARTIALLY_VERIFIED", "UNVERIFIED"
+    ):
+        envelope_verdict = (
+            "PARTIALLY_VERIFIED" if allow_orphan_results else "FAILED"
+        )
+
+    # Sufficiency demotion (cli.py line ~4115). Pending / insufficient
+    # demote a flat VERIFIED to PARTIALLY_VERIFIED.
+    if envelope_verdict == "VERIFIED" and sufficiency_state in (
+        "SUFF_INSUFFICIENT", "SUFF_PENDING"
+    ):
+        envelope_verdict = "PARTIALLY_VERIFIED"
+
+    return envelope_verdict
+
+
+def _audit_spec_envelope(pkg: dict, pins: dict) -> str:
+    """Envelope-dispatch portion of audit_spec — the original verdict
+    function over (Package, Pins) without scenario-knob post-processing.
+    Extracted so the wrapper can compose model-only / orphan /
+    sufficiency demotions around a stable inner verdict.
     """
     bundle = pkg["bundle"]
     ws_sig = pkg["ws_sig"]
@@ -1798,3 +1857,151 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
             f"I14 violated: VERIFIED with non-VALID bundle_bind_signature\n"
             f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
         )
+
+
+# --- Scenario-knob invariants (V6..V12) -------------------------------
+#
+# Targeted unit-level coverage for the new audit_spec post-processing
+# layers added 2026-05-27 (gap #254 / #258 backfill). The TLA+ spec
+# verifies the abstract operator's behaviour exhaustively over the
+# pinned-envelope state space; these tests verify the spec mirror in
+# `audit_spec` matches that behaviour on representative inputs.
+#
+# The model-only (V10/V11/V12) and orphan-results (V8/V9) and
+# sufficiency (V6/V7) branches all post-process the envelope verdict
+# via local enum/boolean knobs — no Sigstore minting required, no
+# real-code invocation needed (cli.py-side coverage lives in
+# tests/test_cli.py). These are spec-mirror sanity checks.
+
+_DEFAULT_PINS_NONE = {
+    "san": None,
+    "issuer_explicit": None,
+    "workspace_fp": None,
+    "model_id": None,
+    "commit_sha": None,
+}
+
+
+def _envelope_unverified():
+    """Canonical no-evidence envelope: spec mirror returns UNVERIFIED."""
+    return {
+        "bundle": ABSENT,
+        "ws_sig": ABSENT,
+        "results_hash": None,
+        "results_canonical_hash": "h1",
+        "bundle_bind_hash": None,
+        "bundle_bind_signature": None,
+    }
+
+
+def test_v10_model_only_emits_model_only():
+    pkg = dict(_envelope_unverified(), is_model_only=True)
+    assert audit_spec(pkg, _DEFAULT_PINS_NONE) == "MODEL_ONLY"
+
+
+def test_v11_model_only_with_pinning_is_usage_error():
+    pkg = dict(_envelope_unverified(), is_model_only=True)
+    for pin_field in ("san", "workspace_fp", "model_id", "commit_sha"):
+        pins = dict(
+            _DEFAULT_PINS_NONE,
+            **{pin_field: "san_gh_a" if pin_field == "san" else "x"},
+        )
+        assert audit_spec(pkg, pins) == "USAGE_ERROR", pin_field
+
+
+def test_v12_model_only_only_emitted_on_model_only_input():
+    # An envelope with is_model_only=FALSE never emits MODEL_ONLY,
+    # regardless of pin / sufficiency / orphan state.
+    for orphan in (False, True):
+        for allow in (False, True):
+            for suff in ("SUFF_ALL", "SUFF_INSUFFICIENT",
+                          "SUFF_PENDING", "SUFF_NA"):
+                pkg = dict(
+                    _envelope_unverified(),
+                    has_orphan_results=orphan,
+                    sufficiency_state=suff,
+                )
+                pins = dict(_DEFAULT_PINS_NONE, allow_orphan_results=allow)
+                assert audit_spec(pkg, pins) != "MODEL_ONLY", (
+                    f"MODEL_ONLY leaked into envelope branch: "
+                    f"orphan={orphan}, allow={allow}, suff={suff}"
+                )
+
+
+def test_v8_orphan_results_fail_close_default():
+    # Envelope verdict UNVERIFIED (no evidence) + orphan + allow=False
+    # demotes to FAILED.
+    pkg = dict(_envelope_unverified(), has_orphan_results=True)
+    pins = dict(_DEFAULT_PINS_NONE, allow_orphan_results=False)
+    assert audit_spec(pkg, pins) == "FAILED"
+
+
+def test_v9_allow_orphan_results_demotes_to_partial():
+    pkg = dict(_envelope_unverified(), has_orphan_results=True)
+    pins = dict(_DEFAULT_PINS_NONE, allow_orphan_results=True)
+    assert audit_spec(pkg, pins) == "PARTIALLY_VERIFIED"
+
+
+def test_v6_pending_sufficiency_demotes_verified():
+    # Build a customer_dsse VERIFIED envelope (audit_spec returns
+    # VERIFIED on the customer_dsse terminal dispatch with matched
+    # predicate / fingerprint and canonical hash intact). Then add
+    # sufficiency_state = SUFF_PENDING — verdict must drop to
+    # PARTIALLY_VERIFIED.
+    pkg = {
+        "bundle": ABSENT,
+        "ws_sig": {
+            "key_source": "customer_dsse",
+            "signing_key_fp": "fp_a",
+            "claimed_fp": None,
+            "valid": True,
+            "message_hash": "h1",
+        },
+        "results_hash": "h1",
+        "results_canonical_hash": "h1",
+        "bundle_bind_hash": None,
+        "bundle_bind_signature": None,
+    }
+    # Without sufficiency knob → VERIFIED.
+    assert audit_spec(pkg, _DEFAULT_PINS_NONE) == "VERIFIED"
+    # With SUFF_PENDING → PARTIALLY_VERIFIED.
+    pkg_pending = dict(pkg, sufficiency_state="SUFF_PENDING")
+    assert audit_spec(pkg_pending, _DEFAULT_PINS_NONE) == "PARTIALLY_VERIFIED"
+
+
+def test_v7_insufficient_sufficiency_demotes_verified():
+    pkg = {
+        "bundle": ABSENT,
+        "ws_sig": {
+            "key_source": "customer_dsse",
+            "signing_key_fp": "fp_a",
+            "claimed_fp": None,
+            "valid": True,
+            "message_hash": "h1",
+        },
+        "results_hash": "h1",
+        "results_canonical_hash": "h1",
+        "bundle_bind_hash": None,
+        "bundle_bind_signature": None,
+        "sufficiency_state": "SUFF_INSUFFICIENT",
+    }
+    assert audit_spec(pkg, _DEFAULT_PINS_NONE) == "PARTIALLY_VERIFIED"
+
+
+def test_orphan_demotion_never_overrides_failed():
+    # A FAILED envelope verdict + orphan + allow=True should NOT
+    # promote to PARTIALLY_VERIFIED. The orphan demotion fires only
+    # on positive-class verdicts.
+    pkg = {
+        # workspace_fp pin + no ws_sig = I2 FAILED.
+        "bundle": ABSENT,
+        "ws_sig": ABSENT,
+        "results_hash": None,
+        "results_canonical_hash": "h1",
+        "bundle_bind_hash": None,
+        "bundle_bind_signature": None,
+        "has_orphan_results": True,
+    }
+    pins = dict(_DEFAULT_PINS_NONE, workspace_fp="fp_a",
+                 allow_orphan_results=True)
+    assert audit_spec(pkg, pins) == "FAILED"

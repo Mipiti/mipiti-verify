@@ -85,6 +85,24 @@ _CFGS = (
     "audit_bundle_bind.cfg",
 )
 
+# Scenario-knob sub-configs (gap #249 / #254 / #258 backfill) do NOT
+# declare `VIEW AuditView` and therefore don't need the faithfulness
+# proof. Their state spaces (5K-10K distinct states each) are small
+# enough that no reduction is necessary. Their INVARIANTS list
+# (ConfigScenarioInvariants) is still subjected to the same
+# (in)equality discipline via the call-graph walk: we treat them as
+# *additional* invariant roots and assert every reachable operator
+# obeys the discipline, but DON'T require they declare the VIEW.
+# This makes a future cfg that adds `VIEW AuditView` while listing
+# ConfigScenarioInvariants definitionally lossless without any
+# script edit.
+_SCENARIO_CFGS = (
+    "audit_main_orphan_results_blocked.cfg",
+    "audit_main_orphan_results_allowed.cfg",
+    "audit_main_model_only.cfg",
+    "audit_main_sufficiency.cfg",
+)
+
 # ---------------------------------------------------------------------------
 # The collapsed quantities. AuditView replaces these (on customer_dsse
 # states only) with a 3-valued token / a kept boolean; every reachable
@@ -595,6 +613,14 @@ def _collect_reachable_invariant_ops():
     all_roots: set = set()
     cfg_roots: dict = {}
     for cfg in _CFGS:
+        roots = _cfg_invariant_roots(os.path.join(_FORMAL, cfg))
+        cfg_roots[cfg] = roots
+        all_roots |= set(roots)
+    # Scenario cfgs (no VIEW declaration) — still fold their invariant
+    # roots into the AST walk so the (in)equality discipline is enforced
+    # on every reachable operator. The structural VIEW-declaration check
+    # below skips _SCENARIO_CFGS deliberately.
+    for cfg in _SCENARIO_CFGS:
         roots = _cfg_invariant_roots(os.path.join(_FORMAL, cfg))
         cfg_roots[cfg] = roots
         all_roots |= set(roots)
