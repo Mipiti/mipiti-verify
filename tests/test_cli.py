@@ -4351,3 +4351,102 @@ class TestAuditPackManifest:
         out_flat = " ".join(result.output.split())
         assert "Unknown section 'future_section_v2'" in out_flat
         assert "Manifest verified" in out_flat
+
+    # ----- Legacy-path deprecation advisory -----
+
+    def test_legacy_only_pack_emits_deprecation_warning(self, tmp_path):
+        """When the pack carries only legacy `signature` + `results_hash`
+        (no manifest), the auditor sees a yellow advisory naming the
+        narrowed verification scope and recommending the pack issuer
+        upgrade Mipiti. The advisory does not change the verdict — a
+        valid legacy signature still produces VERIFIED with exit 0."""
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=False, with_legacy_signature=True,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        # Advisory keyword is present and visually distinct (yellow).
+        assert "WARNING" in out_flat
+        assert "Legacy-only signature path" in out_flat
+        # Names the limitation: which sections are NOT signature-bound
+        # by the legacy path.
+        assert "verification_run.results" in out_flat
+        assert (
+            "model definition, controls, assumptions, assertions, and "
+            "composition"
+        ) in out_flat
+        assert "NOT signature-bound" in out_flat
+        # Recommends operator action (the pack issuer updates Mipiti).
+        assert "update Mipiti" in out_flat
+        assert "deprecated" in out_flat
+        # The legacy path still produces a VERIFIED verdict.
+        assert "Verdict: VERIFIED" in result.output
+
+    def test_manifest_and_legacy_present_notes_deprecation_no_warning(
+        self, tmp_path,
+    ):
+        """When both the manifest path AND legacy fields are present,
+        the manifest is the authoritative verification — legacy fields
+        are ignored. The trust-contract line acknowledges that the
+        legacy fields were ignored as deprecated, but NO warning block
+        is emitted (the auditor's verification is complete via the
+        manifest)."""
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, with_legacy_signature=True,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        # Manifest is the authoritative path.
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+        # Deprecation acknowledged in-line (not as a warning block).
+        assert (
+            "legacy results_hash + signature ignored — deprecated"
+            in out_flat
+        )
+        # No standalone WARNING block — the manifest covers the body
+        # fully, so there's nothing to advise about.
+        assert "Legacy-only signature path" not in out_flat
+        assert "Verdict: VERIFIED" in result.output
+
+    def test_manifest_only_pack_emits_no_deprecation_advisory(
+        self, tmp_path,
+    ):
+        """A pack carrying only the manifest path (no legacy fields)
+        produces a clean VERIFIED result: no deprecation note, no
+        warning block. The audit-pack manifest is the only integrity
+        claim and the verifier reports it cleanly."""
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, with_legacy_signature=False,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        # Manifest verified cleanly.
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+        # No deprecation language anywhere.
+        assert "deprecated" not in out_flat
+        assert "Legacy-only signature path" not in out_flat
+        # Verdict still VERIFIED.
+        assert "Verdict: VERIFIED" in result.output
+
+    def test_legacy_warning_does_not_change_exit_code(self, tmp_path):
+        """The legacy-path warning is advisory only — a valid legacy
+        signature still exits 0. Pin this so a future refactor doesn't
+        accidentally hoist the warning into a hard-fail path."""
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=False, with_legacy_signature=True,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        # Both the warning AND the success verdict must coexist —
+        # narrower scope ≠ failed scope.
+        assert "WARNING" in result.output
+        assert "Verdict: VERIFIED" in result.output

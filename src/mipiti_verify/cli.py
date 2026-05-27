@@ -3898,11 +3898,27 @@ def audit(
             "  Cryptographic chain:    [yellow]ABSENT[/yellow] "
             "(no Sigstore bundle in package)"
         )
+    # Detect whether the legacy `signature` + `results_hash` fields were
+    # populated. The manifest path is the strong, whole-body integrity
+    # claim; the legacy fields are kept for one backward-compat release
+    # window and will be removed in a follow-up. Surface the deprecation
+    # status accordingly in the trust-contract summary below.
+    legacy_fields_present = bool(
+        ci and isinstance(ci, dict)
+        and ci.get("signature") and ci.get("results_hash")
+    )
     if manifest_verified:
-        console.print(
-            "  Audit-pack manifest:    [green]VERIFIED[/green] "
-            "(whole-body coverage via signed section hashes)"
-        )
+        if legacy_fields_present:
+            console.print(
+                "  Audit-pack manifest:    [green]VERIFIED[/green] "
+                "(whole-body coverage via signed section hashes; "
+                "legacy results_hash + signature ignored — deprecated)"
+            )
+        else:
+            console.print(
+                "  Audit-pack manifest:    [green]VERIFIED[/green] "
+                "(whole-body coverage via signed section hashes)"
+            )
     elif manifest_present:
         console.print(
             "  Audit-pack manifest:    [red]FAILED[/red] "
@@ -3913,6 +3929,49 @@ def audit(
             "  Audit-pack manifest:    [yellow]ABSENT[/yellow] "
             "(pack predates manifest signing; legacy signature only)"
         )
+        # Legacy-only verification path: the legacy `signature` over
+        # `results_hash` covers only `verification_run.results`. Model
+        # state, controls, assumptions, assertions, and composition are
+        # NOT signature-bound by the legacy path. Issue an advisory so
+        # the auditor knows the verification scope is narrower than the
+        # manifest path's whole-body coverage, and the pack issuer
+        # should update Mipiti to a release that emits the manifest.
+        # Advisory only — does NOT change the verdict or exit code: the
+        # legacy verification still produces a valid result for what it
+        # covers.
+        if legacy_fields_present:
+            console.print(
+                "  [yellow]WARNING[/yellow] [yellow]Legacy-only "
+                "signature path — verification scope is narrow.[/yellow]"
+            )
+            console.print(
+                "    [yellow]The legacy `signature` over `results_hash` "
+                "binds only `verification_run.results`.[/yellow]"
+            )
+            console.print(
+                "    [yellow]The model definition, controls, assumptions, "
+                "assertions, and composition[/yellow]"
+            )
+            console.print(
+                "    [yellow]section are NOT signature-bound by the "
+                "legacy path — tampering of those[/yellow]"
+            )
+            console.print(
+                "    [yellow]sections is not detected by legacy "
+                "verification alone.[/yellow]"
+            )
+            console.print(
+                "    [yellow]Action: ask the pack issuer (operator) to "
+                "update Mipiti to a release that[/yellow]"
+            )
+            console.print(
+                "    [yellow]emits the signed audit-pack manifest. The "
+                "legacy fields are deprecated and[/yellow]"
+            )
+            console.print(
+                "    [yellow]will be removed in a future "
+                "release.[/yellow]"
+            )
     if content_verified:
         console.print(
             "  Content-integrity sig:  [green]VERIFIED[/green]"
