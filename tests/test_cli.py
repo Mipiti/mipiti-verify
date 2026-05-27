@@ -3898,3 +3898,456 @@ class TestAuditPackComposition:
         # the audit verdict — but the renderer must not crash.
         assert result.exit_code == 0
         assert "Composition" in result.output
+
+
+class TestAuditPackManifest:
+    """Audit-pack manifest verification tests (Option β).
+
+    The signed manifest covers every top-level pack section
+    (model, controls, assumptions, verification_run, composition,
+    ...) via per-section SHA-256 hashes; the inline ECDSA signs the
+    manifest's own canonical hash. Older packs without a manifest
+    fall back to the legacy `signature`/`results_hash` path.
+    """
+
+    def _build_pkg(
+        self,
+        tmp_path,
+        *,
+        with_manifest: bool = True,
+        with_legacy_signature: bool = True,
+        composition: dict | None = None,
+        key=None,
+        manifest_fingerprint_override: str | None = None,
+    ):
+        """Build a minimal audit pack with optional manifest + legacy sig.
+
+        Returned (path, key, fingerprint). The manifest covers every
+        section enumerated in `_MANIFEST_SECTIONS`; absent-from-pack
+        sections are omitted from the manifest, matching backend
+        emission rules.
+        """
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        if key is None:
+            key = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        der_bytes = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        fingerprint = hashlib.sha256(der_bytes).hexdigest()
+
+        pkg = {
+            "model": {
+                "id": "m1", "title": "t", "feature_description": "fd",
+                "version": 1, "assets": [], "attackers": [],
+                "trust_boundaries": [],
+            },
+            "control_objectives": [],
+            "controls": [],
+            "assumptions": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [], "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "key_fingerprint": fingerprint,
+                "public_key_pem": pub_pem,
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "assertions_by_assumption": {},
+            "sufficiency": {},
+        }
+        if composition is not None:
+            pkg["composition"] = composition
+
+        # Legacy `signature` over results_hash — kept for backward
+        # compatibility while the manifest is the strong-binding path.
+        if with_legacy_signature:
+            canonical_results = _j.dumps(
+                pkg["verification_run"]["results"],
+                sort_keys=True, separators=(",", ":"),
+            )
+            results_hash = (
+                "sha256:" + hashlib.sha256(canonical_results.encode()).hexdigest()
+            )
+            sig = key.sign(results_hash.encode(), ec.ECDSA(hashes.SHA256()))
+            pkg["content_integrity"]["results_hash"] = results_hash
+            pkg["content_integrity"]["signature"] = base64.b64encode(sig).decode()
+
+        if with_manifest:
+            from mipiti_verify.cli import _MANIFEST_SECTIONS, _canonical_section_hash
+
+            sections = {
+                name: _canonical_section_hash(pkg[name])
+                for name in _MANIFEST_SECTIONS
+                if name in pkg and pkg[name] is not None
+            }
+            manifest = {
+                "version": 1,
+                "generated_at": "2026-05-27T00:00:00+00:00",
+                "sections": sections,
+            }
+            manifest_canonical = _j.dumps(
+                manifest, sort_keys=True, separators=(",", ":"),
+            )
+            manifest_hash = (
+                "sha256:" + hashlib.sha256(manifest_canonical.encode()).hexdigest()
+            )
+            mfsig = key.sign(manifest_hash.encode(), ec.ECDSA(hashes.SHA256()))
+            pkg["content_integrity"]["manifest"] = manifest
+            pkg["content_integrity"]["manifest_hash"] = manifest_hash
+            pkg["content_integrity"]["manifest_signature"] = (
+                base64.b64encode(mfsig).decode()
+            )
+            pkg["content_integrity"]["manifest_key_fingerprint"] = (
+                manifest_fingerprint_override
+                if manifest_fingerprint_override is not None
+                else fingerprint
+            )
+
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path), key, fingerprint
+
+    # ----- Legacy fallback -----
+
+    def test_pack_without_manifest_falls_back_to_legacy(self, tmp_path):
+        """A legacy pack carries no manifest fields. The CLI emits the
+        fallback notice and the legacy signature verification path
+        carries the audit. Regression pin for backward compatibility."""
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=False, with_legacy_signature=True,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        assert "No manifest fields in content_integrity" in out_flat
+        assert "falling back to legacy signature path" in out_flat
+        # Legacy path still produces a VERIFIED verdict.
+        assert "Verdict: VERIFIED" in result.output
+
+    # ----- Happy path -----
+
+    def test_manifest_verifies_with_all_sections(self, tmp_path):
+        """Pack with manifest fields verifies; success line appears."""
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        assert "Audit-pack manifest (signed sections)" in out_flat
+        assert "Hash match: YES" in out_flat
+        assert "Signature: VALID" in out_flat
+        assert "Sections: ALL" in out_flat and "VERIFIED" in out_flat
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+
+    def test_manifest_covers_composition_when_present(self, tmp_path):
+        """Composition section, when emitted, is included in the manifest
+        and verifies alongside the other sections."""
+        composition = {
+            "available": True,
+            "tree": {"parent_id": None, "ancestor_chain": [], "depth": 0},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, composition=composition,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        # 9 sections in pkg (model, control_objectives, controls,
+        # assumptions, assertions_by_control, assertions_by_assumption,
+        # verification_run, composition) — exact count depends on the
+        # _MANIFEST_SECTIONS tuple and what the test pack populates.
+        out_flat = " ".join(result.output.split())
+        assert "Sections: ALL" in out_flat
+        assert "Manifest verified" in out_flat
+
+    def test_manifest_verifies_after_benign_key_reordering(self, tmp_path):
+        """Re-serializing the pack with a different JSON key order must
+        not break verification — canonical-JSON hashing is order
+        invariant."""
+        import json as _j
+
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Rewrite with reverse-sorted keys to force a different on-disk
+        # serialization. Canonical hashing collapses both orderings to
+        # the same hex, so verification must still pass.
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f, sort_keys=True)
+        runner = CliRunner()
+        result1 = runner.invoke(main, ["audit", path])
+        with open(path, "w", encoding="utf-8") as f:
+            # Different on-disk order — but the verifier canonicalises.
+            _j.dump(pkg, f, indent=4)
+        runner2 = CliRunner()
+        result2 = runner2.invoke(main, ["audit", path])
+        assert result1.exit_code == 0, result1.output
+        assert result2.exit_code == 0, result2.output
+        assert "Manifest verified" in result1.output
+        assert "Manifest verified" in result2.output
+
+    # ----- Tamper paths -----
+
+    def test_tampered_section_content_fails_with_section_name(self, tmp_path):
+        """Modify a section's content while leaving the manifest
+        unchanged. The manifest itself still hashes to manifest_hash
+        and the signature still verifies, but the section's recomputed
+        hash diverges from the manifest entry — the CLI must name the
+        section that was tampered."""
+        import json as _j
+
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Mutate a controls field — manifest is untouched.
+        pkg["controls"] = [
+            {"id": "c-injected", "title": "Tampered Control"}
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Section tamper" in out_flat
+        assert "'controls'" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_tampered_manifest_hash_fails(self, tmp_path):
+        """Modify the recorded manifest_hash so it no longer matches the
+        manifest content. The signature can still verify the (wrong)
+        hash, but the hash-vs-content check catches the swap."""
+        import hashlib
+        import json as _j
+
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        pkg["content_integrity"]["manifest_hash"] = (
+            "sha256:" + hashlib.sha256(b"different content").hexdigest()
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "manifest content does not match manifest_hash" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_tampered_manifest_signature_fails(self, tmp_path):
+        """Modify the ECDSA signature. The manifest_hash recomputes
+        correctly but verification fails."""
+        import base64
+        import json as _j
+
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Decode, flip a byte, re-encode — preserves base64 structure
+        # but destroys the signature.
+        original = base64.b64decode(
+            pkg["content_integrity"]["manifest_signature"]
+        )
+        tampered = bytes([original[0] ^ 0xFF]) + original[1:]
+        pkg["content_integrity"]["manifest_signature"] = (
+            base64.b64encode(tampered).decode()
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "manifest_signature does not verify" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_manifest_key_fingerprint_mismatch_fails(self, tmp_path):
+        """When manifest_key_fingerprint does not match the recomputed
+        fingerprint of the embedded public_key_pem, fail — the embedded
+        key is not the one that signed the manifest."""
+        path, _, _ = self._build_pkg(
+            tmp_path,
+            with_manifest=True,
+            manifest_fingerprint_override="deadbeef" * 8,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Key fingerprint: MISMATCH" in out_flat
+        assert "possible forgery" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_missing_section_referenced_by_manifest_fails(self, tmp_path):
+        """A manifest entry for a section the pack doesn't carry is a
+        structural inconsistency — the signed manifest claims content
+        the pack omits."""
+        import json as _j
+
+        # Build a pack with composition, then drop composition while
+        # leaving the manifest's composition hash in place.
+        composition = {
+            "available": True,
+            "tree": {"parent_id": None, "ancestor_chain": [], "depth": 0},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, composition=composition,
+        )
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        pkg.pop("composition", None)
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "section 'composition' is in manifest but missing" in out_flat
+
+    # ----- Coexistence with legacy path -----
+
+    def test_manifest_verified_but_legacy_signature_corrupted(self, tmp_path):
+        """Both signatures exist independently; either is sufficient for
+        a VERIFIED verdict. When the manifest verifies but the legacy
+        signature is corrupted, the legacy-path failure is surfaced
+        (it's its own independent integrity claim) but the verdict
+        reflects the manifest's stronger whole-body coverage."""
+        import base64
+        import json as _j
+
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, with_legacy_signature=True,
+        )
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Corrupt only the legacy `signature` field. The manifest is
+        # untouched and must still verify cleanly.
+        original = base64.b64decode(pkg["content_integrity"]["signature"])
+        tampered = bytes([original[0] ^ 0xFF]) + original[1:]
+        pkg["content_integrity"]["signature"] = (
+            base64.b64encode(tampered).decode()
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        # The manifest verified — that's the authoritative claim.
+        out_flat = " ".join(result.output.split())
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+        # The legacy path's INVALID line is surfaced to the auditor.
+        assert "Signature: INVALID" in out_flat
+        # has_failure is set by the legacy path failure — explicitly
+        # acknowledge the design choice: legacy is an independent
+        # integrity claim and a failing claim is still a failure even
+        # when the stronger manifest path passed. Exit non-zero.
+        assert result.exit_code == 1
+
+    def test_manifest_present_but_no_public_key_pem_fails(self, tmp_path):
+        """A manifest with no embedded public_key_pem cannot be verified
+        — the manifest_key_fingerprint pin has nothing to compare
+        against."""
+        import json as _j
+
+        path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        pkg["content_integrity"]["public_key_pem"] = ""
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "no public_key_pem to verify manifest_signature" in out_flat
+
+    def test_partial_manifest_fields_falls_back_to_legacy(self, tmp_path):
+        """Only some of the manifest fields are present (e.g.,
+        manifest exists but manifest_hash is missing). The verifier
+        treats this as 'manifest absent' and falls back to the legacy
+        path — defensive against malformed pack emissions."""
+        import json as _j
+
+        path, _, _ = self._build_pkg(
+            tmp_path, with_manifest=True, with_legacy_signature=True,
+        )
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        del pkg["content_integrity"]["manifest_hash"]
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        assert "falling back to legacy signature path" in out_flat
+        # Legacy signature still verifies.
+        assert "Verdict: VERIFIED" in result.output
+
+    def test_unknown_section_in_manifest_is_forward_compatible(self, tmp_path):
+        """A manifest carrying a section name this verifier doesn't
+        know is forward-compatible: log a warning, skip the unknown
+        section, verify the rest. Avoids hard-failing on packs from
+        newer backends with new section types."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Inject a fictitious future section into the manifest. Resign
+        # the manifest with the same key so the signature still
+        # verifies — only the section-name unknown-ness is being
+        # tested here.
+        manifest = pkg["content_integrity"]["manifest"]
+        manifest["sections"]["future_section_v2"] = "sha256:" + ("ab" * 32)
+        manifest_canonical = _j.dumps(
+            manifest, sort_keys=True, separators=(",", ":"),
+        )
+        manifest_hash = (
+            "sha256:" + hashlib.sha256(manifest_canonical.encode()).hexdigest()
+        )
+        mfsig = key.sign(manifest_hash.encode(), ec.ECDSA(hashes.SHA256()))
+        pkg["content_integrity"]["manifest"] = manifest
+        pkg["content_integrity"]["manifest_hash"] = manifest_hash
+        pkg["content_integrity"]["manifest_signature"] = (
+            base64.b64encode(mfsig).decode()
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        assert "Unknown section 'future_section_v2'" in out_flat
+        assert "Manifest verified" in out_flat

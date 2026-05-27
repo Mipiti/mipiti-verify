@@ -1688,6 +1688,231 @@ def _render_composition(comp: dict) -> bool:
     return False
 
 
+# Top-level keys of the audit pack that the signed manifest covers.
+# Mirrors `_MANIFEST_SECTIONS` in
+# `backend/app/services/assertions_service.py`. Sections that the
+# backend chose not to emit (composition when the flag is off, etc.)
+# are silently absent from `manifest.sections`; the verifier hashes
+# only what the manifest enumerates.
+_MANIFEST_SECTIONS: tuple[str, ...] = (
+    "model",
+    "control_objectives",
+    "controls",
+    "assumptions",
+    "assertions_by_control",
+    "assertions_by_assumption",
+    "verification_run",
+    "composition",
+)
+
+
+def _canonical_section_hash(value) -> str:
+    """Compute ``sha256:<hex>`` of canonical-JSON of one pack section.
+
+    Canonicalization matches the backend's ``_canonical_section_hash``
+    in ``assertions_service.py``: ``json.dumps(value, sort_keys=True,
+    separators=(",", ":"))``. The result is key-order invariant — a
+    pack reserialised with a different key order produces the same
+    canonical hash, so the manifest verifies after benign reordering.
+    """
+    import hashlib as _hashlib
+
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{_hashlib.sha256(canonical.encode()).hexdigest()}"
+
+
+def _verify_audit_pack_manifest(pkg: dict, ci: dict) -> tuple[bool, bool]:
+    """Verify the signed audit-pack manifest (Option β).
+
+    See ``docs/audit-pack-signing.md`` in the parent repo for the
+    design rationale. Returns ``(present, verified)``:
+
+    - ``present`` is True when ``content_integrity`` carries the
+      manifest fields (``manifest``, ``manifest_hash``,
+      ``manifest_signature``, ``manifest_key_fingerprint``). When False
+      the caller falls back to the legacy ``signature``/``results_hash``
+      path; older packs predate the manifest and that's expected.
+    - ``verified`` is True only when every manifest check passed: the
+      manifest content recomputes to ``manifest_hash``, the inline
+      ECDSA verifies ``manifest_signature`` over ``manifest_hash`` using
+      the embedded ``public_key_pem``, and every per-section content
+      hash matches its manifest entry. Any mismatch fails closed and
+      names the section so the auditor knows precisely what's wrong.
+
+    The manifest signature is a *complement* to the legacy ``signature``
+    — both are emitted by current backends during the
+    backward-compat window. The legacy path covered only
+    ``verification_run.results``; the manifest covers the whole pack
+    body. Verifying the manifest is the stronger check, but failing
+    it does not imply the legacy path is broken — they're independent.
+    """
+    manifest = ci.get("manifest")
+    manifest_hash = ci.get("manifest_hash", "")
+    manifest_sig = ci.get("manifest_signature", "")
+    manifest_kfp = ci.get("manifest_key_fingerprint", "")
+
+    if not (
+        isinstance(manifest, dict)
+        and isinstance(manifest_hash, str) and manifest_hash
+        and isinstance(manifest_sig, str) and manifest_sig
+        and isinstance(manifest_kfp, str) and manifest_kfp
+    ):
+        return (False, False)
+
+    console.print("\n[bold]Audit-pack manifest (signed sections)[/bold]")
+
+    # Step 1 — recompute the manifest's own canonical hash and confirm
+    # the stored manifest_hash binds the manifest we'd hash. Any drift
+    # between the recorded manifest object and manifest_hash means the
+    # pack was tampered with between signing and audit; the signature
+    # could still verify against a fabricated manifest_hash with
+    # attacker-controlled section entries, so this step is load-bearing.
+    import hashlib as _hashlib
+
+    try:
+        manifest_canonical = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as e:
+        console.print(
+            f"  Manifest:        [red]INVALID — manifest is not "
+            f"canonicalisable JSON ({e})[/red]"
+        )
+        return (True, False)
+
+    recomputed_manifest_hash = (
+        f"sha256:{_hashlib.sha256(manifest_canonical.encode()).hexdigest()}"
+    )
+    console.print(f"  Manifest hash:   {manifest_hash}")
+    console.print(f"  Recomputed:      {recomputed_manifest_hash}")
+    if recomputed_manifest_hash != manifest_hash:
+        console.print(
+            "  Hash match:      [red]NO — manifest content does not match "
+            "manifest_hash. The pack was tampered between signing and "
+            "audit.[/red]"
+        )
+        return (True, False)
+    console.print("  Hash match:      [green]YES[/green]")
+
+    # Step 2 — verify the ECDSA signature over `manifest_hash` bytes
+    # using the embedded `public_key_pem`. The fingerprint pin guards
+    # against a pack swapping the embedded PEM for an attacker-keyed
+    # one whose signature would trivially verify the attacker's
+    # manifest_hash. `manifest_key_fingerprint` is the canonical
+    # SHA-256 of the DER SubjectPublicKeyInfo, matching the platform's
+    # algorithm; we recompute and compare.
+    try:
+        import base64 as _b64
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except Exception as e:  # pragma: no cover — cryptography is a hard dep
+        console.print(f"  Signature:       [red]FAILED — {e}[/red]")
+        return (True, False)
+
+    pub_pem = ci.get("public_key_pem", "")
+    if not isinstance(pub_pem, str) or not pub_pem:
+        console.print(
+            "  Signature:       [red]FAILED — content_integrity has no "
+            "public_key_pem to verify manifest_signature against[/red]"
+        )
+        return (True, False)
+
+    try:
+        pub_key = serialization.load_pem_public_key(pub_pem.encode())
+    except Exception as e:
+        console.print(
+            f"  Signature:       [red]FAILED — public_key_pem is not a "
+            f"valid PEM ({e})[/red]"
+        )
+        return (True, False)
+
+    der_bytes = pub_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    computed_kfp = _hashlib.sha256(der_bytes).hexdigest()
+    if computed_kfp != manifest_kfp:
+        console.print(
+            f"  Key fingerprint: [red]MISMATCH[/red] (manifest_key_fingerprint "
+            f"= {manifest_kfp!r}, recomputed from embedded public_key_pem "
+            f"= {computed_kfp!r}). The pack's embedded key is not the key "
+            "that signed the manifest — possible forgery."
+        )
+        return (True, False)
+    console.print(f"  Key fingerprint: {computed_kfp}")
+
+    try:
+        sig_bytes = _b64.b64decode(manifest_sig)
+        pub_key.verify(
+            sig_bytes, manifest_hash.encode(), ec.ECDSA(hashes.SHA256()),
+        )
+    except Exception as e:
+        console.print(
+            f"  Signature:       [red]INVALID — manifest_signature does "
+            f"not verify against manifest_hash ({e})[/red]"
+        )
+        return (True, False)
+    console.print("  Signature:       [green]VALID[/green]")
+
+    # Step 3 — for every section the manifest claims, recompute the
+    # canonical hash of the matching pack key and compare. A mismatch
+    # means the section was substituted post-signing; report which
+    # section so the auditor can locate the tampering.
+    sections = manifest.get("sections")
+    if not isinstance(sections, dict):
+        console.print(
+            "  Sections:        [red]FAILED — manifest.sections is not "
+            "an object[/red]"
+        )
+        return (True, False)
+
+    section_failures: list[str] = []
+    for name, claimed_hash in sections.items():
+        if name not in _MANIFEST_SECTIONS:
+            # Forward-compatible: an unknown section was added to a
+            # newer manifest version. Don't fail closed — log it so the
+            # auditor sees the verifier didn't recognise the section,
+            # but accept the rest.
+            console.print(
+                f"  [yellow]Unknown section {name!r} in manifest — verifier "
+                "does not know how to recompute its hash; skipping (this "
+                "verifier predates the section's introduction).[/yellow]"
+            )
+            continue
+        if name not in pkg or pkg[name] is None:
+            section_failures.append(
+                f"section {name!r} is in manifest but missing from pack"
+            )
+            continue
+        try:
+            computed_section_hash = _canonical_section_hash(pkg[name])
+        except (TypeError, ValueError) as e:
+            section_failures.append(
+                f"section {name!r}: not canonicalisable ({e})"
+            )
+            continue
+        if computed_section_hash != claimed_hash:
+            section_failures.append(
+                f"section {name!r}: expected {claimed_hash}, "
+                f"recomputed {computed_section_hash}"
+            )
+
+    if section_failures:
+        for msg in section_failures:
+            console.print(f"  [red]Section tamper: {msg}[/red]")
+        return (True, False)
+
+    console.print(
+        f"  Sections:        [green]ALL {len(sections)} VERIFIED[/green]"
+    )
+    console.print(
+        f"  [green]Manifest verified[/green] ({len(sections)} section(s) "
+        "covered, signature valid)"
+    )
+    return (True, True)
+
+
 @main.command()
 @click.argument("package_file", type=click.Path(exists=True))
 @click.option("--key-url", default="", help="JWKS URL for the Mipiti instance (e.g. https://api.mipiti.io/.well-known/jwks)")
@@ -2987,6 +3212,30 @@ def audit(
     # at `ci.get("signature")` below.
     ci = ci_raw if isinstance(ci_raw, dict) else None
 
+    # --- Audit-pack manifest (Option β) ---
+    # Current backends emit a signed manifest covering every top-level
+    # pack section (`model`, `controls`, `assumptions`, `assertions_by_*`,
+    # `verification_run`, `composition`, ...). When present, the manifest
+    # is the authoritative integrity claim for the whole body — the
+    # legacy `signature` over `results_hash` covered only
+    # `verification_run.results` and is kept for one release window for
+    # older verifiers. Absence of the manifest is the silent fallback to
+    # the legacy path.
+    manifest_present = False
+    manifest_verified = False
+    if ci is not None:
+        manifest_present, manifest_verified = _verify_audit_pack_manifest(
+            pkg, ci,
+        )
+        if manifest_present and not manifest_verified:
+            has_failure = True
+    if not manifest_present:
+        console.print(
+            "  [dim]No manifest fields in content_integrity — falling back "
+            "to legacy signature path (pack predates audit-pack manifest "
+            "signing).[/dim]"
+        )
+
     # Canonical hash binding check — runs whenever the package claims
     # a results_hash, regardless of signature presence. The Sigstore
     # bundle (when present) binds to results_hash; if the package's
@@ -3649,6 +3898,21 @@ def audit(
             "  Cryptographic chain:    [yellow]ABSENT[/yellow] "
             "(no Sigstore bundle in package)"
         )
+    if manifest_verified:
+        console.print(
+            "  Audit-pack manifest:    [green]VERIFIED[/green] "
+            "(whole-body coverage via signed section hashes)"
+        )
+    elif manifest_present:
+        console.print(
+            "  Audit-pack manifest:    [red]FAILED[/red] "
+            "(manifest fields present but did not verify)"
+        )
+    else:
+        console.print(
+            "  Audit-pack manifest:    [yellow]ABSENT[/yellow] "
+            "(pack predates manifest signing; legacy signature only)"
+        )
     if content_verified:
         console.print(
             "  Content-integrity sig:  [green]VERIFIED[/green]"
@@ -3740,6 +4004,8 @@ def audit(
             verified_parts = []
             if provenance_verified:
                 verified_parts.append("provenance authentic")
+            if manifest_verified:
+                verified_parts.append("pack manifest authentic")
             if content_verified or content_anchored_in_sigstore:
                 verified_parts.append("content intact")
             chain_state = ", ".join(verified_parts) if verified_parts else "no cryptographic chain"
@@ -3769,6 +4035,8 @@ def audit(
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
+        if manifest_verified:
+            verified_parts.append("pack manifest authentic")
         if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
@@ -3777,7 +4045,7 @@ def audit(
             f"{_assertion_breakdown()} ({len(unmapped_results)} orphan, "
             f"--allow-orphan-results override active)"
         )
-    elif not provenance_verified and not content_verified:
+    elif not provenance_verified and not content_verified and not manifest_verified:
         # No cryptographic verification ran. Don't claim authenticity.
         console.print(
             f"[yellow bold]Verdict: UNVERIFIED[/yellow bold] — no Sigstore "
@@ -3794,6 +4062,8 @@ def audit(
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
+        if manifest_verified:
+            verified_parts.append("pack manifest authentic")
         if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
@@ -3814,6 +4084,8 @@ def audit(
         verified_parts = []
         if provenance_verified:
             verified_parts.append("provenance authentic")
+        if manifest_verified:
+            verified_parts.append("pack manifest authentic")
         if content_verified or content_anchored_in_sigstore:
             verified_parts.append("content intact")
         prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
