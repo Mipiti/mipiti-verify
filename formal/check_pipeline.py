@@ -391,19 +391,47 @@ def check_real_verifiers():
         result = runner._verify_tier2({
             "id": "test", "type": "function_exists",
             "params": {"file": "code.py", "name": "target_func"},
-            "tier2_prompt": "Does this function exist?",
         })
         if result["status"] != "skipped":
             violations.append(f"C6: tier2 without provider should skip, got {result['status']}")
         configs += 1
 
-        # C7: _verify_tier2 without prompt → skipped
+        # C7: _verify_tier2 with payload missing structured type/params →
+        # fail-fast with a clear version-mismatch error. The runner's
+        # single-path design refuses to evaluate a tier-2 assertion
+        # whose backend payload does not carry the structured shape.
+        runner.tier2_provider_name = "openai"
+        result = runner._verify_tier2({"id": "test", "params": {"file": "code.py"}})
+        if result["status"] != "fail":
+            violations.append(f"C7: tier2 with missing type should fail, got {result['status']}")
+        elif "Backend payload missing required" not in result.get("details", ""):
+            violations.append(
+                "C7: tier2 missing-type error must surface the version-mismatch message"
+            )
+        configs += 1
+
+        result = runner._verify_tier2({"id": "test", "type": "function_exists"})
+        if result["status"] != "fail":
+            violations.append(f"C7: tier2 with missing params should fail, got {result['status']}")
+        elif "Backend payload missing required" not in result.get("details", ""):
+            violations.append(
+                "C7: tier2 missing-params error must surface the version-mismatch message"
+            )
+        configs += 1
+
+        # C10: _verify_tier2 must not read `tier2_prompt` / `tier2_boundary_token`
+        # — no legacy field consumption. Verified structurally below in S7;
+        # functional check here pins that a payload carrying only legacy
+        # fields fails fast (no silent fallback to a less-defended path).
         result = runner._verify_tier2({
-            "id": "test", "type": "function_exists",
-            "params": {"file": "code.py", "name": "target_func"},
+            "id": "test",
+            "tier2_prompt": "Does this function exist?",
+            "tier2_boundary_token": "BOUNDARY_legacyguess123456789012",
         })
-        if result["status"] != "skipped":
-            violations.append(f"C7: tier2 without prompt should skip, got {result['status']}")
+        if result["status"] != "fail":
+            violations.append(
+                f"C10: tier2 with only legacy fields should fail, got {result['status']}"
+            )
         configs += 1
 
         # C8: I1 cross-check — Tier 1 failure can never become a pass

@@ -166,6 +166,8 @@ jobs:
           java $JAVA_OPTS -jar tla2tools.jar -config VerificationPipeline_reverify.cfg -workers auto VerificationPipeline.tla
           echo "--- TLC: KeySourceResolver (issuer-side resolver invariants R1-R6, R10, R12 + R3a) ---"
           java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
+          echo "--- TLC: Tier2RunnerSide (runner-side tier-2 rendering invariants T1-T5) ---"
+          java $JAVA_OPTS -jar tla2tools.jar -config Tier2RunnerSide.cfg -workers auto Tier2RunnerSide.tla
         working-directory: formal
 
   audit-tlc:
