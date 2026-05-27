@@ -1469,6 +1469,225 @@ def _audit_pdf_report(
     return pub_key, fingerprint
 
 
+# ---------------------------------------------------------------------------
+# Composition rendering (recursive-tree effective view)
+# ---------------------------------------------------------------------------
+
+
+def _render_composition(comp: dict) -> bool:
+    """Render the audit-pack ``composition`` section.
+
+    Emitted by post-#835 backends with ``TREE_COMPOSITION_ENABLED`` on for
+    the source workspace. Captures the model's *effective view* at pack
+    generation time: tree position, own + inherited entities, effective
+    control objectives with origin classification, effective coverage
+    with provenance + contributing-control attribution, and the explicit
+    inheritance-binding rows that prove each cross-model credit chain.
+
+    The composition data lives under its own ``composition`` namespace and
+    does NOT contribute to ``content_integrity.results_hash`` (which
+    binds only ``verification_run.results``). It IS however covered by
+    the outer Sigstore bundle / content_integrity envelope when the pack
+    was signed — any post-signing tamper of these fields invalidates the
+    enclosing signature.
+
+    Returns True if a rendering-level failure should bubble up to the
+    overall audit verdict (currently never — composition data is
+    informational at the auditor surface; the backend's
+    ``available: false`` shape is a warning, not a hard fail).
+    """
+    console.print()
+    console.print("[bold]Composition (recursive-tree effective view)[/bold]")
+
+    if comp.get("available") is False:
+        # Backend signalled that composition compute failed at pack
+        # generation. Render as a single warning — the rest of the pack
+        # (controls, assertions, sufficiency) is still trustworthy; only
+        # the composition view is unavailable.
+        err = comp.get("error", "composition_compute_failed")
+        console.print(
+            f"  [yellow]Composition unavailable: {err}[/yellow]"
+        )
+        console.print(
+            "  [dim]The rest of the audit pack (controls, assertions, "
+            "sufficiency) is unaffected. Composition is an additive view; "
+            "its absence does not invalidate other sections.[/dim]"
+        )
+        return False
+
+    # Tree summary -----------------------------------------------------
+    tree = comp.get("tree") if isinstance(comp.get("tree"), dict) else {}
+    parent_id = tree.get("parent_id")
+    ancestors = tree.get("ancestor_chain") if isinstance(tree.get("ancestor_chain"), list) else []
+    depth = tree.get("depth", 0)
+    console.print("\n  [bold]Tree position[/bold]")
+    if not parent_id and depth == 0:
+        console.print("    [dim]Flat model (no parent)[/dim]")
+    else:
+        console.print(f"    Parent:          {parent_id or '[dim]<none>[/dim]'}")
+        if ancestors:
+            console.print(f"    Ancestor chain:  {' -> '.join(ancestors)}")
+        console.print(f"    Depth:           {depth}")
+
+    # Entities ---------------------------------------------------------
+    eff_entities_raw = comp.get("effective_entities")
+    eff_entities = eff_entities_raw if isinstance(eff_entities_raw, dict) else {}
+    if eff_entities:
+        console.print("\n  [bold]Effective entities[/bold] (own vs inherited)")
+        entity_table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+        entity_table.add_column("Kind")
+        entity_table.add_column("Own", justify="right")
+        entity_table.add_column("Inherited", justify="right")
+        entity_table.add_column("Total", justify="right")
+        kinds = (
+            "trust_boundaries", "assets", "attackers",
+            "components", "attack_paths", "assumptions",
+        )
+        for kind in kinds:
+            entries = eff_entities.get(kind, [])
+            if not isinstance(entries, list):
+                entries = []
+            own = sum(
+                1 for e in entries
+                if isinstance(e, dict) and e.get("origin") == "own"
+            )
+            inherited = sum(
+                1 for e in entries
+                if isinstance(e, dict) and e.get("origin") != "own"
+            )
+            total = len(entries)
+            entity_table.add_row(
+                kind, str(own),
+                f"[cyan]{inherited}[/cyan]" if inherited else "0",
+                str(total),
+            )
+        console.print(entity_table)
+
+    # Effective control objectives ------------------------------------
+    eff_cos_raw = comp.get("effective_control_objectives")
+    eff_cos = eff_cos_raw if isinstance(eff_cos_raw, list) else []
+    if eff_cos:
+        own_cos = sum(1 for co in eff_cos if isinstance(co, dict) and co.get("origin") == "own")
+        cross_cos = sum(1 for co in eff_cos if isinstance(co, dict) and co.get("origin") == "cross")
+        inh_cos = sum(1 for co in eff_cos if isinstance(co, dict) and co.get("origin") == "inherited")
+        console.print(
+            f"\n  [bold]Effective control objectives[/bold]: "
+            f"{len(eff_cos)} total — {own_cos} own, "
+            f"[cyan]{cross_cos} cross[/cyan], [cyan]{inh_cos} inherited[/cyan]"
+        )
+
+    # Coverage with per-CO provenance ---------------------------------
+    cov_raw = comp.get("effective_coverage")
+    coverage = cov_raw if isinstance(cov_raw, list) else []
+    if coverage:
+        covered = sum(1 for c in coverage if isinstance(c, dict) and c.get("is_covered"))
+        console.print(
+            f"\n  [bold]Effective coverage[/bold]: "
+            f"{covered}/{len(coverage)} CO(s) covered"
+        )
+        for cov in coverage:
+            if not isinstance(cov, dict):
+                continue
+            co_qid = cov.get("co_qid", "<unknown>")
+            is_covered = bool(cov.get("is_covered"))
+            own_credit = bool(cov.get("own_credit"))
+            inh_credit = bool(cov.get("inherited_credit"))
+            status = "[green]COVERED[/green]" if is_covered else "[yellow]UNCOVERED[/yellow]"
+            credit_parts = []
+            if own_credit:
+                credit_parts.append("own")
+            if inh_credit:
+                credit_parts.append("[cyan]inherited[/cyan]")
+            credit = (
+                " via " + ", ".join(credit_parts) if credit_parts else ""
+            )
+            console.print(f"\n    [bold]{co_qid}[/bold]  {status}{credit}")
+            contribs_raw = cov.get("contributing_controls")
+            contribs = contribs_raw if isinstance(contribs_raw, list) else []
+            if not contribs:
+                console.print("      [dim](no contributing controls)[/dim]")
+                continue
+            for c in contribs:
+                if not isinstance(c, dict):
+                    continue
+                ctrl_id = c.get("control_id", "<unknown>")
+                owner = c.get("owner_model_id", "<unknown>")
+                origin = c.get("origin", "own")
+                verified = bool(c.get("is_verified"))
+                mg = c.get("mitigation_group")
+                # Inherited credit is the audit-grade signal —
+                # render with a distinct color and an explicit badge so
+                # the auditor sees cross-model attribution at a glance.
+                if origin == "inherited":
+                    origin_badge = "[cyan]\\[inherited][/cyan]"
+                    ctrl_disp = f"[cyan]{ctrl_id}[/cyan]"
+                else:
+                    origin_badge = "[dim]\\[own][/dim]"
+                    ctrl_disp = ctrl_id
+                verified_mark = "[green]verified[/green]" if verified else "[yellow]unverified[/yellow]"
+                mg_str = f" mg={mg}" if mg is not None else ""
+                console.print(
+                    f"      {origin_badge} {ctrl_disp}  "
+                    f"owner={owner}  {verified_mark}{mg_str}"
+                )
+
+    # Inheritance bindings — load-bearing audit artifact ---------------
+    bindings_raw = comp.get("inheritance_bindings")
+    bindings = bindings_raw if isinstance(bindings_raw, list) else []
+    if bindings:
+        console.print(
+            f"\n  [bold]Inheritance bindings[/bold] "
+            f"({len(bindings)} cross-model credit link(s))"
+        )
+        console.print(
+            "  [dim]Each row is an auditable claim that a parent model's "
+            "control covers a child CO. Cite these to prove cross-model "
+            "credit chains.[/dim]"
+        )
+        bind_table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+        bind_table.add_column("Child model")
+        bind_table.add_column("Child ver", justify="right")
+        bind_table.add_column("CO qid")
+        bind_table.add_column("Parent model")
+        bind_table.add_column("Parent ver", justify="right")
+        bind_table.add_column("Control")
+        bind_table.add_column("Verified")
+        for b in bindings:
+            if not isinstance(b, dict):
+                continue
+            verified = bool(b.get("is_verified"))
+            verified_cell = (
+                "[green]yes[/green]" if verified else "[yellow]no[/yellow]"
+            )
+            bind_table.add_row(
+                str(b.get("child_model_id", "")),
+                str(b.get("child_model_version", "")),
+                str(b.get("co_qid", "")),
+                str(b.get("parent_model_id", "")),
+                str(b.get("parent_version", "")),
+                str(b.get("control_id", "")),
+                verified_cell,
+            )
+        console.print(bind_table)
+
+    # Dangling override linkages ---------------------------------------
+    # Inherited assumption overrides whose linked-CO ids don't resolve
+    # onto the effective CO surface. The evaluator silently drops these;
+    # surfaced here as a single aggregate so the auditor sees them
+    # without per-row noise.
+    dangling = comp.get("dangling_override_linkages")
+    if isinstance(dangling, int) and dangling > 0:
+        console.print(
+            f"\n  [yellow]Warning: {dangling} dangling override "
+            f"linkage(s)[/yellow] — inherited assumption overrides whose "
+            "linked CO ids do not resolve to an effective CO. The "
+            "evaluator silently dropped these; review the ancestor "
+            "models for CO renames or deletions that broke the link."
+        )
+
+    return False
+
+
 @main.command()
 @click.argument("package_file", type=click.Path(exists=True))
 @click.option("--key-url", default="", help="JWKS URL for the Mipiti instance (e.g. https://api.mipiti.io/.well-known/jwks)")
@@ -3399,6 +3618,18 @@ def audit(
                 f"  [dim]Backend marked {len(backend_orphans)} assertion id(s) "
                 "as orphaned in this run.[/dim]"
             )
+
+    # --- Composition (recursive-tree effective view) ---
+    # Additive section emitted by post-#835 backends when
+    # TREE_COMPOSITION_ENABLED is on for the source workspace. Absent on
+    # older packs and packs from workspaces with the flag off — that's
+    # the silent no-op path. Failure to compute on the backend side
+    # produces {"available": false, "error": ...} which we render as a
+    # single warning line rather than skipping the section entirely.
+    comp_raw = pkg.get("composition")
+    if isinstance(comp_raw, dict):
+        if _render_composition(comp_raw):
+            has_failure = True
 
     # --- Trust contract summary ---
     console.print()

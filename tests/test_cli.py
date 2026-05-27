@@ -3511,3 +3511,390 @@ class TestCustomerDsseAudit:
         result = runner.invoke(main, ["audit", "--help"])
         assert result.exit_code == 0
         assert "--expected-customer-key" in result.output
+
+
+class TestAuditPackComposition:
+    """Audit-command rendering of the post-#835 ``composition`` section.
+
+    The composition section is additive and flag-gated on the backend
+    (``TREE_COMPOSITION_ENABLED``). Three input shapes reach the CLI:
+
+      1. No ``composition`` key — pre-#835 pack or flag off. Existing
+         output unchanged; nothing composition-related rendered.
+      2. ``composition.available == False`` — backend compute failed
+         at pack generation. Single warning, audit verdict unaffected.
+      3. ``composition.available == True`` — full effective view
+         rendered: tree, entity tallies, COs with origin breakdown,
+         per-CO coverage with inherited-control attribution,
+         inheritance bindings, and dangling-override counter.
+    """
+
+    def _build_signed_pkg(
+        self, tmp_path, *, composition=None, key=None, fingerprint_override=None
+    ):
+        """Build a minimal signed audit package, optionally with a
+        composition section. Mirrors ``TestAuditIdentityPinning._build_signed_pkg``
+        so the existing signature/hash verification still passes — the
+        composition section sits next to the signed body and does NOT
+        contribute to ``results_hash`` (which only covers
+        ``verification_run.results``)."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        if key is None:
+            key = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        der_bytes = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        actual_fp = (
+            fingerprint_override
+            if fingerprint_override is not None
+            else hashlib.sha256(der_bytes).hexdigest()
+        )
+        pkg = {
+            "model": {"id": "m1", "title": "t", "feature_description": "fd",
+                      "version": 1, "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": [], "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "results_hash": stored,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": actual_fp,
+                "public_key_pem": pub_pem,
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        if composition is not None:
+            pkg["composition"] = composition
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path), actual_fp
+
+    def test_no_composition_key_renders_unchanged(self, tmp_path):
+        """Pre-#835 packs (no ``composition`` key) render exactly as
+        before — regression pin: the composition feature must not bleed
+        into legacy pack output."""
+        path, _ = self._build_signed_pkg(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        assert "Composition" not in result.output
+        assert "Inheritance bindings" not in result.output
+        assert "Effective coverage" not in result.output
+
+    def test_composition_unavailable_renders_warning(self, tmp_path):
+        """``available: false`` from the backend renders as a single
+        warning. Audit verdict is unaffected (composition is
+        informational; its absence does not invalidate other sections)."""
+        path, _ = self._build_signed_pkg(
+            tmp_path,
+            composition={"available": False, "error": "composition_compute_failed"},
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        assert "Composition" in result.output
+        assert "Composition unavailable" in out_flat
+        assert "composition_compute_failed" in out_flat
+        # The rest of the audit pack still verifies — verdict is
+        # neither demoted nor failed because of an unavailable section.
+        assert "FAILED" not in result.output
+
+    def test_full_composition_renders_tree_entities_cos_coverage_bindings(
+        self, tmp_path
+    ):
+        """End-to-end composition rendering with every documented field
+        populated: tree metadata, own + inherited entities across all
+        six kinds, COs with origin breakdown, coverage with inherited
+        contributing controls, inheritance bindings, and a non-zero
+        dangling counter."""
+        composition = {
+            "available": True,
+            "tree": {
+                "parent_id": "parent-1",
+                "ancestor_chain": ["parent-1", "grand-1"],
+                "depth": 2,
+            },
+            "effective_entities": {
+                "trust_boundaries": [
+                    {"kind": "trust_boundaries", "qualified_id": "m1:tb1",
+                     "owner_model_id": "m1", "owner_title": "child",
+                     "origin": "own", "entity": {"id": "tb1"}},
+                    {"kind": "trust_boundaries", "qualified_id": "parent-1:tbP",
+                     "owner_model_id": "parent-1", "owner_title": "parent",
+                     "origin": "inherited", "entity": {"id": "tbP"}},
+                ],
+                "assets": [
+                    {"kind": "assets", "qualified_id": "m1:a1",
+                     "owner_model_id": "m1", "owner_title": "child",
+                     "origin": "own", "entity": {"id": "a1"}},
+                ],
+                "attackers": [
+                    {"kind": "attackers", "qualified_id": "parent-1:atP",
+                     "owner_model_id": "parent-1", "owner_title": "parent",
+                     "origin": "inherited", "entity": {"id": "atP"}},
+                ],
+                "components": [],
+                "attack_paths": [
+                    {"kind": "attack_paths", "qualified_id": "m1:ap1",
+                     "owner_model_id": "m1", "owner_title": "child",
+                     "origin": "own", "entity": {"id": "ap1"}},
+                ],
+                "assumptions": [
+                    {"kind": "assumptions", "qualified_id": "parent-1:asmP",
+                     "owner_model_id": "parent-1", "owner_title": "parent",
+                     "origin": "inherited", "entity": {"id": "asmP"}},
+                ],
+            },
+            "effective_control_objectives": [
+                {"co_qid": "m1:co_own", "asset_qid": "m1:a1",
+                 "attacker_qid": "parent-1:atP",
+                 "security_properties": ["C"], "origin": "own"},
+                {"co_qid": "parent-1:co_inh", "asset_qid": "m1:a1",
+                 "attacker_qid": "parent-1:atP",
+                 "security_properties": ["I"], "origin": "inherited"},
+                {"co_qid": "m1:co_cross", "asset_qid": "m1:a1",
+                 "attacker_qid": "parent-1:atP",
+                 "security_properties": ["A"], "origin": "cross"},
+            ],
+            "effective_coverage": [
+                {"co_qid": "m1:co_own", "is_covered": True,
+                 "own_credit": True, "inherited_credit": False,
+                 "contributing_controls": [
+                     {"control_id": "C-OWN-1", "owner_model_id": "m1",
+                      "origin": "own", "is_verified": True,
+                      "mitigation_group": 1},
+                 ]},
+                {"co_qid": "parent-1:co_inh", "is_covered": True,
+                 "own_credit": False, "inherited_credit": True,
+                 "contributing_controls": [
+                     {"control_id": "C-PARENT-7", "owner_model_id": "parent-1",
+                      "origin": "inherited", "is_verified": True,
+                      "mitigation_group": 2},
+                 ]},
+                {"co_qid": "m1:co_cross", "is_covered": False,
+                 "own_credit": False, "inherited_credit": False,
+                 "contributing_controls": []},
+            ],
+            "inheritance_bindings": [
+                {"child_model_id": "m1", "child_model_version": 1,
+                 "co_qid": "parent-1:co_inh", "parent_model_id": "parent-1",
+                 "parent_version": 3, "control_id": "C-PARENT-7",
+                 "is_verified": True},
+            ],
+            "dangling_override_linkages": 2,
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out = result.output
+        out_flat = " ".join(out.split())
+
+        # Section header.
+        assert "Composition" in out
+
+        # Tree.
+        assert "Tree position" in out
+        assert "parent-1" in out
+        assert "grand-1" in out
+        # Depth value.
+        assert "Depth" in out and "2" in out
+
+        # Entity tallies — inherited count for trust_boundaries must
+        # appear, as must total entries across kinds.
+        assert "Effective entities" in out
+        assert "trust_boundaries" in out_flat
+        assert "assumptions" in out_flat
+
+        # CO origin breakdown.
+        assert "Effective control objectives" in out
+        # The summary line carries origin tallies.
+        assert "1 own" in out_flat
+        assert "1 cross" in out_flat
+        assert "1 inherited" in out_flat
+
+        # Coverage rendering.
+        assert "Effective coverage" in out
+        assert "m1:co_own" in out
+        assert "parent-1:co_inh" in out
+        assert "COVERED" in out
+        assert "UNCOVERED" in out
+
+        # Contributing-control attribution — inherited badge + control id.
+        assert "C-PARENT-7" in out
+        assert "inherited" in out_flat
+        assert "C-OWN-1" in out
+
+        # Inheritance bindings — the load-bearing audit artifact.
+        assert "Inheritance bindings" in out
+        # Each citable field from the binding row.
+        assert "m1" in out
+        assert "parent-1" in out
+        assert "C-PARENT-7" in out
+        # Parent version is rendered.
+        assert "3" in out
+
+        # Dangling override warning.
+        assert "dangling override" in out_flat
+        assert "2" in out_flat
+
+    def test_inherited_credit_is_visually_distinct(self, tmp_path):
+        """Inherited contributing controls render with a distinct
+        ``[inherited]`` badge so an auditor can spot cross-model credit
+        attribution at a glance — own credits render with ``[own]``."""
+        composition = {
+            "available": True,
+            "tree": {"parent_id": None, "ancestor_chain": [], "depth": 0},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [
+                {"co_qid": "co_x", "is_covered": True,
+                 "own_credit": True, "inherited_credit": True,
+                 "contributing_controls": [
+                     {"control_id": "OWN-X", "owner_model_id": "m1",
+                      "origin": "own", "is_verified": True,
+                      "mitigation_group": None},
+                     {"control_id": "INH-Y", "owner_model_id": "ancestor-z",
+                      "origin": "inherited", "is_verified": False,
+                      "mitigation_group": None},
+                 ]},
+            ],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out = result.output
+        # Both badges rendered, each next to the matching control id.
+        assert "[own]" in out
+        assert "[inherited]" in out
+        assert "OWN-X" in out
+        assert "INH-Y" in out
+        # Verified state explicit for both.
+        assert "verified" in out
+        assert "unverified" in out
+
+    def test_zero_dangling_emits_no_warning(self, tmp_path):
+        """The dangling-override warning only appears when the counter
+        is non-zero. Zero is the common case for well-formed models."""
+        composition = {
+            "available": True,
+            "tree": {"parent_id": None, "ancestor_chain": [], "depth": 0},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        assert "dangling override" not in result.output.lower()
+
+    def test_flat_model_renders_no_parent_line(self, tmp_path):
+        """A flat model (no parent, depth 0) renders the tree position
+        as a single dim ``Flat model`` line — no parent / ancestor
+        rows to clutter the auditor's view."""
+        composition = {
+            "available": True,
+            "tree": {"parent_id": None, "ancestor_chain": [], "depth": 0},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out = result.output
+        assert "Flat model" in out
+        # No ancestor-chain arrow when there's nothing to chain.
+        assert "->" not in out.split("Tree position")[1].split("Effective")[0]
+
+    def test_signature_verification_passes_with_composition_present(
+        self, tmp_path
+    ):
+        """Adding a ``composition`` key MUST NOT break the existing
+        signature/hash verification. The inline ``content_integrity``
+        signature is over ``results_hash`` (which covers
+        ``verification_run.results`` only), so composition data sits
+        next to the signed body. The auditor expects to see both
+        signature MATCH and the composition rendering on the same run."""
+        composition = {
+            "available": True,
+            "tree": {"parent_id": "p", "ancestor_chain": ["p"], "depth": 1},
+            "effective_entities": {},
+            "effective_control_objectives": [],
+            "effective_coverage": [],
+            "inheritance_bindings": [],
+            "dangling_override_linkages": 0,
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        # Signature path still verifies.
+        assert "VERIFIED" in result.output
+        # Hash match still holds — composition is outside results_hash
+        # but inside the broader audit pack body.
+        assert "Hash match:" in result.output and "YES" in result.output
+        # Composition section also rendered.
+        assert "Composition" in result.output
+
+    def test_malformed_composition_does_not_crash(self, tmp_path):
+        """A package with structurally-malformed composition fields
+        (wrong types, missing keys) must not crash the auditor's CI
+        gate — the renderer normalises types defensively, same posture
+        as the existing per-field hardening for ``controls`` /
+        ``assertions_by_control`` / ``sufficiency``."""
+        composition = {
+            "available": True,
+            # tree is the wrong type — should be normalised to empty.
+            "tree": "not a dict",
+            # effective_entities the wrong type — normalised to empty.
+            "effective_entities": ["bad"],
+            # COs entries are not dicts — defensively skipped.
+            "effective_control_objectives": ["not-a-dict", 42],
+            # coverage entries with mixed valid / invalid shapes.
+            "effective_coverage": [
+                None,
+                {"co_qid": "ok", "is_covered": True, "own_credit": True,
+                 "inherited_credit": False,
+                 "contributing_controls": "not a list"},
+            ],
+            "inheritance_bindings": "not a list",
+            "dangling_override_linkages": "not an int",
+        }
+        path, _ = self._build_signed_pkg(tmp_path, composition=composition)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        # Composition is informational; malformed shape doesn't fail
+        # the audit verdict — but the renderer must not crash.
+        assert result.exit_code == 0
+        assert "Composition" in result.output
