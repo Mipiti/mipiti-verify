@@ -183,6 +183,16 @@ DiscardToken(a) ==
     /\ UNCHANGED <<transmitted_tokens, used_tokens, payload, fail_fast,
                    legacy_fields_present>>
 
+\* Terminal-state stutter — once every assertion has been evaluated
+\* (either via the fast-fail path or the full mint/render/send/discard
+\* pipeline), no further actions are enabled. TLC flags that as
+\* deadlock by default, but it's the legitimate end of the run, not a
+\* missing transition. Allow a self-loop in that state so invariants
+\* still hold under stuttering without TLC raising deadlock.
+TerminalStutter ==
+    /\ \A a \in Assertions : evaluated[a] = TRUE
+    /\ UNCHANGED vars
+
 \* Next-state relation
 Next ==
     \/ \E a \in Assertions : FailFastInvalidPayload(a)
@@ -190,6 +200,7 @@ Next ==
     \/ \E a \in Assertions : RenderTemplate(a)
     \/ \E a \in Assertions : SendToProvider(a)
     \/ \E a \in Assertions : DiscardToken(a)
+    \/ TerminalStutter
 
 Spec == Init /\ [][Next]_vars
 
