@@ -127,7 +127,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path))
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo")
         assert runner.reverify is True
         report = runner.run("m1")
 
@@ -163,7 +163,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1
@@ -186,7 +186,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_fail"] == 1
@@ -214,7 +214,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), tier2_provider=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier2_skip"] == 1
@@ -235,7 +235,7 @@ class TestRunner:
             {"model_id": "m1", "controls": {}},
         ]
 
-        runner = Runner(client=client, project_root=str(tmp_path), dry_run=True, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", dry_run=True, reverify=False)
         report = runner.run("m1")
 
         assert report["dry_run"] is True
@@ -278,7 +278,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), verbose=True, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", verbose=True, reverify=False)
         report = runner.run("m1")
 
         assert len(report["details"]) == 1
@@ -307,7 +307,7 @@ class TestRunner:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # verify_token + config.json
@@ -334,7 +334,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"auth.py"}, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files={"auth.py"}, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1  # only auth.py verified
@@ -359,7 +359,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files=None, reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 2  # both verified
@@ -380,7 +380,7 @@ class TestChangedFilesFilter:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), changed_files={"unrelated.py"}, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", changed_files={"unrelated.py"}, reverify=False)
         report = runner.run("m1")
 
         # asrt_001 filtered out (file=other.py not in changed), asrt_002 included (no file param)
@@ -407,7 +407,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), concurrency=4, tier2_provider=None, reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", concurrency=4, tier2_provider=None, reverify=False)
         report = runner.run("m1")
 
         # Both skipped (no provider), but verifies concurrent path doesn't crash
@@ -431,7 +431,7 @@ class TestConcurrency:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         assert runner.concurrency == 1
         report = runner.run("m1")
         assert report["tier1_pass"] == 1

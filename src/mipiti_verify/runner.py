@@ -24,6 +24,69 @@ from .workspace_key_signer import WorkspaceKeySigner
 console = Console(stderr=True)
 
 
+# Tier-2 source-loading: types whose params carry ``pattern`` (a glob
+# expression resolved against ``project_root``) rather than ``file``.
+# Tier-1 globs the pattern; tier-2 mirrors the glob here so it sees
+# the same matched files. Keeping this list explicit (rather than
+# falling back to "if params has pattern, use it") preserves the
+# defense that types map to a single, expected source-resolution
+# strategy.
+_PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists", "test_passes"})
+
+# Tier-2 source-loading: types whose tier-2 criterion may legitimately
+# be evaluated with empty SOURCE_CODE. The conservative default is the
+# empty set — every type requires source-code evidence and the pre-LLM
+# guard fails-closed otherwise. Add a type here only after confirming
+# its tier-2 template can produce a sound YES/NO verdict from params
+# alone.
+_EMPTY_SOURCE_OK_TYPES: frozenset[str] = frozenset()
+
+
+def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
+    """Load source content for pattern-based tier-2 types.
+
+    Globs ``params["pattern"]`` against ``project_root`` (recursive,
+    same glob semantics as tier-1's pattern verifiers), reads each
+    matched file, concatenates with a ``# === <relative_path> ===``
+    separator so the LLM can distinguish files in multi-match results,
+    and truncates the combined content to 16K chars to match the
+    truncation budget the rest of the tier-2 source-loading path uses.
+
+    Returns ``""`` when no files match, the pattern is empty, or every
+    read fails — the caller's pre-LLM fail-closed guard catches that
+    case before invoking the LLM.
+    """
+    import glob
+
+    pattern = (params.get("pattern") or "").strip()
+    if not pattern:
+        return ""
+    try:
+        matches = glob.glob(str(project_root / pattern), recursive=True)
+    except Exception:
+        return ""
+    if not matches:
+        return ""
+    parts: list[str] = []
+    for match in sorted(matches):
+        try:
+            mpath = Path(match)
+            if not mpath.is_file():
+                continue
+            content = mpath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        try:
+            rel = str(mpath.relative_to(project_root))
+        except ValueError:
+            rel = match
+        parts.append(f"# === {rel} ===\n{content}")
+    combined = "\n".join(parts)
+    if len(combined) > 16000:
+        combined = combined[:16000] + "\n... (truncated)"
+    return combined
+
+
 class AttestationRequiredError(RuntimeError):
     """Raised when ``--require-attestation`` is set and no signer
     produced a usable attestation for the run.
@@ -499,6 +562,12 @@ class Runner:
         self, model_id: str, tier: int
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """Run verification for a single tier. Returns (api_results, detail_records, all_assertions)."""
+        if not self.repo:
+            raise RuntimeError(
+                "Repository scope is required but could not be auto-detected. "
+                "Pass --repo <owner/name> or run in an environment that exports "
+                "GITHUB_REPOSITORY (GitHub Actions) or CI_PROJECT_PATH (GitLab CI)."
+            )
         if self.reverify:
             pending = self.client.get_all_assertions(model_id, repo=self.repo)
         else:
@@ -510,6 +579,39 @@ class Runner:
         if not controls:
             if self.verbose:
                 console.print(f"  No tier {tier} assertions pending")
+            return [], [], []
+
+        # Strict per-repo scope filter. The server already scopes by
+        # ``repo`` at fetch time, but a misconfigured or impersonated
+        # response could include cross-repo assertions; the runner must
+        # never evaluate (and submit verdicts for) an assertion bound to
+        # a different repository. Sentinel ``no_repo`` is the contract
+        # for assertions that have no file-system scope (e.g.,
+        # feature_description targets) and passes through unconditionally.
+        # Assertions with no ``repo`` field at all are treated as
+        # ``no_repo`` — they predate per-repo scoping and have no
+        # filesystem boundary to enforce.
+        for ctrl_id, assertions in list(controls.items()):
+            kept_scope: list[dict[str, Any]] = []
+            for a in assertions:
+                a_repo = (a.get("repo") or "").strip()
+                if not a_repo or a_repo == "no_repo" or a_repo == self.repo:
+                    kept_scope.append(a)
+                    continue
+                console.print(
+                    f"[skip] {a.get('id', '<no-id>')}: "
+                    f"repo mismatch (assertion={a_repo}, "
+                    f"runner={self.repo})"
+                )
+            if kept_scope:
+                controls[ctrl_id] = kept_scope
+            else:
+                del controls[ctrl_id]
+        if not controls:
+            if self.verbose:
+                console.print(
+                    f"  No tier {tier} assertions remained after repo-scope filter"
+                )
             return [], [], []
 
         # Filter by component — only verify assertions for controls in this component
@@ -691,6 +793,15 @@ class Runner:
         # the provider will fail naturally with an informative error.
         if not source_file and params.get("target_content"):
             source_code = params["target_content"]
+        elif not source_file and a_type in _PATTERN_GLOB_TYPES:
+            # Pattern-based types (test_exists, test_passes) use
+            # ``params["pattern"]`` and tier-1 globs it. Mirror that
+            # resolution here so tier-2 has the matched file contents as
+            # SOURCE_CODE — previously the runner looked up
+            # ``params["file"]`` and received empty source content while
+            # tier-1's glob succeeded, leaving tier-2 to evaluate an
+            # assertion with no evidence.
+            source_code = _load_pattern_source(self.project_root, params)
         elif source_file:
             from .verifiers import safe_resolve_path, PathTraversalError
             try:
@@ -767,6 +878,27 @@ class Runner:
                     source_code = content
                 except Exception:
                     pass
+
+        # Pre-LLM fail-closed guard. If a type requires source-code
+        # evidence and loading produced nothing, refuse to call the LLM:
+        # an empty SOURCE_CODE block leaves nothing for the model to
+        # ground its verdict on, and an LLM that returns YES from the
+        # assertion's description alone is a false-pass — the assertion's
+        # ``description`` is a CLAIM, not evidence. Types listed in
+        # ``_EMPTY_SOURCE_OK_TYPES`` are exempted because their tier-2
+        # criterion can legitimately be evaluated on params alone.
+        if not source_code and a_type not in _EMPTY_SOURCE_OK_TYPES:
+            return {
+                "status": "fail",
+                "details": (
+                    f"Tier-2 has no source content to evaluate for "
+                    f"{a_type!r} assertion. Loading from params "
+                    f"(file / pattern / target_content) produced empty "
+                    f"content, and this type requires source-code "
+                    f"evidence — refusing to ask the LLM to evaluate "
+                    f"empty evidence."
+                ),
+            }
 
         try:
             from .tier2 import get_provider

@@ -30,7 +30,7 @@ class TestRunnerMergesAssumptions:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         # Both the control assertion and the assumption assertion should be verified
@@ -60,7 +60,7 @@ class TestRunnerMergesAssumptions:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1
@@ -85,7 +85,7 @@ class TestRunnerMergesAssumptions:
         ]
         client.submit_results.return_value = {"run_id": "run_1"}
 
-        runner = Runner(client=client, project_root=str(tmp_path), reverify=False)
+        runner = Runner(client=client, project_root=str(tmp_path), repo="test/repo", reverify=False)
         report = runner.run("m1")
 
         assert report["tier1_pass"] == 1

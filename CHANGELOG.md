@@ -43,6 +43,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New runtime dependency: `jinja2>=3.1` (used by the vendored
   template renderer).
 
+### Fixed
+
+#### Tier-2 verification hardening (scope + fail-closed + source-loading)
+
+Five layered fixes that close a false-positive INJECTION_DETECTED
+class of failure and the deeper false-pass risk it accidentally
+masked. The runner now refuses any assertion whose `repo` field
+does not equal its auto-detected `self.repo` (sentinel `no_repo`
+and the absent-`repo` legacy case excepted); when `self.repo`
+cannot be auto-detected and was not supplied, the runner exits
+non-zero rather than evaluating an unbounded set. Tier-2's
+source-loading now resolves `params["pattern"]` for `test_exists`
+/ `test_passes` types — previously tier-2 looked for `params["file"]`
+and silently received empty source content while tier-1's pattern
+glob succeeded; the keys-mismatch produced empty SOURCE_CODE that
+the LLM either interpreted as an injection attempt (immediate
+boundary close, returning INJECTION_DETECTED) or, under a
+permissive prompt, could have evaluated as YES from the assertion
+description alone. A pre-LLM guard now fails-closed at the runner
+level if the source-code is unexpectedly empty for a type that
+requires it, without invoking the LLM at all — the conservative
+default `_EMPTY_SOURCE_OK_TYPES` is the empty frozenset, meaning
+every type requires source-code evidence. The tier-2 templates
+gain a universal fail-closed clause instructing the LLM that lack
+of visible evidence is NEVER a YES verdict and that the assertion's
+`description` is a CLAIM, not evidence — the LLM-side safety net
+is now explicit rather than implicit.
+
 ### Deprecated
 
 - The legacy `content_integrity.signature` over `content_integrity.results_hash`
