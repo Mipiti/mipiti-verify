@@ -381,7 +381,11 @@ def run(
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
-    # Resolve model IDs to verify
+    # Resolve model IDs to verify (and map id -> title for output
+    # attribution; assertion ids are not globally unique across
+    # models in a workspace so flat GitHub Actions annotations
+    # need a `[<title> <id8>]` prefix to be readable).
+    model_titles: dict[str, str] = {}
     if run_all:
         try:
             models = client.list_models()
@@ -390,6 +394,7 @@ def run(
             client.close()
             sys.exit(1)
         model_ids = [m["id"] for m in models]
+        model_titles = {m["id"]: (m.get("title") or "") for m in models}
         if not model_ids:
             console.print("[yellow]No models found in workspace.[/yellow]")
             client.close()
@@ -397,6 +402,15 @@ def run(
         console.print(f"Verifying {len(model_ids)} model(s)...")
     else:
         model_ids = [model_id]
+        try:
+            single_model = client.get_model(model_id)
+            model_titles[model_id] = single_model.get("title") or ""
+        except Exception:
+            # Title is purely cosmetic for annotations — if fetch
+            # fails (offline test fixtures, transient API error)
+            # fall back to id-only prefix rather than blocking
+            # verification.
+            model_titles[model_id] = ""
 
     # Parse changed files list
     changed_files: set[str] | None = None
@@ -446,8 +460,10 @@ def run(
     from .runner import AttestationRequiredError
 
     for mid in model_ids:
+        title = model_titles.get(mid, "")
         if run_all:
-            console.print(f"\n[bold]--- {mid} ---[/bold]")
+            header = f"{title} ({mid})" if title else mid
+            console.print(f"\n[bold]--- {header} ---[/bold]")
         try:
             report = runner.run(mid)
         except AttestationRequiredError as e:
@@ -477,9 +493,9 @@ def run(
             if output_format == "json":
                 click.echo(json.dumps(report, indent=2))
             elif output_format == "github":
-                _github_output(report)
+                _github_output(report, model_title=title)
             else:
-                _text_output(report, verbose)
+                _text_output(report, verbose, model_title=title)
 
     client.close()
 
@@ -488,10 +504,17 @@ def run(
             click.echo(json.dumps(all_reports, indent=2))
         elif output_format == "github":
             for report in all_reports:
-                _github_output(report)
+                _github_output(
+                    report,
+                    model_title=model_titles.get(report.get("model_id", ""), ""),
+                )
         else:
             for report in all_reports:
-                _text_output(report, verbose)
+                _text_output(
+                    report,
+                    verbose,
+                    model_title=model_titles.get(report.get("model_id", ""), ""),
+                )
             # Summary
             total = len(all_reports)
             failed = sum(
@@ -766,9 +789,33 @@ def report(model_id: str, api_key: str | None, base_url: str | None) -> None:
     console.print()
 
 
-def _text_output(report: dict, verbose: bool) -> None:
+def _model_prefix(model_id: str | None, model_title: str | None) -> str:
+    """Return a `[<title> <id8>]` annotation prefix for a model.
+
+    `<id8>` is the first 8 hex chars of the model UUID; when the id is
+    missing, falls back to `[<title>]`; when both are missing returns
+    an empty string. Assertion ids (`asrt_NNN`) are not globally unique
+    across models in a workspace, so flat GitHub Actions annotations
+    need this attribution to be readable when multiple models run in
+    one CI step.
+    """
+    mid = (model_id or "").strip()
+    title = (model_title or "").strip()
+    id8 = mid[:8] if mid else ""
+    if title and id8:
+        return f"[{title} {id8}]"
+    if title:
+        return f"[{title}]"
+    if id8:
+        return f"[{id8}]"
+    return ""
+
+
+def _text_output(report: dict, verbose: bool, model_title: str | None = None) -> None:
     """Pretty-print verification results."""
-    console.print(f"\n[bold]Verification Results[/bold]\n")
+    prefix = _model_prefix(report.get("model_id"), model_title)
+    prefix_space = f"{prefix} " if prefix else ""
+    console.print(f"\n[bold]{prefix_space}Verification Results[/bold]\n")
     console.print(f"  Tier 1: [green]{report.get('tier1_pass', 0)} pass[/green]  "
                   f"[red]{report.get('tier1_fail', 0)} fail[/red]  "
                   f"[yellow]{report.get('tier1_skip', 0)} skip[/yellow]")
@@ -801,32 +848,42 @@ def _text_output(report: dict, verbose: bool) -> None:
                       f"tier2 run={report.get('tier2_run_id', 'n/a')}")
 
     if verbose:
+        prefix_v = f"{prefix} " if prefix else ""
         for detail in report.get("details", []):
             status_color = "green" if detail["passed"] else "red"
-            console.print(f"  [{status_color}]{detail['assertion_id']}[/{status_color}] "
+            console.print(f"  {prefix_v}[{status_color}]{detail['assertion_id']}[/{status_color}] "
                           f"({detail['type']}) tier={detail['tier']}: {detail['details']}")
     console.print()
 
 
-def _github_output(report: dict) -> None:
-    """Print GitHub Actions annotations with per-assertion detail."""
+def _github_output(report: dict, model_title: str | None = None) -> None:
+    """Print GitHub Actions annotations with per-assertion detail.
+
+    Every annotation's `title=` field and group header is prefixed
+    with `[<title> <id8>]` so the GitHub UI Annotations panel (which
+    flattens annotations across the whole CI step) keeps per-model
+    attribution when multiple models are verified in one run.
+    """
+    prefix = _model_prefix(report.get("model_id"), model_title)
+    pfx = f"{prefix} " if prefix else ""
+
     details = report.get("details", [])
     # Group by tier for clear output
     for tier in (1, 2):
         tier_details = [d for d in details if d.get("tier") == tier]
         if not tier_details:
             continue
-        click.echo(f"::group::Tier {tier} — assertion verification")
+        click.echo(f"::group::{pfx}Tier {tier} — assertion verification")
         passed = [d for d in tier_details if d["passed"]]
         skipped = [d for d in tier_details if d.get("skipped")]
         failed = [d for d in tier_details if not d["passed"] and not d.get("skipped")]
         for d in passed:
-            click.echo(f"  \u2713 {d['assertion_id']} ({d['type']}) tier{tier}: {d['details']}")
+            click.echo(f"  \u2713 {pfx}{d['assertion_id']} ({d['type']}) tier{tier}: {d['details']}")
         for d in skipped:
-            click.echo(f"::warning title=Tier {tier} Skipped::{d['assertion_id']} "
+            click.echo(f"::warning title={pfx}Tier {tier} Skipped::{d['assertion_id']} "
                        f"({d['type']}): {d['details']}")
         for d in failed:
-            click.echo(f"::error title=Tier {tier} Failed::{d['assertion_id']} "
+            click.echo(f"::error title={pfx}Tier {tier} Failed::{d['assertion_id']} "
                        f"({d['type']}): {d['details']}")
         click.echo("::endgroup::")
 
@@ -842,19 +899,19 @@ def _github_output(report: dict) -> None:
     t2f = report.get("tier2_fail", 0)
     t2s = report.get("tier2_skip", 0)
     if t1f or t2f:
-        click.echo(f"::error title=Verification Summary::{t1f} tier1 failures, {t2f} tier2 failures")
+        click.echo(f"::error title={pfx}Verification Summary::{t1f} tier1 failures, {t2f} tier2 failures")
     else:
         total = report.get("tier1_pass", 0) + report.get("tier2_pass", 0)
         msg = f"{total} assertions verified"
         if t2s:
-            click.echo(f"::error title=Tier 2 Skipped::{t2s} tier2 assertions skipped — no provider configured. Controls cannot reach verified status without tier 2.")
-        click.echo(f"::notice title=Verification Passed::{msg}")
+            click.echo(f"::error title={pfx}Tier 2 Skipped::{t2s} tier2 assertions skipped — no provider configured. Controls cannot reach verified status without tier 2.")
+        click.echo(f"::notice title={pfx}Verification Passed::{msg}")
 
     # Sufficiency gaps — separate section after verification results
     suff_details = report.get("suff_details", [])
     insufficient = [sd for sd in suff_details if sd.get("result") == "insufficient"]
     if insufficient:
-        click.echo(f"::group::Sufficiency — coverage gaps ({len(insufficient)} controls)")
+        click.echo(f"::group::{pfx}Sufficiency — coverage gaps ({len(insufficient)} controls)")
         for sd in insufficient:
             details = sd.get("details", "").strip()
             if details:
@@ -862,7 +919,7 @@ def _github_output(report: dict) -> None:
                 for line in details.split("\n"):
                     line = line.strip()
                     if line:
-                        click.echo(f"::warning title=Insufficient Coverage::{ctrl_id}: {line}")
+                        click.echo(f"::warning title={pfx}Insufficient Coverage::{ctrl_id}: {line}")
         click.echo("::endgroup::")
 
 
