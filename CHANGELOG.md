@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--output github` annotations and per-assertion text output now
+  carry the threat model context (`[<title> <id8>]` prefix on every
+  `::warning::` / `::error::` / `::notice::` title and group header).
+  Previously the GitHub UI Annotations panel surfaced verification
+  failures without model attribution, making it impossible to tell
+  which model an `asrt_NNN` belonged to when running verification
+  across multiple models in one CI step.
+
 #### Tier-2 verification hardening (scope + fail-closed + source-loading)
 
 Five layered fixes that close a false-positive INJECTION_DETECTED

@@ -125,9 +125,21 @@ jobs:
         # case the disputed advisory is about does not apply to this
         # usage. Re-evaluate if pyjwt's maintainers later accept the
         # claim and ship a hardened release; remove the ignore then.
+        #
+        # --ignore-vuln GHSA-qp9x-wp8f-qgjj: python-tuf 6.0.0
+        # delegation path-pattern matching is case-insensitive on
+        # Windows (fnmatch.fnmatch calls os.path.normcase, identity on
+        # posixpath but lowercasing on ntpath). The advisory states
+        # "No effect on Linux/macOS." mipiti-verify runs in CI on
+        # Linux/macOS runners; the affected codepath is unreachable.
+        # tuf enters our lockfile transitively via sigstore, and the
+        # fix requires sigstore>=5 (sigstore 4.x is the latest release
+        # and pins tuf<7), so the upgrade is blocked upstream.
+        # Re-evaluate when sigstore 5.x ships. Same ignore is applied
+        # in the parent repo's ci.yml for the same reasoning.
         run: |
           pip install --require-hashes -r requirements-audit.lock
-          IGNORE='--ignore-vuln PYSEC-2025-183'
+          IGNORE='--ignore-vuln PYSEC-2025-183 --ignore-vuln GHSA-qp9x-wp8f-qgjj'
           pip-audit -r requirements.lock       --disable-pip $IGNORE
           pip-audit -r requirements-build.lock --disable-pip $IGNORE
           pip-audit -r requirements-all.lock   --disable-pip $IGNORE

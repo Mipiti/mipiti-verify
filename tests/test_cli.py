@@ -121,6 +121,175 @@ class TestCLI:
         assert "Verification Report" in result.output
 
 
+class TestModelAttributionPrefix:
+    """Output-formatter tests: every per-assertion line (text and
+    GitHub Actions) carries `[<title> <id8>]` model attribution.
+
+    Assertion ids (`asrt_NNN`) are not globally unique across models
+    in a workspace; without a model prefix, the GitHub UI Annotations
+    panel (which flattens annotations across the whole CI step) makes
+    it impossible to tell which model an `asrt_NNN` belongs to when
+    running verification across multiple models in one CI step.
+    """
+
+    @staticmethod
+    def _failure_report(model_id: str = "abcdef1234567890" * 2) -> dict:
+        # Long hex-ish id so we can pin that exactly 8 chars are used.
+        return {
+            "model_id": model_id,
+            "tier1_pass": 1,
+            "tier1_fail": 1,
+            "tier1_skip": 0,
+            "tier2_pass": 0,
+            "tier2_fail": 0,
+            "tier2_skip": 0,
+            "tier1_run_id": "r1",
+            "tier2_run_id": "",
+            "dry_run": False,
+            "details": [
+                {
+                    "assertion_id": "asrt_106",
+                    "type": "test_exists",
+                    "tier": 1,
+                    "passed": True,
+                    "details": "ok",
+                },
+                {
+                    "assertion_id": "asrt_107",
+                    "type": "test_exists",
+                    "tier": 1,
+                    "passed": False,
+                    "details": "missing",
+                },
+                {
+                    "assertion_id": "asrt_108",
+                    "type": "test_exists",
+                    "tier": 2,
+                    "passed": False,
+                    "skipped": True,
+                    "details": "no provider",
+                },
+            ],
+            "suff_details": [
+                {
+                    "control_id": "CTRL-21",
+                    "result": "insufficient",
+                    "details": "needs more evidence",
+                },
+            ],
+            "suff_sufficient": 0,
+            "suff_insufficient": 1,
+            "suff_skip": 0,
+        }
+
+    def test_github_output_failures_carry_model_prefix(self):
+        from mipiti_verify.cli import _github_output
+
+        rpt = self._failure_report()
+        runner = CliRunner()
+        with runner.isolation() as streams:
+            _github_output(rpt, model_title="Payments")
+        output = streams[0].getvalue().decode()
+
+        # Pin exact format: `[<title> <id8>]` — first 8 hex chars of id.
+        prefix = "[Payments abcdef12]"
+
+        # Every workflow command line carries the prefix in title=
+        # (or after `::group::`).
+        assert f"::group::{prefix} Tier 1" in output
+        assert f"::error title={prefix} Tier 1 Failed::asrt_107" in output
+        assert f"::warning title={prefix} Tier 2 Skipped::asrt_108" in output
+        assert f"::error title={prefix} Verification Summary::" in output
+        assert f"::group::{prefix} Sufficiency" in output
+        assert f"::warning title={prefix} Insufficient Coverage::CTRL-21" in output
+        # Inline checkmark line for the passing assertion has the prefix too.
+        assert f"{prefix} asrt_106" in output
+
+    def test_github_output_notice_on_pass_carries_prefix(self):
+        from mipiti_verify.cli import _github_output
+
+        rpt = {
+            "model_id": "deadbeefcafefeed" + "00" * 8,
+            "tier1_pass": 2,
+            "tier1_fail": 0,
+            "tier2_pass": 1,
+            "tier2_fail": 0,
+            "tier2_skip": 0,
+            "details": [],
+        }
+        runner = CliRunner()
+        with runner.isolation() as streams:
+            _github_output(rpt, model_title="Identity")
+        output = streams[0].getvalue().decode()
+        assert "::notice title=[Identity deadbeef] Verification Passed::" in output
+
+    def test_github_output_falls_back_to_id8_only_when_no_title(self):
+        from mipiti_verify.cli import _github_output
+
+        rpt = self._failure_report(model_id="0123456789abcdef" + "ff" * 8)
+        runner = CliRunner()
+        with runner.isolation() as streams:
+            _github_output(rpt)  # no model_title
+        output = streams[0].getvalue().decode()
+        # No empty `[ ...]` — just `[<id8>]` when title is absent.
+        assert "::error title=[01234567] Tier 1 Failed::asrt_107" in output
+        assert "title=[ " not in output
+
+    def test_text_output_verbose_carries_model_prefix(self):
+        from mipiti_verify.cli import _text_output
+
+        rpt = self._failure_report()
+        runner = CliRunner()
+        with runner.isolation() as streams:
+            _text_output(rpt, verbose=True, model_title="Payments")
+        output = streams[0].getvalue().decode()
+
+        prefix = "[Payments abcdef12]"
+        # Header carries the prefix.
+        assert f"{prefix} Verification Results" in output
+        # Per-assertion verbose lines carry the prefix.
+        assert f"{prefix} asrt_107" in output
+
+    def test_github_run_all_threads_titles_from_list_models(self):
+        """`run --all` looks up titles once via list_models and
+        threads them into every per-model annotation block."""
+        with patch("mipiti_verify.cli.MipitiClient") as MockClient, \
+             patch("mipiti_verify.cli.Runner") as MockRunner:
+            client = MagicMock()
+            client.list_models.return_value = [
+                {"id": "abcdef1234567890" + "11" * 8, "title": "Payments"},
+                {"id": "fedcba0987654321" + "22" * 8, "title": "Identity"},
+            ]
+            MockClient.return_value = client
+
+            mock_runner = MagicMock()
+            mock_runner.run.side_effect = [
+                {
+                    "tier1_pass": 1, "tier1_fail": 1, "tier2_pass": 0,
+                    "tier2_fail": 0, "tier2_skip": 0,
+                    "details": [{
+                        "assertion_id": "asrt_106", "type": "test_exists",
+                        "tier": 1, "passed": False, "details": "missing",
+                    }],
+                },
+                {
+                    "tier1_pass": 2, "tier1_fail": 0, "tier2_pass": 1,
+                    "tier2_fail": 0, "tier2_skip": 0, "details": [],
+                },
+            ]
+            MockRunner.return_value = mock_runner
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["run", "--all", "--api-key", "test-key", "--output", "github"],
+            )
+            # Exit 1 because the first model has a failure.
+            assert result.exit_code == 1
+            assert "::error title=[Payments abcdef12] Tier 1 Failed::asrt_106" in result.output
+            assert "::notice title=[Identity fedcba09] Verification Passed::" in result.output
+
+
 class TestAuditIdentityPinning:
     """Audit-command identity-pinning tests.
 
