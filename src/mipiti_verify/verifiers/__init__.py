@@ -176,4 +176,4 @@ def get_verifier(assertion_type: str) -> Verifier | None:
 
 def _load_all() -> None:
     """Import all verifier modules to trigger registration."""
-    from . import file_based, code_structure, config, dependencies, tests, semantic  # noqa: F401
+    from . import file_based, code_structure, config, dependencies, tests, semantic, rtl  # noqa: F401

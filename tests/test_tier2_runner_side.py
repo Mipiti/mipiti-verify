@@ -180,9 +180,12 @@ class TestBuildMessageRendering:
         "file_hash", "pattern_matches", "pattern_absent",
         "import_present", "env_var_referenced", "error_handled",
         "no_plaintext_secret", "middleware_registered", "http_header_set",
+        "module_exists", "module_instantiated", "port_exists",
+        "parameter_defined", "signal_exists", "sva_assertion_present",
+        "register_reset",
     ])
     def test_every_known_type_has_a_template(self, a_type):
-        """Each of the 21 AssertionType values supported by the
+        """Each of the 28 AssertionType values supported by the
         platform's tier-2 rendering must have a corresponding runner
         template — otherwise the platform and the runner would
         disagree on what types are evaluable, breaking verification

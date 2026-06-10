@@ -283,7 +283,7 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 
 ## Two-Tier Verification
 
-**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->21<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls:
+**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls:
 - `function_exists`, `class_exists`, `decorator_present`, `function_calls`
 - `pattern_matches`, `pattern_absent`, `import_present`
 - `file_exists`, `file_hash`
@@ -292,6 +292,7 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 - `test_passes`, `test_exists`
 - `env_var_referenced`, `error_handled`
 - `no_plaintext_secret`, `middleware_registered`, `http_header_set`
+- `module_exists`, `module_instantiated`, `port_exists`, `parameter_defined`, `signal_exists`, `sva_assertion_present`, `register_reset` (RTL/Verilog)
 
 **Tier 2 (Semantic)** — AI evaluates whether matched code actually implements the control's intent. Supports OpenAI, Anthropic, and Ollama (local).
 
