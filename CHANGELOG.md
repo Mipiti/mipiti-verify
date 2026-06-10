@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Seven RTL/Verilog assertion types: `module_exists`,
+  `module_instantiated`, `port_exists`, `parameter_defined`,
+  `signal_exists`, `sva_assertion_present`, and `register_reset`.
+  Tier-1 verification runs deterministic RE2-based checks over
+  Verilog/SystemVerilog source — module/primitive/program
+  declarations, direct instantiations within a module body, ANSI and
+  non-ANSI port declarations (optionally direction-qualified),
+  parameter/localparam declarations (optionally value-matched against
+  an RE2 pattern and scoped to a module), net/variable declarations
+  (optionally kind-qualified), named SVA properties/assertions, and
+  registers assigned inside reset-referencing always blocks. Each
+  type also ships a tier-2 semantic template so the AI pass can
+  reject comment-only matches, vacuous assertions, and reset branches
+  that don't actually clear the register.
 - Runner-side rendering for tier-2 semantic verification. The runner
   now carries one Jinja2 instruction template per supported assertion
   type (21 templates total) and renders the LLM input locally with a

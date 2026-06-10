@@ -53,11 +53,11 @@ def test_template_contains_fail_closed_clause(template_path: Path) -> None:
 
 
 def test_every_tier2_template_covered() -> None:
-    """Bumper test — at least 21 tier2 templates exist. If the count
+    """Bumper test — at least 28 tier2 templates exist. If the count
     drops, the templating layout changed and the per-type coverage
     should be revisited."""
     files = sorted(TEMPLATES_DIR.glob("tier2_*.j2"))
-    assert len(files) >= 21, f"expected ≥21 tier2 templates, found {len(files)}"
+    assert len(files) >= 28, f"expected ≥28 tier2 templates, found {len(files)}"
 
 
 def test_clause_appears_before_per_type_criterion() -> None:
