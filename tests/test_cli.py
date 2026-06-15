@@ -235,6 +235,27 @@ class TestModelAttributionPrefix:
         assert "::error title=[01234567] Tier 1 Failed::asrt_107" in output
         assert "title=[ " not in output
 
+    def test_github_output_survives_unwritable_output_file(self, monkeypatch):
+        """A GITHUB_OUTPUT we can't write (runner-owned file, non-root
+        container) must NOT crash the run — it had already computed and printed
+        the results — only warn and continue."""
+        from mipiti_verify.cli import _github_output
+
+        rpt = {
+            "model_id": "feedface" + "00" * 12,
+            "content_hash": "deadbeefcafe",
+            "tier1_pass": 1, "tier1_fail": 0,
+            "tier2_pass": 0, "tier2_fail": 0, "tier2_skip": 0,
+            "details": [],
+        }
+        # Unwritable target (dir doesn't exist) -> open(..,"a") raises OSError.
+        monkeypatch.setenv("GITHUB_OUTPUT", "/nonexistent-dir-xyz/output")
+        runner = CliRunner()
+        with runner.isolation() as streams:
+            _github_output(rpt)  # must not raise
+        output = streams[0].getvalue().decode()
+        assert "Could not write content_hash to GITHUB_OUTPUT" in output
+
     def test_text_output_verbose_carries_model_prefix(self):
         from mipiti_verify.cli import _text_output
 

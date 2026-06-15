@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# In a GitHub Actions container action, the runner overrides HOME to
+# /github/home, owned by the runner uid — which the non-root `verifier` user
+# can't write to. That breaks the Sigstore TUF cache (~/.cache), so signing
+# fails and attestations are silently dropped. Point HOME back at our own
+# writable home so the cache (and any HOME-based state) works.
+export HOME=/home/verifier
+
 ARGS=("run")
 
 if [ -n "$INPUT_MODEL_ID" ]; then
