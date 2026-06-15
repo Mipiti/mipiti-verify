@@ -887,13 +887,22 @@ def _github_output(report: dict, model_title: str | None = None) -> None:
                        f"({d['type']}): {d['details']}")
         click.echo("::endgroup::")
 
-    # Write content hash to GITHUB_OUTPUT for attestation steps
+    # Write content hash to GITHUB_OUTPUT for attestation steps. Best-effort:
+    # the output file is owned by the runner uid and may be unwritable from a
+    # non-root container — never let that crash verification (it would abort
+    # the run after the results were already computed and printed).
     content_hash = report.get("content_hash", "")
     if content_hash:
         gh_output = os.environ.get("GITHUB_OUTPUT", "")
         if gh_output:
-            with open(gh_output, "a") as f:
-                f.write(f"content_hash={content_hash}\n")
+            try:
+                with open(gh_output, "a") as f:
+                    f.write(f"content_hash={content_hash}\n")
+            except OSError as e:
+                click.echo(
+                    f"::warning::Could not write content_hash to GITHUB_OUTPUT "
+                    f"({e}); downstream attestation steps won't receive it."
+                )
 
     t1f = report.get("tier1_fail", 0)
     t2f = report.get("tier2_fail", 0)
