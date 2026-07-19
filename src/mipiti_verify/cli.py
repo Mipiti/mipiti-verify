@@ -116,6 +116,10 @@ _HINT_MANIFEST_ONLY = (
     "Ask the issuer to re-run verification in CI to restore "
     "end-to-end run provenance."
 )
+_HINT_BUNDLE_UNBOUND = (
+    "Ask the report issuer to re-export the report from a current "
+    "build so each run entry carries its bundle binding."
+)
 
 
 def _remediation_hint(text: str, indent: str = "      ") -> None:
@@ -2222,7 +2226,7 @@ def _render_provenance_health(ph: dict) -> None:
 
 def _verify_run_sigstore_bundle(
     bundle_json: str,
-    results_hash: str,
+    bundle_bind_hash: str,
     expected_ci_identity: str | None,
     expected_issuer: str | None,
     sigstore_tuf_url: str | None,
@@ -2233,13 +2237,26 @@ def _verify_run_sigstore_bundle(
     Same trust chain as the package-level bundle path: Fulcio cert
     chain, Rekor inclusion proof, DSSE signature, plus the auditor's
     SAN pin when one is configured (UnsafeNoOp otherwise, matching the
-    package-level precedent). When the run carries a ``results_hash``,
-    the bundle's in-toto Subject digest must include it — the binding
-    between the bundle and this run's signed results.
+    package-level precedent).
+
+    Binding uses the run entry's ``content_integrity.bundle_bind_hash``
+    — the same explicit value the top-level bundle-bind check compares
+    against the bundle's in-toto Subject digest, with no
+    canonicalisation or rehashing on either side. This is a DIFFERENT
+    hash domain from ``results_hash``: ``results_hash`` binds the run's
+    frozen ``results_canonical`` bytes (checked separately by the
+    caller), while the bundle's Subject digest was minted over the
+    bundle-bind value at signing time. Comparing the Subject digest
+    against ``results_hash`` would mismatch on every well-formed
+    bundle.
 
     Returns ``(ok, detail)``; ``detail`` carries the failure reason
-    when ``ok`` is False.
+    when ``ok`` is False. A missing ``bundle_bind_hash`` is a caller
+    error — the caller reports an unbindable bundle instead of calling
+    this function.
     """
+    if not bundle_bind_hash:
+        return (False, "no bundle_bind_hash supplied for binding")
     try:
         from sigstore.models import Bundle
         from sigstore.verify import policy
@@ -2270,25 +2287,24 @@ def _verify_run_sigstore_bundle(
                 False,
                 f"unexpected DSSE payload type: {payload_type!r}",
             )
-        if results_hash:
-            statement = json.loads(payload_bytes)
-            expected_digest = (
-                results_hash[len("sha256:"):]
-                if results_hash.startswith("sha256:")
-                else results_hash
+        statement = json.loads(payload_bytes)
+        expected_digest = (
+            bundle_bind_hash[len("sha256:"):]
+            if bundle_bind_hash.startswith("sha256:")
+            else bundle_bind_hash
+        )
+        subjects = statement.get("subject", []) or []
+        if not any(
+            isinstance(s, dict)
+            and s.get("digest", {}).get("sha256") == expected_digest
+            for s in subjects
+        ):
+            return (
+                False,
+                "bundle Subject digest does not match this run's "
+                "bundle_bind_hash — the bundle was signed over a different "
+                "value than the run entry claims",
             )
-            subjects = statement.get("subject", []) or []
-            if not any(
-                isinstance(s, dict)
-                and s.get("digest", {}).get("sha256") == expected_digest
-                for s in subjects
-            ):
-                return (
-                    False,
-                    "bundle Subject digest does not match this run's "
-                    "results_hash — the bundle was signed over a different "
-                    "value than the run entry claims",
-                )
         return (True, "")
     except Exception as e:
         return (False, str(e))
@@ -2508,24 +2524,44 @@ def _verify_contributing_runs(
                     ))
 
         # 3. Sigstore bundle — canonical trust anchor when present.
+        # Binding is against the run entry's bundle_bind_hash (the
+        # value the bundle's Subject digest was minted over), NEVER
+        # results_hash — those live in different hash domains and are
+        # never equal by design. A bundle with no bundle_bind_hash to
+        # bind against proves nothing about THIS run entry: report it
+        # as unbindable (warning-grade, not tampering) and let the
+        # hash + signature path carry the run's verification.
+        bundle_unbound = False
         if bundle_json:
-            ok, detail = _verify_run_sigstore_bundle(
-                bundle_json,
-                results_hash,
-                expected_ci_identity,
-                expected_issuer,
-                sigstore_tuf_url,
-                sigstore_trust_config_path,
-            )
-            if ok:
-                sigstore_ok = True
-                sigstore_verified_count += 1
-            else:
-                tamper = True
+            run_bind_hash = rci.get("bundle_bind_hash", "")
+            if not isinstance(run_bind_hash, str):
+                run_bind_hash = ""
+            if not run_bind_hash:
+                bundle_unbound = True
                 notes.append((
-                    f"Sigstore bundle failed to verify ({detail}).",
-                    _HINT_RUN_TAMPER,
+                    "Sigstore bundle present but not bindable to this run "
+                    "entry (no content_integrity.bundle_bind_hash); the "
+                    "bundle was not evaluated for this run.",
+                    _HINT_BUNDLE_UNBOUND,
                 ))
+            else:
+                ok, detail = _verify_run_sigstore_bundle(
+                    bundle_json,
+                    run_bind_hash,
+                    expected_ci_identity,
+                    expected_issuer,
+                    sigstore_tuf_url,
+                    sigstore_trust_config_path,
+                )
+                if ok:
+                    sigstore_ok = True
+                    sigstore_verified_count += 1
+                else:
+                    tamper = True
+                    notes.append((
+                        f"Sigstore bundle failed to verify ({detail}).",
+                        _HINT_RUN_TAMPER,
+                    ))
 
         # Status resolution (worst-first).
         if tamper:
@@ -2562,7 +2598,14 @@ def _verify_contributing_runs(
             ))
         counts[status] += 1
 
-        sigstore_str = "yes" if sigstore_ok else ("failed" if bundle_json else "no")
+        if sigstore_ok:
+            sigstore_str = "yes"
+        elif bundle_unbound:
+            sigstore_str = "unbound"
+        elif bundle_json:
+            sigstore_str = "failed"
+        else:
+            sigstore_str = "no"
         console.print(
             f"  run {short}  {submitted}  {provider}"
             f"{('/' + sha[:12]) if sha else ''}  "
@@ -3854,10 +3897,38 @@ def audit(
             # Each access is wrapped so a sigstore-python attribute
             # rename doesn't fail the audit verdict on what is
             # purely human-readable.
+            # Fulcio-issued signing certificates identify the signer in
+            # the SAN extension; the X.509 subject is empty by design.
+            # Print whichever is populated and omit the line entirely
+            # when neither is available — a literal "(none)" reads as a
+            # defect when the identity actually lives in the SAN.
             try:
-                console.print(f"  Certificate:      {cert.subject.rfc4514_string() or '(none)'}")
+                cert_subject = cert.subject.rfc4514_string()
             except Exception:
-                pass
+                cert_subject = ""
+            if cert_subject:
+                console.print(f"  Certificate:      {cert_subject}")
+            else:
+                try:
+                    from cryptography.x509 import (
+                        SubjectAlternativeName,
+                        UniformResourceIdentifier,
+                    )
+                    _san_ext = cert.extensions.get_extension_for_class(
+                        SubjectAlternativeName
+                    )
+                    _san_uris = list(
+                        _san_ext.value.get_values_for_type(
+                            UniformResourceIdentifier
+                        )
+                    )
+                    if _san_uris:
+                        console.print(
+                            "  Certificate SAN:  "
+                            + ", ".join(str(u) for u in _san_uris)
+                        )
+                except Exception:
+                    pass
             for label, attr in (
                 ("Not before:      ", "not_valid_before_utc"),
                 ("Not after:       ", "not_valid_after_utc"),
