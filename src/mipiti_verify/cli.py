@@ -1798,12 +1798,15 @@ def _render_composition(comp: dict) -> bool:
     return False
 
 
-# Top-level keys of the audit pack that the signed manifest covers.
-# Mirrors `_MANIFEST_SECTIONS` in
-# `backend/app/services/assertions_service.py`. Sections that the
-# backend chose not to emit (composition when the flag is off, etc.)
-# are silently absent from `manifest.sections`; the verifier hashes
-# only what the manifest enumerates.
+# Known top-level audit-pack sections a signed manifest may cover, for
+# documentation and test fixtures. Verification does NOT depend on
+# this list: section hashes are, by contract, SHA-256 over the
+# canonical JSON of the section exactly as present in the package, so
+# `_verify_audit_pack_manifest` recomputes generically for ANY section
+# name the manifest enumerates — including names introduced after this
+# verifier build. Sections the issuer chose not to emit are silently
+# absent from `manifest.sections`; the verifier hashes only what the
+# manifest enumerates.
 _MANIFEST_SECTIONS: tuple[str, ...] = (
     "model",
     "control_objectives",
@@ -1813,6 +1816,10 @@ _MANIFEST_SECTIONS: tuple[str, ...] = (
     "assertions_by_assumption",
     "verification_run",
     "composition",
+    "functional_tests",
+    "assertions_by_functional_test",
+    "contributing_runs",
+    "provenance_health",
 )
 
 
@@ -2049,6 +2056,16 @@ def _verify_audit_pack_manifest(
     # canonical hash of the matching pack key and compare. A mismatch
     # means the section was substituted post-signing; report which
     # section so the auditor can locate the tampering.
+    #
+    # Recomputation is fully generic: by contract, every section hash
+    # is SHA-256 over the canonical JSON (sorted keys, compact
+    # separators) of the section EXACTLY as present in the package, so
+    # the verifier needs no section-specific knowledge — any section
+    # name the manifest claims is recomputed the same way, including
+    # sections introduced after this verifier build. A section named
+    # in the manifest but absent from the package is a failure (the
+    # signed manifest claims content the pack omits); package sections
+    # the manifest doesn't enumerate stay unscored.
     sections = manifest.get("sections")
     if not isinstance(sections, dict):
         console.print(
@@ -2059,17 +2076,6 @@ def _verify_audit_pack_manifest(
 
     section_failures: list[str] = []
     for name, claimed_hash in sections.items():
-        if name not in _MANIFEST_SECTIONS:
-            # Forward-compatible: an unknown section was added to a
-            # newer manifest version. Don't fail closed — log it so the
-            # auditor sees the verifier didn't recognise the section,
-            # but accept the rest.
-            console.print(
-                f"  [yellow]Unknown section {name!r} in manifest — verifier "
-                "does not know how to recompute its hash; skipping (this "
-                "verifier predates the section's introduction).[/yellow]"
-            )
-            continue
         if name not in pkg or pkg[name] is None:
             section_failures.append(
                 f"section {name!r} is in manifest but missing from pack"
@@ -2181,6 +2187,22 @@ def _render_provenance_health(ph: dict) -> None:
         "Runs unverifiable serializat.:", "runs_unverifiable_serialization",
         warn_when_positive=True,
     )
+    # Additive disclosure fields — the envelope may grow keys over
+    # time; unknown keys are always tolerated, and the ones below are
+    # displayed when present.
+    verified_as_of = ph.get("verified_as_of")
+    if isinstance(verified_as_of, str) and verified_as_of.strip():
+        console.print(f"  Verified as of:               {verified_as_of}")
+    if "attestations_near_expiry" in ph:
+        _line(
+            "Attestations near expiry:     ", "attestations_near_expiry",
+            warn_when_positive=True,
+        )
+    if "attestations_expired" in ph:
+        _line(
+            "Attestations expired:         ", "attestations_expired",
+            warn_when_positive=True,
+        )
     if ph.get("resolution_window_truncated"):
         console.print(
             "  [yellow]Resolution window truncated — the embedded run "
@@ -3958,6 +3980,19 @@ def audit(
     # check, a forged package with a real Sigstore bundle bound to
     # one hash and tampered results would slip through whenever
     # content_integrity carried no ECDSA signature.
+    #
+    # When the envelope embeds contributing runs, the legacy
+    # results_hash + signature pair is deprecated and superseded: the
+    # accumulated verification_run.results view is earned across
+    # multiple runs, each carrying its own independently-verified hash
+    # + signature, so a divergence on the legacy top-level pair is a
+    # deprecation artefact, not tamper evidence. In that case the
+    # legacy pair is rendered informationally (not scored) and tamper
+    # conclusions come solely from the per-run checks below. Envelopes
+    # without contributing runs keep the strict behavior — there the
+    # legacy pair is the only content binding available.
+    _runs_probe = pkg.get("contributing_runs")
+    legacy_pair_superseded = isinstance(_runs_probe, list) and len(_runs_probe) > 0
     stored_hash = ""
     if ci and isinstance(ci, dict) and ci.get("results_hash"):
         try:
@@ -3973,6 +4008,13 @@ def audit(
             console.print(f"  Recomputed hash: {computed_hash}")
             if computed_hash == stored_hash:
                 console.print("  Hash match:      [green]YES[/green]")
+            elif legacy_pair_superseded:
+                console.print(
+                    "  Hash match:      [yellow]NOT SCORED[/yellow] "
+                    "(legacy pair, superseded by per-run verification "
+                    "below; deprecated top-level binding diverges from "
+                    "the accumulated results view)"
+                )
             else:
                 console.print(
                     "  Hash match:      [red]NO — results may have been "
@@ -3981,8 +4023,15 @@ def audit(
                 _remediation_hint(_HINT_RUN_TAMPER, indent="  ")
                 has_failure = True
         except (KeyError, TypeError) as e:
-            console.print(f"  Hash check:      [red]FAILED — {e}[/red]")
-            has_failure = True
+            if legacy_pair_superseded:
+                console.print(
+                    f"  Hash check:      [yellow]NOT SCORED[/yellow] "
+                    f"(legacy pair, superseded by per-run verification "
+                    f"below; {e})"
+                )
+            else:
+                console.print(f"  Hash check:      [red]FAILED — {e}[/red]")
+                has_failure = True
 
     # The audit envelope may carry a `key_source` field declaring which
     # signing path produced this verification run. Three independently

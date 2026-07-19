@@ -86,6 +86,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The deprecated top-level results-hash pair no longer produces
+  tamper-shaped output when the envelope embeds contributing runs.
+  With run-level provenance present, the accumulated
+  `verification_run.results` view is earned across multiple runs
+  (each carrying its own independently verified hash + signature), so
+  a divergence on the legacy pair is a deprecation artefact: it is
+  now rendered as `NOT SCORED` (informational, no remediation line)
+  and tamper conclusions come solely from the per-run checks.
+  Envelopes without `contributing_runs` keep the strict behavior —
+  there the legacy pair is the only content binding available.
+- Audit-pack manifest section hashes are recomputed generically for
+  any section name the manifest claims. Section hashes are, by
+  contract, SHA-256 over the canonical JSON of the section exactly as
+  present in the package, so the verifier needs no section-specific
+  knowledge — `functional_tests`, `assertions_by_functional_test`,
+  `contributing_runs`, `provenance_health`, and any future section
+  now verify instead of being skipped with an unknown-section
+  warning. A section named in the manifest but absent from the
+  package is now a failure for every section name (previously only
+  for names the verifier recognized).
+- The provenance-health panel displays the additive disclosure fields
+  `verified_as_of`, `attestations_near_expiry`, and
+  `attestations_expired` when present; unrecognized disclosure keys
+  never break rendering.
 - Audit-pack manifest verification no longer requires the
   verification run's `public_key_pem`. The manifest is signed by the
   issuer's platform key, which is not necessarily the run's key; the
