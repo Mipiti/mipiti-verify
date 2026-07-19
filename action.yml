@@ -75,7 +75,7 @@ outputs:
 
 runs:
   using: docker
-  image: docker://ghcr.io/mipiti/mipiti-verify:v0.46.1@sha256:9a23ab1612e7b40c9dec7d6405d0a7f0a75290b47ad6662b2e81a9168e13e3fc
+  image: docker://ghcr.io/mipiti/mipiti-verify:v0.47.0@sha256:12dff163f7c7f8e8b03d313b449bf53b55555f73bec5faed1fbd291d85e3a86f
   env:
     MIPITI_API_KEY: ${{ inputs.api-key }}
     MIPITI_BASE_URL: ${{ inputs.base-url }}
