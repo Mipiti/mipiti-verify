@@ -2598,13 +2598,28 @@ def _verify_contributing_runs(
             f"[red]{len(reconstructed) - rec_pass} fail[/red])"
         )
 
-    # Cross-check: every assertion the envelope's assertion records
-    # carry should be determined by SOME embedded run; those that
-    # aren't are manifest-only provenance (state asserted by the
-    # signed report body, with no embedded run to independently
-    # verify how it was earned).
+    # Cross-check: an assertion counts as run-covered only when its
+    # status-determining run passed the auditor-side verification
+    # above — an embedded run that failed verification (unresolved
+    # key, unverifiable serialization, tamper, unsigned) provides no
+    # auditor-verifiable coverage. Three derived views:
+    #
+    #   manifest_only          — envelope assertions with NO embedded
+    #                            determining run at all (state asserted
+    #                            by the signed report body only).
+    #   unverified_determined  — determinations by embedded runs that
+    #                            did not pass verification, summed
+    #                            across ALL such runs.
+    #   not_verifiably_covered — envelope assertions not covered by
+    #                            any VERIFIED run. This matches the
+    #                            producer's `assertions_manifest_only`
+    #                            semantics (assertions lacking an
+    #                            auditor-verifiable run), so it is the
+    #                            value the disclosure cross-check
+    #                            compares against.
     manifest_only = envelope_assertion_ids - run_covered_aids
-    limited = (envelope_assertion_ids & run_covered_aids) - verified_covered_aids
+    unverified_determined = run_covered_aids - verified_covered_aids
+    not_verifiably_covered = envelope_assertion_ids - verified_covered_aids
     if manifest_only:
         sample = ", ".join(sorted(manifest_only)[:10])
         suffix = ", …" if len(manifest_only) > 10 else ""
@@ -2614,20 +2629,24 @@ def _verify_contributing_runs(
             f"but not determined by any embedded run: {sample}{suffix}[/yellow]"
         )
         _remediation_hint(_HINT_MANIFEST_ONLY, indent="    ")
-    if limited:
+    if unverified_determined:
         console.print(
-            f"  [yellow]{len(limited)} assertion(s) are determined by "
-            "embedded runs that could not be fully verified (see run "
-            "statuses above).[/yellow]"
+            f"  [yellow]{len(unverified_determined)} assertion(s) are "
+            "determined by embedded runs that could not be fully verified "
+            "(see run statuses above).[/yellow]"
         )
     if provenance_health is not None:
         claimed_mo = provenance_health.get("assertions_manifest_only")
-        if isinstance(claimed_mo, int) and claimed_mo != len(manifest_only):
+        if (
+            isinstance(claimed_mo, int)
+            and claimed_mo != len(not_verifiably_covered)
+        ):
             console.print(
                 f"  [yellow]Producer disclosure disagreement: "
                 f"provenance_health.assertions_manifest_only = {claimed_mo}, "
-                f"but cross-referencing the embedded runs finds "
-                f"{len(manifest_only)}.[/yellow]"
+                f"but cross-referencing the embedded runs the auditor could "
+                f"verify finds {len(not_verifiably_covered)} assertion(s) "
+                f"without auditor-verifiable run coverage.[/yellow]"
             )
 
     return {
@@ -2637,6 +2656,8 @@ def _verify_contributing_runs(
         "sigstore_verified": sigstore_verified_count,
         "verified_assertion_ids": verified_covered_aids,
         "manifest_only": manifest_only,
+        "unverified_determined": unverified_determined,
+        "not_verifiably_covered": not_verifiably_covered,
         "reconstructed": reconstructed,
         "failed": counts[_RUN_STATUS_TAMPER] > 0 or malformed > 0,
     }

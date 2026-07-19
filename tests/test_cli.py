@@ -5215,6 +5215,104 @@ class TestContributingRunsProvenance:
         assert "disagreement" not in out_flat.lower()
         assert "Run-level provenance: PARTIAL" in out_flat
 
+    def test_unresolved_runs_crosscheck_matches_producer(self, tmp_path):
+        """The cross-check uses the producer's semantics: an assertion
+        is run-covered only when its status-determining run passed
+        auditor-side verification. With every embedded run failing key
+        resolution, the producer's `assertions_manifest_only` (all
+        verified assertions lack an auditor-verifiable run) agrees
+        with the auditor's finding — no disagreement is reported —
+        and the unverified-determination summary sums determinations
+        across ALL non-verified runs."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_003", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_004", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_005", "result": "pass", "tier": 1},
+            ],
+        )
+        for run in (run1, run2):
+            run["content_integrity"]["key_source"] = "orphan"
+            run["content_integrity"]["public_key_pem"] = ""
+        results = [
+            {"assertion_id": f"asrt_00{i}", "result": "pass", "tier": 1,
+             "control_id": "c1"}
+            for i in range(1, 6)
+        ]
+        health = {
+            "assertions_verified": 5,
+            "assertions_run_covered": 0,
+            "assertions_manifest_only": 5,
+            "runs_embedded": 2,
+            "runs_orphan_key": 2,
+            "runs_unverifiable_serialization": 0,
+            "runs_sigstore": 0,
+        }
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+            provenance_health=health,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert out_flat.count("UNRESOLVED KEY") >= 2
+        # Determinations summed across BOTH non-verified runs (2 + 3).
+        assert (
+            "5 assertion(s) are determined by embedded runs that could "
+            "not be fully verified" in out_flat
+        )
+        # Producer and auditor agree under matching semantics.
+        assert "disagreement" not in out_flat.lower()
+
+    def test_genuine_disagreement_with_unresolved_runs_still_flagged(
+        self, tmp_path,
+    ):
+        """A producer optimistically claiming zero manifest-only
+        assertions while the auditor finds the embedded runs
+        unverifiable is a REAL disagreement and is still surfaced."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_003", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_004", "result": "pass", "tier": 1},
+                {"assertion_id": "asrt_005", "result": "pass", "tier": 1},
+            ],
+        )
+        for run in (run1, run2):
+            run["content_integrity"]["key_source"] = "orphan"
+            run["content_integrity"]["public_key_pem"] = ""
+        results = [
+            {"assertion_id": f"asrt_00{i}", "result": "pass", "tier": 1,
+             "control_id": "c1"}
+            for i in range(1, 6)
+        ]
+        health = {"assertions_manifest_only": 0, "runs_embedded": 2}
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+            provenance_health=health,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Producer disclosure disagreement" in out_flat
+        assert "assertions_manifest_only = 0" in out_flat
+        assert "finds 5 assertion(s)" in out_flat
+
     def test_provenance_health_disagreement_noted(self, tmp_path):
         """When the producer's manifest-only count disagrees with the
         cross-reference over embedded runs, the divergence is surfaced."""
