@@ -4109,6 +4109,10 @@ class TestAuditPackManifest:
         composition: dict | None = None,
         key=None,
         manifest_fingerprint_override: str | None = None,
+        manifest_key=None,
+        embed_manifest_pubkey: bool = False,
+        omit_run_pubkey: bool = False,
+        run_key_source: str | None = None,
     ):
         """Build a minimal audit pack with optional manifest + legacy sig.
 
@@ -4116,6 +4120,13 @@ class TestAuditPackManifest:
         section enumerated in `_MANIFEST_SECTIONS`; absent-from-pack
         sections are omitted from the manifest, matching backend
         emission rules.
+
+        `manifest_key` signs the manifest when supplied (defaults to
+        the run key — the legacy same-key envelope shape);
+        `embed_manifest_pubkey` embeds `manifest_public_key_pem`;
+        `omit_run_pubkey` empties the run-level `public_key_pem`
+        (orphaned-run-key shape); `run_key_source` sets
+        `content_integrity.key_source`.
         """
         import base64
         import hashlib
@@ -4178,6 +4189,12 @@ class TestAuditPackManifest:
         if with_manifest:
             from mipiti_verify.cli import _MANIFEST_SECTIONS, _canonical_section_hash
 
+            mkey = manifest_key if manifest_key is not None else key
+            m_der = mkey.public_key().public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            m_fingerprint = hashlib.sha256(m_der).hexdigest()
             sections = {
                 name: _canonical_section_hash(pkg[name])
                 for name in _MANIFEST_SECTIONS
@@ -4194,7 +4211,7 @@ class TestAuditPackManifest:
             manifest_hash = (
                 "sha256:" + hashlib.sha256(manifest_canonical.encode()).hexdigest()
             )
-            mfsig = key.sign(manifest_hash.encode(), ec.ECDSA(hashes.SHA256()))
+            mfsig = mkey.sign(manifest_hash.encode(), ec.ECDSA(hashes.SHA256()))
             pkg["content_integrity"]["manifest"] = manifest
             pkg["content_integrity"]["manifest_hash"] = manifest_hash
             pkg["content_integrity"]["manifest_signature"] = (
@@ -4203,8 +4220,20 @@ class TestAuditPackManifest:
             pkg["content_integrity"]["manifest_key_fingerprint"] = (
                 manifest_fingerprint_override
                 if manifest_fingerprint_override is not None
-                else fingerprint
+                else m_fingerprint
             )
+            if embed_manifest_pubkey:
+                pkg["content_integrity"]["manifest_public_key_pem"] = (
+                    mkey.public_key().public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    ).decode()
+                )
+
+        if omit_run_pubkey:
+            pkg["content_integrity"]["public_key_pem"] = ""
+        if run_key_source is not None:
+            pkg["content_integrity"]["key_source"] = run_key_source
 
         path = tmp_path / "pkg.json"
         path.write_text(_j.dumps(pkg), encoding="utf-8")
@@ -4374,11 +4403,13 @@ class TestAuditPackManifest:
 
     def test_manifest_key_fingerprint_mismatch_fails(self, tmp_path):
         """When manifest_key_fingerprint does not match the recomputed
-        fingerprint of the embedded public_key_pem, fail — the embedded
-        key is not the one that signed the manifest."""
+        fingerprint of the embedded manifest_public_key_pem, fail — the
+        pack embeds a key it claims signed the manifest and the claim
+        is false."""
         path, _, _ = self._build_pkg(
             tmp_path,
             with_manifest=True,
+            embed_manifest_pubkey=True,
             manifest_fingerprint_override="deadbeef" * 8,
         )
         runner = CliRunner()
@@ -4459,11 +4490,13 @@ class TestAuditPackManifest:
         # when the stronger manifest path passed. Exit non-zero.
         assert result.exit_code == 1
 
-    def test_manifest_present_but_no_public_key_pem_fails(self, tmp_path):
-        """A manifest with no embedded public_key_pem cannot be verified
-        — the manifest_key_fingerprint pin has nothing to compare
-        against."""
+    def test_manifest_key_unresolvable_fails(self, tmp_path):
+        """No embedded manifest key, no in-scope key matching
+        manifest_key_fingerprint, and JWKS cannot resolve it — the
+        manifest verification fails with a resolution message (never a
+        blind fallback to the run's key)."""
         import json as _j
+        from unittest.mock import patch
 
         path, _, _ = self._build_pkg(tmp_path, with_manifest=True)
         with open(path, encoding="utf-8") as f:
@@ -4472,10 +4505,89 @@ class TestAuditPackManifest:
         with open(path, "w", encoding="utf-8") as f:
             _j.dump(pkg, f)
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        with patch(
+            "mipiti_verify.cli._resolve_pubkey_from_jwks",
+            side_effect=SystemExit(1),
+        ):
+            result = runner.invoke(main, ["audit", path])
         assert result.exit_code == 1
         out_flat = " ".join(result.output.split())
-        assert "no public_key_pem to verify manifest_signature" in out_flat
+        assert "could not resolve the manifest signing key" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_manifest_verifies_via_manifest_public_key_pem_with_orphan_run_key(
+        self, tmp_path,
+    ):
+        """Regression: the manifest is signed by the issuer's platform
+        key, not the run's key. When the run's key is orphaned (empty
+        public_key_pem, fingerprint absent from the issuer's published
+        key set) the manifest must still verify via the embedded
+        manifest_public_key_pem — fully offline, no JWKS."""
+        from unittest.mock import patch
+
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        path, _, _ = self._build_pkg(
+            tmp_path,
+            with_manifest=True,
+            with_legacy_signature=True,
+            manifest_key=platform_key,
+            embed_manifest_pubkey=True,
+            omit_run_pubkey=True,
+            run_key_source="unverifiable_orphan",
+        )
+        runner = CliRunner()
+        # JWKS must never be consulted — the embedded manifest key
+        # resolves the signature offline.
+        with patch(
+            "mipiti_verify.cli._resolve_pubkey_from_jwks",
+            side_effect=AssertionError("JWKS must not be consulted"),
+        ):
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+        assert "embedded manifest_public_key_pem" in out_flat
+        # The orphaned run key is reported as UNRESOLVED, not as a
+        # manifest failure.
+        assert "UNRESOLVED" in result.output
+
+    def test_manifest_verifies_via_jwks_when_run_key_differs(self, tmp_path):
+        """A pack whose run is signed by a different (e.g. workspace)
+        key than the platform key that signed the manifest resolves the
+        manifest key via JWKS by manifest_key_fingerprint — the run's
+        key is never used for the manifest."""
+        import hashlib
+        from unittest.mock import patch
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        platform_key = ec.generate_private_key(ec.SECP256R1())
+        m_der = platform_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        m_fp = hashlib.sha256(m_der).hexdigest()
+        path, _, _ = self._build_pkg(
+            tmp_path,
+            with_manifest=True,
+            with_legacy_signature=True,
+            manifest_key=platform_key,
+            embed_manifest_pubkey=False,
+        )
+        runner = CliRunner()
+        with patch(
+            "mipiti_verify.cli._resolve_pubkey_from_jwks",
+            return_value=(platform_key.public_key(), m_fp, "mock://jwks"),
+        ):
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Manifest verified" in out_flat
+        assert "JWKS lookup by manifest_key_fingerprint" in out_flat
 
     def test_partial_manifest_fields_falls_back_to_legacy(self, tmp_path):
         """Only some of the manifest fields are present (e.g.,
@@ -4640,3 +4752,500 @@ class TestAuditPackManifest:
         # narrower scope ≠ failed scope.
         assert "WARNING" in result.output
         assert "Verdict: VERIFIED" in result.output
+
+
+class TestContributingRunsProvenance:
+    """Run-level provenance verification (contributing_runs +
+    provenance_health envelope keys).
+
+    Verification state accumulates across partial CI runs; each
+    assertion's status was earned by its most recent run. The envelope
+    embeds one entry per status-determining run, each independently
+    verifiable (canonical-bytes hash + signature and/or Sigstore
+    bundle). Older envelopes without these keys degrade gracefully to
+    latest-run behavior with coverage reported as unknown.
+    """
+
+    @staticmethod
+    def _keypair():
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        return ec.generate_private_key(ec.SECP256R1())
+
+    @staticmethod
+    def _pub_pem(key) -> str:
+        from cryptography.hazmat.primitives import serialization
+
+        return key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+
+    @staticmethod
+    def _fingerprint(key) -> str:
+        import hashlib
+
+        from cryptography.hazmat.primitives import serialization
+
+        der = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return hashlib.sha256(der).hexdigest()
+
+    def _signed_run(
+        self,
+        key,
+        run_id: str,
+        assertion_results: list[dict],
+        *,
+        submitted_at: str = "2026-07-01T12:00:00+00:00",
+        provider: str = "github",
+        commit_sha: str = "deadbeefcafe",
+    ) -> dict:
+        """Build one contributing_runs entry: canonical results text,
+        hash over its exact bytes, signature over the hash string."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        results_canonical = _j.dumps(
+            assertion_results, sort_keys=True, separators=(",", ":"),
+        )
+        results_hash = (
+            "sha256:"
+            + hashlib.sha256(results_canonical.encode("utf-8")).hexdigest()
+        )
+        sig = key.sign(results_hash.encode(), ec.ECDSA(hashes.SHA256()))
+        return {
+            "run_id": run_id,
+            "submitted_at": submitted_at,
+            "pipeline": {"provider": provider, "commit_sha": commit_sha},
+            "assertion_ids": [
+                r["assertion_id"] for r in assertion_results
+            ],
+            "results_canonical": results_canonical,
+            "content_integrity": {
+                "key_source": "workspace",
+                "results_hash": results_hash,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": self._fingerprint(key),
+                "public_key_pem": self._pub_pem(key),
+            },
+        }
+
+    def _build_pkg(
+        self,
+        tmp_path,
+        *,
+        contributing_runs: list | None = None,
+        provenance_health: dict | None = None,
+        results: list | None = None,
+        key=None,
+    ):
+        """Build an audit pack whose legacy content_integrity signature
+        verifies over `results`, with optional run-level provenance."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        if key is None:
+            key = self._keypair()
+        results = results if results is not None else []
+        canonical = _j.dumps(results, sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        control_ids = sorted({
+            r["control_id"] for r in results if r.get("control_id")
+        })
+        pkg = {
+            "model": {"id": "m1", "title": "t", "feature_description": "fd",
+                      "version": 1, "assets": [], "attackers": [],
+                      "trust_boundaries": []},
+            "control_objectives": [],
+            "controls": [
+                {"id": cid, "description": f"Control {cid}"}
+                for cid in control_ids
+            ],
+            "verification_run": {
+                "id": "r-latest", "pipeline": {}, "results": results,
+                "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "results_hash": stored,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": self._fingerprint(key),
+                "public_key_pem": self._pub_pem(key),
+            },
+            "generated_at": "",
+            "assertions_by_control": {},
+            "sufficiency": {
+                cid: {"status": "sufficient"} for cid in control_ids
+            },
+        }
+        if contributing_runs is not None:
+            pkg["contributing_runs"] = contributing_runs
+        if provenance_health is not None:
+            pkg["provenance_health"] = provenance_health
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path), key
+
+    # ----- Happy path -----
+
+    def test_two_verified_runs_reconstruct_state(self, tmp_path):
+        """Two runs, each signing its own canonical results; both
+        verify, the reconstructed state covers every assertion, and the
+        trust contract reports full run-level provenance."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+            provider="gitlab", commit_sha="0123456789ab",
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1", "details": "ok"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1", "details": "ok"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Contributing runs (2)" in out_flat
+        assert "run run-aaaa" in out_flat
+        assert "run run-bbbb" in out_flat
+        assert out_flat.count("VERIFIED sigstore: no") == 2
+        assert "Reconstructed from verified runs: 2 assertion result(s)" in out_flat
+        assert "manifest-only" not in out_flat.lower()
+        assert "Run-level provenance: VERIFIED (2/2 run(s)" in out_flat
+        # Per-run pipeline attribution is shown.
+        assert "github/deadbeefcafe" in out_flat
+        assert "gitlab/0123456789ab" in out_flat
+
+    # ----- Tamper path -----
+
+    def test_run_hash_mismatch_fails_with_hint(self, tmp_path):
+        """Tampering a run's canonical results text after signing is
+        the tamper-shaped failure: TAMPER-MISMATCH, non-zero exit, and
+        the run-tamper remediation hint."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+        )
+        # Flip the signed verdict inside the exact canonical bytes.
+        run2["results_canonical"] = run2["results_canonical"].replace(
+            '"pass"', '"fail"',
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "TAMPER-MISMATCH" in out_flat
+        assert "results_canonical does not hash to results_hash" in out_flat
+        assert (
+            "Treat this run as untrusted; ask the report issuer to re-run "
+            "verification in CI and re-export." in out_flat
+        )
+        assert "Run-level provenance: FAILED (1/2 run(s) verified" in out_flat
+        assert "Verdict: FAILED" in result.output
+
+    # ----- Unverifiable serialization -----
+
+    def test_unverifiable_serialization_distinct_from_mismatch(self, tmp_path):
+        """A run whose signed bytes cannot be re-derived (serialization
+        predates canonical freezing) is a coverage limitation, not
+        tampering: distinct status, distinct wording, hint present,
+        exit code unaffected."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+        )
+        del run2["results_canonical"]
+        run2["content_integrity"]["unverifiable_serialization"] = True
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "UNVERIFIABLE SERIALIZATION" in out_flat
+        assert "cannot re-derive the signed serialization" in out_flat
+        assert "nothing is known to be modified" in out_flat
+        # Distinct from the tamper-shaped failure.
+        assert "TAMPER" not in out_flat
+        assert (
+            "a fresh run is verifiable by construction" in out_flat
+        )
+        assert "Run-level provenance: PARTIAL (1/2 run(s) verified" in out_flat
+
+    # ----- Unresolved / orphan key -----
+
+    def test_orphan_run_key_unresolved_with_hint(self, tmp_path):
+        """A run signed under a key absent from the issuer's published
+        key set is UNRESOLVED KEY (warning-grade, not tampering), with
+        the re-run remediation hint."""
+        k1, k2 = self._keypair(), self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": "asrt_002", "result": "pass", "tier": 1},
+            ],
+        )
+        run2["content_integrity"]["key_source"] = "orphan"
+        run2["content_integrity"]["public_key_pem"] = ""
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2], results=results,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "UNRESOLVED KEY" in out_flat
+        assert (
+            "runs are then signed under the issuer's current key" in out_flat
+        )
+        assert "TAMPER" not in out_flat
+
+    # ----- Manifest-only cross-check -----
+
+    def test_manifest_only_assertions_reported_with_hint(self, tmp_path):
+        """Assertions carried by the report's records but determined by
+        no embedded run are manifest-only provenance; the count matches
+        the producer's provenance_health disclosure."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        health = {
+            "assertions_verified": 2,
+            "assertions_run_covered": 1,
+            "assertions_manifest_only": 1,
+            "runs_embedded": 1,
+            "runs_orphan_key": 0,
+            "runs_unverifiable_serialization": 0,
+            "runs_sigstore": 0,
+            "resolution_window_truncated": False,
+            "warnings": [],
+        }
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+            provenance_health=health,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Provenance health (producer disclosure)" in out_flat
+        assert "1 manifest-only assertion(s)" in out_flat
+        assert "asrt_002" in out_flat
+        assert (
+            "re-run verification in CI to restore end-to-end run provenance"
+            in out_flat
+        )
+        # Producer disclosure and cross-check agree — no disagreement note.
+        assert "disagreement" not in out_flat.lower()
+        assert "Run-level provenance: PARTIAL" in out_flat
+
+    def test_provenance_health_disagreement_noted(self, tmp_path):
+        """When the producer's manifest-only count disagrees with the
+        cross-reference over embedded runs, the divergence is surfaced."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+            {"assertion_id": "asrt_002", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        health = {"assertions_manifest_only": 0, "runs_embedded": 1}
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+            provenance_health=health,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Producer disclosure disagreement" in out_flat
+
+    # ----- Backward compatibility -----
+
+    def test_old_envelope_without_contributing_runs_graceful(self, tmp_path):
+        """Envelopes that predate the contributing-runs keys verify
+        exactly as before, with run-level coverage reported as unknown
+        — never a failure."""
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(tmp_path, results=results)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Contributing runs" not in out_flat
+        assert "Run-level provenance: UNKNOWN" in out_flat
+        assert "report predates run-level provenance disclosure" in out_flat
+        assert "Verdict: VERIFIED" in result.output
+
+    def test_empty_contributing_runs_reported_not_unknown(self, tmp_path):
+        """A present-but-empty contributing_runs list is a disclosure
+        of zero embedded runs — reported as NONE, not UNKNOWN."""
+        path, _ = self._build_pkg(tmp_path, contributing_runs=[])
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Contributing runs (0)" in out_flat
+        assert "Run-level provenance: NONE" in out_flat
+        assert "UNKNOWN" not in out_flat
+
+    # ----- Remediation hints on non-run failure classes -----
+
+    def test_no_sigstore_provenance_hint(self, tmp_path):
+        """The missing-Sigstore line carries the OIDC/DSSE hint."""
+        path, _ = self._build_pkg(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        out_flat = " ".join(result.output.split())
+        assert "No Sigstore provenance in package" in out_flat
+        assert (
+            "enable OIDC attestation in the CI job, or use the offline "
+            "DSSE attestation path" in out_flat
+        )
+
+    def test_results_hash_mismatch_hint(self, tmp_path):
+        """The top-level results-hash mismatch line carries the
+        untrusted-run remediation hint."""
+        import json as _j
+
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(tmp_path, results=results)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        pkg["verification_run"]["results"][0]["details"] = "tampered"
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Hash match: NO" in out_flat
+        assert (
+            "Treat this run as untrusted; ask the report issuer to re-run "
+            "verification in CI and re-export." in out_flat
+        )
+
+
+class TestDocSignatureRemediationHint:
+    """The document-signature INVALID failure carries the re-download
+    remediation hint (HTML report path)."""
+
+    def test_html_signature_invalid_carries_hint(self, tmp_path):
+        import base64
+        import hashlib
+
+        from unittest.mock import patch
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        body = "<!DOCTYPE html><html><body>audited-content</body></html>"
+        content_hash = hashlib.sha256(body.encode()).digest()
+        sig = key.sign(content_hash, ec.ECDSA(hashes.SHA256()))
+        fingerprint = "ab" * 32
+        signed = (
+            f"{body}\n<!-- mipiti-report-signature:{fingerprint}:"
+            f"{base64.b64encode(sig).decode()} -->"
+        )
+        # Tamper the body AFTER signing so the signature fails.
+        tampered = signed.replace("audited-content", "tampered-content")
+        path = tmp_path / "report.html"
+        path.write_text(tampered, encoding="utf-8")
+        runner = CliRunner()
+        with patch(
+            "mipiti_verify.cli._resolve_pubkey_from_jwks",
+            return_value=(key.public_key(), fingerprint, "mock://jwks"),
+        ):
+            result = runner.invoke(main, ["audit", str(path)])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Signature: INVALID" in out_flat
+        assert (
+            "Re-download the report from the issuer; if this persists the "
+            "copy chain is compromised." in out_flat
+        )
