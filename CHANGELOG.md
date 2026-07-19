@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Run-level provenance verification for the `audit` command. Newer
+  audit envelopes carry two additive top-level keys:
+  `contributing_runs` (one entry per status-determining CI run, each
+  carrying the exact canonical results text whose hash was signed,
+  its own hash + signature + key material, the assertion ids that run
+  determines, and optionally a per-run Sigstore bundle) and
+  `provenance_health` (the producer's own coverage disclosure,
+  rendered as a summary panel). Each run is verified independently —
+  hash recomputed over the exact canonical bytes, signature over the
+  hash, bundle when present — and reported as `VERIFIED`,
+  `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`,
+  or `UNSIGNED`. The verified runs reconstruct the report's
+  verification state; assertions with no embedded determining run are
+  reported as manifest-only provenance and cross-checked against the
+  producer disclosure. A run declaring `unverifiable_serialization`
+  (signed bytes can no longer be re-derived; predates canonical
+  freezing) is a coverage limitation, distinct from a hash mismatch,
+  and never fails the verdict; a genuine mismatch over present
+  canonical text fails as tampering. Older envelopes without these
+  keys verify unchanged, with run-level coverage reported as unknown.
+- Remediation hints on audit failure lines. Every failure class
+  (document signature invalid, run hash mismatch, unverifiable
+  serialization, unresolved/orphaned signing key, missing Sigstore
+  provenance, manifest-only assertions) now carries a one-line,
+  auditor-audience remediation sentence rendered subordinate to the
+  failure line.
+
 - Seven RTL/Verilog assertion types: `module_exists`,
   `module_instantiated`, `port_exists`, `parameter_defined`,
   `signal_exists`, `sva_assertion_present`, and `register_reset`.
@@ -59,6 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Audit-pack manifest verification no longer requires the
+  verification run's `public_key_pem`. The manifest is signed by the
+  issuer's platform key, which is not necessarily the run's key; the
+  manifest signing key is now resolved by `manifest_key_fingerprint`
+  — via the embedded `manifest_public_key_pem` (offline), the
+  envelope key or an in-scope platform key on fingerprint match, or a
+  JWKS lookup — so packs whose run key is orphaned or
+  workspace-signed verify their manifest correctly instead of failing
+  with a missing-key error.
 - `--output github` annotations and per-assertion text output now
   carry the threat model context (`[<title> <id8>]` prefix on every
   `::warning::` / `::error::` / `::notice::` title and group header).

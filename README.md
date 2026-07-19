@@ -94,6 +94,17 @@ A signed audit package (PDF or JSON) carries the following per-row evidence:
 | `content_integrity.dsse_bundle` | Self-contained customer-keyed DSSE / in-toto attestation, signed offline with the customer's own ECDSA P-256 key (when key_source is `customer_dsse`) | Customer's own key, pinned out-of-band by fingerprint |
 | `content_integrity.key_source` | One of `sigstore` / `platform` / `workspace` / `customer_dsse` / `unverifiable_orphan` / `legacy` | Tells the verifier which trust anchor to use for this row |
 
+### Run-level provenance (`contributing_runs` + `provenance_health`)
+
+Verification state in a report accumulates across (often partial) CI runs — each assertion's current status was earned by its most recent run. Newer envelopes disclose that history through two additive top-level keys:
+
+- `contributing_runs` — one entry per status-determining run. Each entry carries the run's exact canonical results text (`results_canonical` — the exact bytes whose hash was signed), its own `content_integrity` block (`results_hash`, `signature`, key material), the assertion ids that run determines, and optionally a per-run Sigstore bundle (the canonical trust anchor for that run when present).
+- `provenance_health` — the producer's own coverage disclosure (assertions run-covered vs. manifest-only, per-run key/serialization limitations, warnings). Rendered as a summary panel; the per-run verification below it is the independent auditor-side check.
+
+The verifier checks each run independently: SHA-256 recomputed over the exact `results_canonical` bytes against `results_hash`, the signature over the hash with the run's key (embedded PEM or JWKS lookup by fingerprint), and the per-run Sigstore bundle when present. Each run is reported as `VERIFIED`, `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`, or `UNSIGNED`. A run whose `content_integrity` declares `unverifiable_serialization` (signed material exists but the signed bytes can no longer be re-derived; the serialization predates canonical freezing) is a coverage limitation — reported distinctly from a hash mismatch and never treated as tampering. A genuine mismatch over present `results_canonical` fails the audit.
+
+Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. Older envelopes without these keys verify exactly as before; the trust contract then reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
+
 ### Each check the verifier runs
 
 | Check | Anchor | Fails when | What it defends against |

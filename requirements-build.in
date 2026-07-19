@@ -4,5 +4,6 @@ twine
 # Transitive CVE floors (mirror of [tool.uv].constraint-dependencies in
 # pyproject.toml; build-env doesn't read pyproject.toml so the pins must
 # be repeated here)
+cryptography>=48.0.1  # GHSA-537c-gmf6-5ccf
 idna>=3.15      # CVE-2026-45409
 urllib3>=2.7.0  # CVE-2026-44431 + CVE-2026-44432
