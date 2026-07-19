@@ -1393,7 +1393,9 @@ class TestAuditPackageComprehensive:
             assertions_by_assumption={"AS1": [{"id": "asrt_1"}]},
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", pkg_path])
+        # Full mode: the exhaustive listing renders the assumption's
+        # description, its assertion rows, and the sufficiency note.
+        result = runner.invoke(main, ["audit", pkg_path, "--full"])
         out_flat = " ".join(result.output.split())
         assert "Assumptions" in result.output
         assert "AS1" in out_flat
@@ -1403,6 +1405,15 @@ class TestAuditPackageComprehensive:
         assert "Sufficiency does not apply" in out_flat
         # The verdict tally separates control vs assumption assertions.
         assert "1/1 assumption assertions pass" in out_flat
+        # Summary mode: the assumption appears as a one-line count and
+        # the passing assertion's per-row detail is not enumerated.
+        result_summary = runner.invoke(main, ["audit", pkg_path])
+        assert result_summary.exit_code == result.exit_code
+        summary_flat = " ".join(result_summary.output.split())
+        assert "AS1" in summary_flat
+        assert "1 assertion(s): 1 pass, 0 fail" in summary_flat
+        assert "asrt_1" not in summary_flat
+        assert "1/1 assumption assertions pass" in summary_flat
 
     def test_denormalised_control_id_drives_grouping_when_lookup_tables_empty(self, tmp_path):
         """The per-result ``control_id`` denorm field is the primary
@@ -1420,11 +1431,16 @@ class TestAuditPackageComprehensive:
             # denorm path is engaged, not the cross-reference fallback.
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", pkg_path])
+        result = runner.invoke(main, ["audit", pkg_path, "--full"])
         out_flat = " ".join(result.output.split())
         assert "CTRL-1" in out_flat
         assert "Encrypt at rest" in out_flat
         assert "Unmapped" not in out_flat
+        # Summary mode groups identically (one count line per control).
+        result_summary = runner.invoke(main, ["audit", pkg_path])
+        summary_flat = " ".join(result_summary.output.split())
+        assert "CTRL-1" in summary_flat
+        assert "Unmapped" not in summary_flat
 
     def test_legacy_envelope_without_denorm_falls_back_to_assertions_by_control(self, tmp_path):
         """Older envelope shapes without the per-result
@@ -3896,7 +3912,7 @@ class TestAuditPackComposition:
         }
         path, _ = self._build_signed_pkg(tmp_path, composition=composition)
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0
         out = result.output
         out_flat = " ".join(out.split())
@@ -3949,6 +3965,19 @@ class TestAuditPackComposition:
         assert "dangling override" in out_flat
         assert "2" in out_flat
 
+        # Summary mode condenses the same data: entity table + one
+        # coverage line, no per-CO contributing-control enumeration and
+        # no binding rows.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0
+        summary_flat = " ".join(result_summary.output.split())
+        assert "Effective entities" in result_summary.output
+        assert "Effective coverage: 2/3 CO(s) covered" in summary_flat
+        assert "Inheritance bindings: 1 cross-model credit link(s)" in summary_flat
+        assert "m1:co_own" not in summary_flat
+        assert "C-PARENT-7" not in summary_flat
+        assert "dangling override" in summary_flat
+
     def test_inherited_credit_is_visually_distinct(self, tmp_path):
         """Inherited contributing controls render with a distinct
         ``[inherited]`` badge so an auditor can spot cross-model credit
@@ -3975,7 +4004,7 @@ class TestAuditPackComposition:
         }
         path, _ = self._build_signed_pkg(tmp_path, composition=composition)
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0
         out = result.output
         # Both badges rendered, each next to the matching control id.
@@ -4020,12 +4049,16 @@ class TestAuditPackComposition:
         }
         path, _ = self._build_signed_pkg(tmp_path, composition=composition)
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0
         out = result.output
         assert "Flat model" in out
         # No ancestor-chain arrow when there's nothing to chain.
         assert "->" not in out.split("Tree position")[1].split("Effective")[0]
+        # Summary mode renders the same single flat-model line.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0
+        assert "Flat model" in result_summary.output
 
     def test_signature_verification_passes_with_composition_present(
         self, tmp_path
@@ -4769,7 +4802,7 @@ class TestAuditPackManifest:
             tmp_path, with_manifest=False, with_legacy_signature=True,
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0
         out_flat = " ".join(result.output.split())
         # Advisory keyword is present and visually distinct (yellow).
@@ -4788,6 +4821,15 @@ class TestAuditPackManifest:
         assert "deprecated" in out_flat
         # The legacy path still produces a VERIFIED verdict.
         assert "Verdict: VERIFIED" in result.output
+        # Summary mode carries the same advisory in the Caveats section.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0
+        summary_flat = " ".join(result_summary.output.split())
+        assert "Legacy-only signature path" in summary_flat
+        assert "verification_run.results" in summary_flat
+        assert "NOT signature-bound" in summary_flat
+        assert "update Mipiti" in summary_flat
+        assert "Verdict: VERIFIED" in result_summary.output
 
     def test_manifest_and_legacy_present_notes_deprecation_no_warning(
         self, tmp_path,
@@ -4849,12 +4891,20 @@ class TestAuditPackManifest:
             tmp_path, with_manifest=False, with_legacy_signature=True,
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0
         # Both the warning AND the success verdict must coexist —
         # narrower scope ≠ failed scope.
         assert "WARNING" in result.output
         assert "Verdict: VERIFIED" in result.output
+        # Same advisory-only semantics in summary mode: caveat present,
+        # exit code unchanged.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0
+        assert "Legacy-only signature path" in " ".join(
+            result_summary.output.split()
+        )
+        assert "Verdict: VERIFIED" in result_summary.output
 
 
 class TestContributingRunsProvenance:
@@ -5397,7 +5447,7 @@ class TestContributingRunsProvenance:
             provenance_health=health,
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0, result.output
         out_flat = " ".join(result.output.split())
         assert "Provenance health (producer disclosure)" in out_flat
@@ -5410,6 +5460,21 @@ class TestContributingRunsProvenance:
         # Producer disclosure and cross-check agree — no disagreement note.
         assert "disagreement" not in out_flat.lower()
         assert "Run-level provenance: PARTIAL" in out_flat
+        # Summary mode: the manifest-only count surfaces as a caveat
+        # with the same remediation hint, and the cross-check section
+        # states the agreement explicitly.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0, result_summary.output
+        summary_flat = " ".join(result_summary.output.split())
+        assert "1 manifest-only assertion(s)" in summary_flat
+        assert "asrt_002" in summary_flat
+        assert (
+            "re-run verification in CI to restore end-to-end run provenance"
+            in summary_flat
+        )
+        assert "AGREES" in summary_flat
+        assert "disagreement" not in summary_flat.lower()
+        assert "Run-level provenance: PARTIAL" in summary_flat
 
     def test_unresolved_runs_crosscheck_matches_producer(self, tmp_path):
         """The cross-check uses the producer's semantics: an assertion
@@ -5725,12 +5790,18 @@ class TestContributingRunsProvenance:
             provenance_health=health,
         )
         runner = CliRunner()
-        result = runner.invoke(main, ["audit", path])
+        result = runner.invoke(main, ["audit", path, "--full"])
         assert result.exit_code == 0, result.output
         out_flat = " ".join(result.output.split())
         assert "Verified as of: 2026-07-18T09:00:00+00:00" in out_flat
         assert "Attestations near expiry: 2" in out_flat
         assert "Attestations expired: 0" in out_flat
+        # Summary mode: warning-grade disclosure values surface as
+        # caveats; additive keys never break rendering.
+        result_summary = runner.invoke(main, ["audit", path])
+        assert result_summary.exit_code == 0, result_summary.output
+        summary_flat = " ".join(result_summary.output.split())
+        assert "2 attestation(s) near expiry" in summary_flat
 
 
 class TestDocSignatureRemediationHint:
@@ -5771,4 +5842,295 @@ class TestDocSignatureRemediationHint:
         assert (
             "Re-download the report from the issuer; if this persists the "
             "copy chain is compromised." in out_flat
+        )
+
+
+class TestAuditSummaryMode:
+    """Default (summary) vs --full output modes of the audit command.
+
+    The default output is a verdict-first workpaper summary: verdict,
+    trust contract, contributing runs, producer-disclosure cross-check,
+    caveats, per-control counts, condensed composition, then the
+    compact cryptographic evidence blocks. Per-element detail expands
+    automatically only for elements that fail or degrade; --full
+    restores the exhaustive listing in verification order. Exit codes
+    are identical in both modes.
+    """
+
+    def _build_pkg(self, tmp_path, results, sufficiency=None):
+        """Signed package (legacy content_integrity path) over the
+        supplied verification_run results."""
+        import base64
+        import hashlib
+        import json as _j
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        canonical = _j.dumps(results, sort_keys=True, separators=(",", ":"))
+        stored = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        sig = key.sign(stored.encode(), ec.ECDSA(hashes.SHA256()))
+        der_bytes = key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        fp = hashlib.sha256(der_bytes).hexdigest()
+        control_ids = sorted({
+            r.get("control_id") for r in results if r.get("control_id")
+        })
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [
+                {"id": cid, "description": f"control {cid}", "deleted": False}
+                for cid in control_ids
+            ],
+            "verification_run": {
+                "id": "r1", "pipeline": {}, "results": results,
+                "submitted_at": "",
+            },
+            "provenance": None,
+            "content_integrity": {
+                "results_hash": stored,
+                "signature": base64.b64encode(sig).decode(),
+                "key_fingerprint": fp,
+                "public_key_pem": pub_pem,
+            },
+            "assertions_by_control": {
+                cid: [r["assertion_id"] for r in results
+                      if r.get("control_id") == cid]
+                for cid in control_ids
+            },
+            "sufficiency": sufficiency or {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        return str(path)
+
+    _PASSING_RESULTS = [
+        {"assertion_id": "asrt_ok_1", "result": "pass", "tier": 1,
+         "control_id": "CTRL-A", "details": "checked the invariant. ok."},
+        {"assertion_id": "asrt_ok_2", "result": "pass", "tier": 2,
+         "control_id": "CTRL-A", "details": "semantic check passed. fine."},
+    ]
+
+    _MIXED_RESULTS = _PASSING_RESULTS + [
+        {"assertion_id": "asrt_bad", "result": "fail", "tier": 2,
+         "control_id": "CTRL-B",
+         "details": "the guard clause is missing entirely."},
+    ]
+
+    def test_summary_is_verdict_first(self, tmp_path):
+        path = self._build_pkg(
+            tmp_path, self._PASSING_RESULTS,
+            sufficiency={"CTRL-A": {"status": "sufficient"}},
+        )
+        result = CliRunner().invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        first_line = next(
+            line for line in result.output.splitlines() if line.strip()
+        )
+        assert first_line.startswith("Verdict:")
+
+    def test_summary_hides_passing_detail_shows_counts(self, tmp_path):
+        path = self._build_pkg(
+            tmp_path, self._PASSING_RESULTS,
+            sufficiency={"CTRL-A": {"status": "pending"}},
+        )
+        result = CliRunner().invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out_flat = " ".join(result.output.split())
+        # Per-control count line, not per-assertion enumeration.
+        assert "CTRL-A 2 assertion(s): 2 pass, 0 fail" in out_flat
+        assert "Sufficiency: pending" in out_flat
+        assert "asrt_ok_1" not in out_flat
+        assert "asrt_ok_2" not in out_flat
+        assert "checked the invariant" not in out_flat
+
+    def test_summary_expands_failed_assertion_detail(self, tmp_path):
+        path = self._build_pkg(tmp_path, self._MIXED_RESULTS)
+        result = CliRunner().invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        # The failing assertion auto-expands its full row...
+        assert "asrt_bad" in out_flat
+        assert "Tier 2 FAIL" in out_flat
+        assert "the guard clause is missing entirely." in out_flat
+        # ...while passing assertions stay collapsed.
+        assert "asrt_ok_1" not in out_flat
+        assert "CTRL-B 1 assertion(s): 0 pass, 1 fail" in out_flat
+
+    def test_full_shows_passing_detail(self, tmp_path):
+        path = self._build_pkg(tmp_path, self._MIXED_RESULTS)
+        result = CliRunner().invoke(main, ["audit", path, "--full"])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "asrt_ok_1" in out_flat
+        assert "asrt_ok_2" in out_flat
+        assert "asrt_bad" in out_flat
+        assert "control CTRL-A" in out_flat  # description enumerated
+        # Full mode keeps the verdict as the closing line.
+        non_blank = [
+            line for line in result.output.splitlines() if line.strip()
+        ]
+        assert non_blank[-1].startswith("Verdict:")
+
+    @pytest.mark.parametrize("failing", [False, True])
+    def test_exit_codes_identical_across_modes(self, tmp_path, failing):
+        results = self._MIXED_RESULTS if failing else self._PASSING_RESULTS
+        sufficiency = (
+            None if failing else {"CTRL-A": {"status": "sufficient"}}
+        )
+        path = self._build_pkg(tmp_path, results, sufficiency=sufficiency)
+        runner = CliRunner()
+        summary = runner.invoke(main, ["audit", path])
+        full = runner.invoke(main, ["audit", path, "--full"])
+        assert summary.exit_code == full.exit_code == (1 if failing else 0)
+        # Both modes state the same verdict.
+        summary_verdict = next(
+            line for line in summary.output.splitlines()
+            if line.startswith("Verdict:")
+        )
+        full_verdict = next(
+            line for line in full.output.splitlines()
+            if line.startswith("Verdict:")
+        )
+        assert summary_verdict == full_verdict
+
+    def test_summary_replays_crypto_evidence_blocks(self, tmp_path):
+        """The compact signature/provenance evidence stays available in
+        the default view — after the summary sections, not before."""
+        path = self._build_pkg(
+            tmp_path, self._PASSING_RESULTS,
+            sufficiency={"CTRL-A": {"status": "sufficient"}},
+        )
+        result = CliRunner().invoke(main, ["audit", path])
+        assert result.exit_code == 0
+        out = result.output
+        assert "Content Integrity (ECDSA P-256)" in out
+        assert "Signature:" in out
+        assert out.index("Verdict:") < out.index("Content Integrity")
+
+    def test_summary_caveats_none_line(self, tmp_path):
+        """A clean modern-shaped report with no warnings renders an
+        explicit empty Caveats line rather than omitting the section."""
+        path = self._build_pkg(
+            tmp_path, self._PASSING_RESULTS,
+            sufficiency={"CTRL-A": {"status": "sufficient"}},
+        )
+        result = CliRunner().invoke(main, ["audit", path])
+        # This legacy-signed fixture always carries caveats (no
+        # Sigstore bundle, legacy-only path) — assert the section
+        # header exists and enumerates them.
+        assert "Caveats (" in result.output
+
+
+class TestSigstoreNoOpNoticeSuppression:
+    """The sigstore library's "unsafe (no-op) verification policy"
+    notice is suppressed around the verification call when no identity
+    is pinned — the CLI's own SKIPPED block explains the same state
+    accurately. Only that one message is filtered; other library log
+    records pass through.
+    """
+
+    def _build_pkg_with_bundle(self, tmp_path):
+        import base64 as _b64
+        import hashlib as _h
+        import json as _j
+
+        canonical = _j.dumps([], sort_keys=True, separators=(",", ":"))
+        results_hash = "sha256:" + _h.sha256(canonical.encode()).hexdigest()
+        bundle_bind_hash_hex = _h.sha256(results_hash.encode()).hexdigest()
+        pkg = {
+            "model": {"id": "m1"},
+            "controls": [],
+            "verification_run": {"id": "r1", "results": []},
+            "provenance": {"bundle": "{\"placeholder\": true}"},
+            "content_integrity": {
+                "results_hash": results_hash,
+                "bundle_bind_hash": bundle_bind_hash_hex,
+            },
+            "assertions_by_control": {},
+            "sufficiency": {},
+        }
+        path = tmp_path / "pkg.json"
+        path.write_text(_j.dumps(pkg), encoding="utf-8")
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "test", "digest": {"sha256": bundle_bind_hash_hex}},
+            ],
+            "predicateType": "https://mipiti.io/attestations/v1/verification-run",
+            "predicate": {"model_id": "m1", "pipeline": {}},
+        }
+        return str(path), statement
+
+    def _patch_sigstore_emitting_notice(self, statement):
+        """Fake verifier whose verify_dsse emits the library notice the
+        way sigstore-python does (policy-module logger at verify time),
+        plus an unrelated record that must survive the filter."""
+        import json as _j
+        import logging as _logging
+        from datetime import datetime, timezone
+
+        fake_cert = MagicMock()
+        fake_cert.subject.rfc4514_string.return_value = ""
+        fake_cert.not_valid_before_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_cert.not_valid_after_utc = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fake_bundle = MagicMock()
+        fake_bundle.signing_certificate = fake_cert
+
+        def _verify_dsse(bundle, policy):
+            logger = _logging.getLogger("sigstore.verify.policy")
+            logger.warning(
+                "unsafe (no-op) verification policy used! "
+                "no verification performed!"
+            )
+            logger.warning("unrelated policy-module diagnostics")
+            return (
+                "application/vnd.in-toto+json",
+                _j.dumps(statement).encode("utf-8"),
+            )
+
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.side_effect = _verify_dsse
+        bundle_patch = patch(
+            "sigstore.models.Bundle.from_json", return_value=fake_bundle,
+        )
+        verifier_patch = patch(
+            "sigstore.verify.Verifier.production", return_value=fake_verifier,
+        )
+        return bundle_patch, verifier_patch
+
+    @pytest.mark.parametrize("mode_args", [[], ["--full"]])
+    def test_noop_notice_absent_in_both_modes(self, tmp_path, mode_args, capfd):
+        path, statement = self._build_pkg_with_bundle(tmp_path)
+        bp, vp = self._patch_sigstore_emitting_notice(statement)
+        with bp, vp:
+            result = CliRunner().invoke(main, ["audit", path] + mode_args)
+        _out, err = capfd.readouterr()
+        combined = result.output + err
+        assert "unsafe (no-op) verification policy" not in combined
+        # The CLI's own accurate explanation is present instead.
+        assert "SKIPPED" in result.output
+        assert "no --expected-ci-identity pinned" in result.output
+
+    def test_filter_is_message_targeted(self, tmp_path, caplog):
+        """Only the no-op notice is dropped; other records from the
+        same logger propagate."""
+        import logging as _logging
+
+        path, statement = self._build_pkg_with_bundle(tmp_path)
+        bp, vp = self._patch_sigstore_emitting_notice(statement)
+        with caplog.at_level(_logging.WARNING, logger="sigstore.verify.policy"):
+            with bp, vp:
+                CliRunner().invoke(main, ["audit", path])
+        messages = [r.getMessage() for r in caplog.records]
+        assert "unrelated policy-module diagnostics" in messages
+        assert not any(
+            "unsafe (no-op) verification policy" in m for m in messages
         )
