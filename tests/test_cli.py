@@ -5167,6 +5167,202 @@ class TestContributingRunsProvenance:
         )
         assert "TAMPER" not in out_flat
 
+    # ----- Per-run Sigstore bundle binding -----
+
+    @staticmethod
+    def _patch_sigstore_statement(subject_hex: str):
+        """Patch the Sigstore Bundle and Verifier symbols so verify_dsse
+        returns an in-toto Statement whose Subject digest is
+        `subject_hex`. Same shape as the TestBundleBindExplicit helper."""
+        import json as _j
+
+        from unittest.mock import MagicMock, patch
+
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "mipiti-verification", "digest": {"sha256": subject_hex}},
+            ],
+            "predicate": {},
+        }
+        fake_bundle = MagicMock()
+        fake_verifier = MagicMock()
+        fake_verifier.verify_dsse.return_value = (
+            "application/vnd.in-toto+json",
+            _j.dumps(statement).encode("utf-8"),
+        )
+        return (
+            patch("sigstore.models.Bundle.from_json", return_value=fake_bundle),
+            patch("sigstore.verify.Verifier.production", return_value=fake_verifier),
+        )
+
+    def test_sigstore_run_binds_against_bundle_bind_hash(self, tmp_path):
+        """Regression: the per-run bundle's Subject digest is compared
+        against the entry's bundle_bind_hash — NOT results_hash, which
+        lives in a different hash domain (it binds the frozen
+        results_canonical bytes) and is never equal to the Subject
+        digest by design. A well-formed Sigstore-attested run must
+        verify."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        bind_hex = "cd" * 32  # bundle-bind domain value; != results_hash
+        run1["content_integrity"]["bundle_bind_hash"] = f"sha256:{bind_hex}"
+        run1["provenance"] = {"bundle": "{}"}
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+        )
+        bp, vp = self._patch_sigstore_statement(bind_hex)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "VERIFIED sigstore: yes" in out_flat
+        assert "TAMPER" not in out_flat
+        assert "signed over a different value" not in out_flat
+
+    def test_sigstore_run_wrong_bind_hash_is_tamper(self, tmp_path):
+        """A genuine Subject-digest vs bundle_bind_hash mismatch is the
+        real tamper signal and fails the run."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run1["content_integrity"]["bundle_bind_hash"] = "sha256:" + ("cd" * 32)
+        run1["provenance"] = {"bundle": "{}"}
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+        )
+        # Bundle Subject digest differs from the entry's claimed bind hash.
+        bp, vp = self._patch_sigstore_statement("ef" * 32)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "TAMPER-MISMATCH" in out_flat
+        assert (
+            "bundle Subject digest does not match this run's "
+            "bundle_bind_hash" in out_flat
+        )
+
+    def test_sigstore_run_without_bind_hash_is_unbound_not_tamper(
+        self, tmp_path,
+    ):
+        """A per-run bundle with no bundle_bind_hash to bind against is
+        reported as unbindable (warning-grade); the run's hash +
+        signature path still carries its verification."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run1["provenance"] = {"bundle": "{}"}  # no bundle_bind_hash
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+        )
+        bp, vp = self._patch_sigstore_statement("cd" * 32)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "VERIFIED sigstore: unbound" in out_flat
+        assert "not bindable to this run entry" in out_flat
+        assert (
+            "re-export the report from a current build so each run entry "
+            "carries its bundle binding" in out_flat
+        )
+        assert "TAMPER" not in out_flat
+
+    def test_sigstore_run_plus_unresolved_runs_agree_with_producer(
+        self, tmp_path,
+    ):
+        """Pinned production scenario: one Sigstore-attested run
+        (correctly bound and verified, determining 6 assertions) plus
+        two unresolved-key runs determining the remaining 50 of 56.
+        With the bundle bound against bundle_bind_hash the run
+        verifies, the auditor's not-verifiably-covered count equals
+        the producer's assertions_manifest_only (50), and no
+        disagreement is reported."""
+        k1, k2, k3 = self._keypair(), self._keypair(), self._keypair()
+        bind_hex = "cd" * 32
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": f"asrt_{i:03d}", "result": "pass", "tier": 1}
+                for i in range(1, 7)
+            ],
+        )
+        run1["content_integrity"]["bundle_bind_hash"] = f"sha256:{bind_hex}"
+        run1["provenance"] = {"bundle": "{}"}
+        run2 = self._signed_run(
+            k2, "run-bbbb2222", [
+                {"assertion_id": f"asrt_{i:03d}", "result": "pass", "tier": 1}
+                for i in range(7, 16)
+            ],
+        )
+        run3 = self._signed_run(
+            k3, "run-cccc3333", [
+                {"assertion_id": f"asrt_{i:03d}", "result": "pass", "tier": 1}
+                for i in range(16, 57)
+            ],
+        )
+        for run in (run2, run3):
+            run["content_integrity"]["key_source"] = "orphan"
+            run["content_integrity"]["public_key_pem"] = ""
+        results = [
+            {"assertion_id": f"asrt_{i:03d}", "result": "pass", "tier": 1,
+             "control_id": "c1"}
+            for i in range(1, 57)
+        ]
+        health = {
+            "assertions_verified": 56,
+            "assertions_run_covered": 6,
+            "assertions_manifest_only": 50,
+            "runs_embedded": 3,
+            "runs_orphan_key": 2,
+            "runs_unverifiable_serialization": 0,
+            "runs_sigstore": 1,
+        }
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1, run2, run3], results=results,
+            provenance_health=health,
+        )
+        bp, vp = self._patch_sigstore_statement(bind_hex)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "VERIFIED sigstore: yes" in out_flat
+        assert out_flat.count("UNRESOLVED KEY") >= 2
+        # 9 + 41 determinations across the two non-verified runs.
+        assert (
+            "50 assertion(s) are determined by embedded runs that could "
+            "not be fully verified" in out_flat
+        )
+        assert "disagreement" not in out_flat.lower()
+        assert "TAMPER" not in out_flat
+
     # ----- Manifest-only cross-check -----
 
     def test_manifest_only_assertions_reported_with_hint(self, tmp_path):

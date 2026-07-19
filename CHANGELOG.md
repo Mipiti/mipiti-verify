@@ -86,6 +86,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Per-run Sigstore bundle binding uses the run entry's
+  `bundle_bind_hash`, matching the top-level bundle-bind check. The
+  bundle's in-toto Subject digest is minted over the bundle-bind
+  value, a different hash domain from `results_hash` (which binds the
+  run's frozen `results_canonical` bytes); comparing the Subject
+  digest against `results_hash` mismatches on every well-formed
+  bundle, so every Sigstore-attested contributing run false-failed as
+  `TAMPER-MISMATCH`. A genuine Subject-digest vs `bundle_bind_hash`
+  mismatch remains the tamper signal; a per-run bundle with no
+  `bundle_bind_hash` to bind against is reported as unbindable
+  (warning-grade, `sigstore: unbound`) and the run's hash + signature
+  path carries its verification.
+- The top-level Sigstore block no longer prints `Certificate: (none)`
+  for Fulcio-issued certificates, whose X.509 subject is empty by
+  design (the identity lives in the SAN extension). The subject is
+  printed when populated, the SAN URIs otherwise, and the line is
+  omitted when neither is available.
 - The provenance-health cross-check now uses the producer's coverage
   semantics: an assertion counts as run-covered only when its
   status-determining run passed the auditor-side verification (hash +
