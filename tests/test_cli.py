@@ -4612,27 +4612,18 @@ class TestAuditPackManifest:
         # Legacy signature still verifies.
         assert "Verdict: VERIFIED" in result.output
 
-    def test_unknown_section_in_manifest_is_forward_compatible(self, tmp_path):
-        """A manifest carrying a section name this verifier doesn't
-        know is forward-compatible: log a warning, skip the unknown
-        section, verify the rest. Avoids hard-failing on packs from
-        newer backends with new section types."""
+    @staticmethod
+    def _resign_manifest(pkg: dict, key) -> None:
+        """Recompute manifest_hash over the (possibly mutated) manifest
+        and re-sign it with `key`, in place."""
         import base64
         import hashlib
         import json as _j
 
-        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec
 
-        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
-        with open(path, encoding="utf-8") as f:
-            pkg = _j.load(f)
-        # Inject a fictitious future section into the manifest. Resign
-        # the manifest with the same key so the signature still
-        # verifies — only the section-name unknown-ness is being
-        # tested here.
         manifest = pkg["content_integrity"]["manifest"]
-        manifest["sections"]["future_section_v2"] = "sha256:" + ("ab" * 32)
         manifest_canonical = _j.dumps(
             manifest, sort_keys=True, separators=(",", ":"),
         )
@@ -4640,19 +4631,131 @@ class TestAuditPackManifest:
             "sha256:" + hashlib.sha256(manifest_canonical.encode()).hexdigest()
         )
         mfsig = key.sign(manifest_hash.encode(), ec.ECDSA(hashes.SHA256()))
-        pkg["content_integrity"]["manifest"] = manifest
         pkg["content_integrity"]["manifest_hash"] = manifest_hash
         pkg["content_integrity"]["manifest_signature"] = (
             base64.b64encode(mfsig).decode()
         )
+
+    def test_section_named_in_manifest_but_missing_from_pack_fails(
+        self, tmp_path,
+    ):
+        """A manifest entry for a section the pack doesn't carry is a
+        failure regardless of the section name — the signed manifest
+        claims content the pack omits. There is no unknown-section
+        skip: section hashes are canonical-JSON by contract, so every
+        claimed section is recomputable."""
+        import json as _j
+
+        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        manifest = pkg["content_integrity"]["manifest"]
+        manifest["sections"]["future_section_v2"] = "sha256:" + ("ab" * 32)
+        self._resign_manifest(pkg, key)
         with open(path, "w", encoding="utf-8") as f:
             _j.dump(pkg, f)
         runner = CliRunner()
         result = runner.invoke(main, ["audit", path])
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         out_flat = " ".join(result.output.split())
-        assert "Unknown section 'future_section_v2'" in out_flat
+        assert "Unknown section" not in out_flat
+        assert (
+            "section 'future_section_v2' is in manifest but missing"
+            in out_flat
+        )
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_generic_recompute_verifies_synthetic_section(self, tmp_path):
+        """The verifier recomputes ANY manifest-claimed section
+        generically (canonical-JSON hash of the section exactly as
+        present in the package) — including section names it has no
+        specific knowledge of."""
+        import json as _j
+
+        from mipiti_verify.cli import _canonical_section_hash
+
+        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        section_content = {"entries": [{"id": "z1", "value": 42}], "v": 2}
+        pkg["zz_synthetic_section"] = section_content
+        manifest = pkg["content_integrity"]["manifest"]
+        manifest["sections"]["zz_synthetic_section"] = (
+            _canonical_section_hash(section_content)
+        )
+        self._resign_manifest(pkg, key)
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Unknown section" not in out_flat
         assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
+
+    def test_generic_recompute_catches_tamper_in_synthetic_section(
+        self, tmp_path,
+    ):
+        """Tampering a section the verifier has no specific knowledge
+        of is caught by the generic recompute and named."""
+        import json as _j
+
+        from mipiti_verify.cli import _canonical_section_hash
+
+        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        section_content = {"entries": [{"id": "z1", "value": 42}], "v": 2}
+        pkg["zz_synthetic_section"] = section_content
+        manifest = pkg["content_integrity"]["manifest"]
+        manifest["sections"]["zz_synthetic_section"] = (
+            _canonical_section_hash(section_content)
+        )
+        self._resign_manifest(pkg, key)
+        # Tamper the section AFTER the manifest was signed.
+        pkg["zz_synthetic_section"]["entries"][0]["value"] = 43
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Section tamper" in out_flat
+        assert "'zz_synthetic_section'" in out_flat
+        assert "Audit-pack manifest: FAILED" in out_flat
+
+    def test_run_provenance_sections_verify_in_manifest(self, tmp_path):
+        """`functional_tests`, `assertions_by_functional_test`,
+        `contributing_runs`, and `provenance_health` verify like any
+        other manifest section — no unknown-section skip."""
+        import json as _j
+
+        from mipiti_verify.cli import _canonical_section_hash
+
+        path, key, _ = self._build_pkg(tmp_path, with_manifest=True)
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        extra_sections = {
+            "functional_tests": [],
+            "assertions_by_functional_test": {},
+            "contributing_runs": [],
+            "provenance_health": {"runs_embedded": 0},
+        }
+        manifest = pkg["content_integrity"]["manifest"]
+        for name, content in extra_sections.items():
+            pkg[name] = content
+            manifest["sections"][name] = _canonical_section_hash(content)
+        self._resign_manifest(pkg, key)
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Unknown section" not in out_flat
+        assert "Manifest verified" in out_flat
+        assert "Audit-pack manifest: VERIFIED" in out_flat
 
     # ----- Legacy-path deprecation advisory -----
 
@@ -5186,7 +5289,9 @@ class TestContributingRunsProvenance:
 
     def test_results_hash_mismatch_hint(self, tmp_path):
         """The top-level results-hash mismatch line carries the
-        untrusted-run remediation hint."""
+        untrusted-run remediation hint. This is the no-contributing-runs
+        (old envelope) behavior: the legacy pair is the only content
+        binding available, so a mismatch stays tamper-shaped."""
         import json as _j
 
         results = [
@@ -5208,6 +5313,130 @@ class TestContributingRunsProvenance:
             "Treat this run as untrusted; ask the report issuer to re-run "
             "verification in CI and re-export." in out_flat
         )
+
+    # ----- Legacy pair superseded by per-run verification -----
+
+    def test_legacy_hash_mismatch_not_scored_when_runs_present(self, tmp_path):
+        """When the envelope embeds contributing runs, a divergence on
+        the deprecated top-level results_hash pair is rendered
+        informationally (not scored) — no tamper language, no
+        remediation line, verdict unaffected. Tamper conclusions come
+        solely from the per-run checks."""
+        import json as _j
+
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+        )
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        # Diverge the accumulated results view from the legacy stored
+        # hash without touching the per-run canonical bytes.
+        pkg["verification_run"]["results"][0]["details"] = "accumulated-view"
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Hash match: NOT SCORED" in out_flat
+        assert "superseded by per-run verification below" in out_flat
+        assert "results may have been modified" not in out_flat
+        assert "Treat this run as untrusted" not in out_flat
+        assert "Verdict: FAILED" not in result.output
+        # Per-run verification remains the scored check.
+        assert "run run-aaaa" in out_flat
+        assert "VERIFIED sigstore: no" in out_flat
+
+    def test_per_run_tamper_still_fails_when_legacy_pair_not_scored(
+        self, tmp_path,
+    ):
+        """The softened legacy pair never masks per-run tampering: a
+        run whose canonical bytes were modified still fails the audit."""
+        import json as _j
+
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        run1["results_canonical"] = run1["results_canonical"].replace(
+            '"pass"', '"fail"',
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+        )
+        with open(path, encoding="utf-8") as f:
+            pkg = _j.load(f)
+        pkg["verification_run"]["results"][0]["details"] = "accumulated-view"
+        with open(path, "w", encoding="utf-8") as f:
+            _j.dump(pkg, f)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Hash match: NOT SCORED" in out_flat
+        assert "TAMPER-MISMATCH" in out_flat
+        assert "Verdict: FAILED" in result.output
+
+    # ----- Additive provenance_health fields -----
+
+    def test_health_panel_tolerates_and_displays_additive_fields(
+        self, tmp_path,
+    ):
+        """New provenance_health keys (verified_as_of,
+        attestations_near_expiry, attestations_expired) are displayed
+        when present; unrecognized keys never break rendering."""
+        k1 = self._keypair()
+        run1 = self._signed_run(
+            k1, "run-aaaa1111", [
+                {"assertion_id": "asrt_001", "result": "pass", "tier": 1},
+            ],
+        )
+        results = [
+            {"assertion_id": "asrt_001", "result": "pass", "tier": 1,
+             "control_id": "c1"},
+        ]
+        health = {
+            "assertions_verified": 1,
+            "assertions_run_covered": 1,
+            "assertions_manifest_only": 0,
+            "runs_embedded": 1,
+            "runs_orphan_key": 0,
+            "runs_unverifiable_serialization": 0,
+            "runs_sigstore": 0,
+            "resolution_window_truncated": False,
+            "warnings": [],
+            "verified_as_of": "2026-07-18T09:00:00+00:00",
+            "attestations_near_expiry": 2,
+            "attestations_expired": 0,
+            "zz_future_disclosure_key": {"nested": True},
+        }
+        path, _ = self._build_pkg(
+            tmp_path, contributing_runs=[run1], results=results,
+            provenance_health=health,
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", path])
+        assert result.exit_code == 0, result.output
+        out_flat = " ".join(result.output.split())
+        assert "Verified as of: 2026-07-18T09:00:00+00:00" in out_flat
+        assert "Attestations near expiry: 2" in out_flat
+        assert "Attestations expired: 0" in out_flat
 
 
 class TestDocSignatureRemediationHint:
