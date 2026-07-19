@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The provenance-health cross-check now uses the producer's coverage
+  semantics: an assertion counts as run-covered only when its
+  status-determining run passed the auditor-side verification (hash +
+  resolved signature, or a verified Sigstore bundle). Previously the
+  cross-check counted mere embedding — a report whose embedded runs
+  all failed key resolution was reported as a false "Producer
+  disclosure disagreement" against a correct
+  `assertions_manifest_only` disclosure. Genuine disagreements
+  (producer claiming coverage the auditor cannot verify) are still
+  flagged.
+- The "assertions determined by embedded runs that could not be fully
+  verified" summary now sums determinations across ALL non-verified
+  embedded runs; previously it was intersected with the report's
+  accumulated assertion records, undercounting when several runs
+  failed verification.
 - The deprecated top-level results-hash pair no longer produces
   tamper-shaped output when the envelope embeds contributing runs.
   With run-level provenance present, the accumulated
