@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import sys
 import time
@@ -148,13 +150,118 @@ def _capture_stderr(call):
     with a stderr handler, those still hit ``sys.stderr`` and are
     captured here. C-extensions writing to raw fd 2 are out of scope.
     """
-    import contextlib
     import io
 
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
         result = call()
     return result, buf.getvalue()
+
+
+class _NoOpPolicyNoticeFilter(logging.Filter):
+    """Drop sigstore-python's no-op-policy notice, and only that notice.
+
+    When no identity is pinned, the verifier deliberately runs the
+    library's no-op identity policy and prints its own SKIPPED block
+    describing exactly what was and wasn't checked (the cryptographic
+    chain IS verified; only the SAN/issuer match is skipped). The
+    library's blanket "unsafe (no-op) verification policy used! no
+    verification performed!" notice contradicts that explanation, so it
+    is filtered out around the verification call. Every other record
+    the library logs passes through unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "unsafe (no-op) verification policy" not in record.getMessage()
+
+
+@contextlib.contextmanager
+def _suppress_noop_policy_notice():
+    """Suppress the sigstore no-op-policy notice around a verify call.
+
+    sigstore-python emits the notice from its policy module's logger at
+    verification time (``UnsafeNoOp.verify``). The filter is installed
+    on that specific logger for the duration of the call only — this is
+    a targeted removal of one misleading message, not a blanket stderr
+    or logging silence.
+    """
+    logger = logging.getLogger("sigstore.verify.policy")
+    filt = _NoOpPolicyNoticeFilter()
+    logger.addFilter(filt)
+    try:
+        yield
+    finally:
+        logger.removeFilter(filt)
+
+
+class _AuditRender:
+    """Output-mode coordinator for the ``audit`` command.
+
+    Two modes:
+
+    - **summary** (default): a verdict-first workpaper summary. The
+      compact cryptographic evidence blocks (provenance, content
+      integrity, manifest) are captured while verification runs and
+      replayed after the summary sections; per-assertion and per-CO
+      enumerations are replaced by counts, with detail auto-expanded
+      only for elements that fail or degrade.
+    - **full** (``--full``): the exhaustive evidence listing, printed
+      in verification order. Capture calls are no-ops in this mode.
+
+    Verification logic and exit codes are identical in both modes —
+    only rendering differs.
+
+    ``abort_flush`` is the safety net: if the command exits while a
+    capture is open (any abort path), every captured byte is flushed to
+    the real output so failure evidence is never lost.
+    """
+
+    def __init__(self, full: bool) -> None:
+        self.full = full
+        self.caveats: list[tuple[str, str | None]] = []
+        self._saved: list[str] = []
+        self._capturing = False
+
+    @property
+    def summary(self) -> bool:
+        return not self.full
+
+    def caveat(self, message: str, hint: str | None = None) -> None:
+        self.caveats.append((message, hint))
+
+    def capture_begin(self) -> None:
+        if self.full:
+            return
+        console.begin_capture()
+        self._capturing = True
+
+    def capture_keep(self) -> None:
+        """End the current capture segment and save it for replay."""
+        if not self._capturing:
+            return
+        self._capturing = False
+        self._saved.append(console.end_capture())
+
+    def capture_discard(self) -> None:
+        """End the current capture segment and drop it (the summary
+        renders its own condensed form from structured data)."""
+        if not self._capturing:
+            return
+        self._capturing = False
+        console.end_capture()
+
+    def take_saved(self) -> str:
+        text = "".join(self._saved)
+        self._saved = []
+        return text
+
+    def abort_flush(self) -> None:
+        if self._capturing:
+            self._capturing = False
+            self._saved.append(console.end_capture())
+        text = self.take_saved()
+        if text:
+            console.file.write(text)
 
 
 def _windows_symlink_privilege_remediation(exc: BaseException) -> str | None:
@@ -1588,6 +1695,112 @@ def _audit_pdf_report(
 # ---------------------------------------------------------------------------
 
 
+def _composition_entity_table(eff_entities: dict) -> Table:
+    """Build the own-vs-inherited effective-entities table."""
+    entity_table = Table(
+        show_header=True, header_style="bold", box=None, pad_edge=False
+    )
+    entity_table.add_column("Kind")
+    entity_table.add_column("Own", justify="right")
+    entity_table.add_column("Inherited", justify="right")
+    entity_table.add_column("Total", justify="right")
+    kinds = (
+        "trust_boundaries", "assets", "attackers",
+        "components", "attack_paths", "assumptions",
+    )
+    for kind in kinds:
+        entries = eff_entities.get(kind, [])
+        if not isinstance(entries, list):
+            entries = []
+        own = sum(
+            1 for e in entries
+            if isinstance(e, dict) and e.get("origin") == "own"
+        )
+        inherited = sum(
+            1 for e in entries
+            if isinstance(e, dict) and e.get("origin") != "own"
+        )
+        total = len(entries)
+        entity_table.add_row(
+            kind, str(own),
+            f"[cyan]{inherited}[/cyan]" if inherited else "0",
+            str(total),
+        )
+    return entity_table
+
+
+def _render_composition_summary(comp: dict) -> None:
+    """Render the condensed composition view for the summary output.
+
+    Entity table plus single-line aggregates only — the per-CO
+    contributing-control enumeration and the inheritance-binding rows
+    are available via ``--full``. An unavailable composition section is
+    reported through the caveats list by the caller, so this renders
+    nothing in that case.
+    """
+    if comp.get("available") is False:
+        return
+
+    console.print()
+    console.print("[bold]Composition (recursive-tree effective view)[/bold]")
+
+    tree = comp.get("tree") if isinstance(comp.get("tree"), dict) else {}
+    parent_id = tree.get("parent_id")
+    depth = tree.get("depth", 0)
+    if not parent_id and depth == 0:
+        console.print("  [dim]Flat model (no parent)[/dim]")
+    else:
+        console.print(
+            f"  Tree position: parent {parent_id or '<none>'}, depth {depth}"
+        )
+
+    eff_entities_raw = comp.get("effective_entities")
+    eff_entities = eff_entities_raw if isinstance(eff_entities_raw, dict) else {}
+    if eff_entities:
+        console.print("\n  [bold]Effective entities[/bold] (own vs inherited)")
+        console.print(_composition_entity_table(eff_entities))
+
+    eff_cos_raw = comp.get("effective_control_objectives")
+    eff_cos = eff_cos_raw if isinstance(eff_cos_raw, list) else []
+    if eff_cos:
+        own_cos = sum(
+            1 for co in eff_cos
+            if isinstance(co, dict) and co.get("origin") == "own"
+        )
+        cross_cos = sum(
+            1 for co in eff_cos
+            if isinstance(co, dict) and co.get("origin") == "cross"
+        )
+        inh_cos = sum(
+            1 for co in eff_cos
+            if isinstance(co, dict) and co.get("origin") == "inherited"
+        )
+        console.print(
+            f"\n  [bold]Effective control objectives[/bold]: "
+            f"{len(eff_cos)} total — {own_cos} own, "
+            f"[cyan]{cross_cos} cross[/cyan], [cyan]{inh_cos} inherited[/cyan]"
+        )
+
+    cov_raw = comp.get("effective_coverage")
+    coverage = cov_raw if isinstance(cov_raw, list) else []
+    if coverage:
+        covered = sum(
+            1 for c in coverage if isinstance(c, dict) and c.get("is_covered")
+        )
+        console.print(
+            f"  [bold]Effective coverage[/bold]: "
+            f"{covered}/{len(coverage)} CO(s) covered"
+        )
+
+    bindings_raw = comp.get("inheritance_bindings")
+    bindings = bindings_raw if isinstance(bindings_raw, list) else []
+    if bindings:
+        console.print(
+            f"  Inheritance bindings: {len(bindings)} cross-model credit "
+            f"link(s) [dim](--full enumerates each binding)[/dim]"
+        )
+
+
 def _render_composition(comp: dict) -> bool:
     """Render the audit-pack ``composition`` section.
 
@@ -1648,34 +1861,7 @@ def _render_composition(comp: dict) -> bool:
     eff_entities = eff_entities_raw if isinstance(eff_entities_raw, dict) else {}
     if eff_entities:
         console.print("\n  [bold]Effective entities[/bold] (own vs inherited)")
-        entity_table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
-        entity_table.add_column("Kind")
-        entity_table.add_column("Own", justify="right")
-        entity_table.add_column("Inherited", justify="right")
-        entity_table.add_column("Total", justify="right")
-        kinds = (
-            "trust_boundaries", "assets", "attackers",
-            "components", "attack_paths", "assumptions",
-        )
-        for kind in kinds:
-            entries = eff_entities.get(kind, [])
-            if not isinstance(entries, list):
-                entries = []
-            own = sum(
-                1 for e in entries
-                if isinstance(e, dict) and e.get("origin") == "own"
-            )
-            inherited = sum(
-                1 for e in entries
-                if isinstance(e, dict) and e.get("origin") != "own"
-            )
-            total = len(entries)
-            entity_table.add_row(
-                kind, str(own),
-                f"[cyan]{inherited}[/cyan]" if inherited else "0",
-                str(total),
-            )
-        console.print(entity_table)
+        console.print(_composition_entity_table(eff_entities))
 
     # Effective control objectives ------------------------------------
     eff_cos_raw = comp.get("effective_control_objectives")
@@ -2224,6 +2410,65 @@ def _render_provenance_health(ph: dict) -> None:
     )
 
 
+def _provenance_health_caveats(ph: dict) -> list[tuple[str, str | None]]:
+    """Extract caveat entries from the producer's ``provenance_health``
+    disclosure for the summary output's Caveats section.
+
+    Returns ``(message, remediation_hint_or_None)`` tuples. The full
+    output renders the whole panel instead (``_render_provenance_health``).
+    """
+    out: list[tuple[str, str | None]] = []
+    warnings = ph.get("warnings")
+    if isinstance(warnings, list):
+        for w in warnings:
+            if isinstance(w, str) and w.strip():
+                out.append((f"Producer warning: {w}", None))
+    if ph.get("resolution_window_truncated"):
+        out.append((
+            "Resolution window truncated — the embedded run history does "
+            "not reach back to every assertion's status-determining run.",
+            None,
+        ))
+    near_expiry = ph.get("attestations_near_expiry")
+    if isinstance(near_expiry, int) and near_expiry > 0:
+        out.append((f"{near_expiry} attestation(s) near expiry.", None))
+    expired = ph.get("attestations_expired")
+    if isinstance(expired, int) and expired > 0:
+        out.append((f"{expired} attestation(s) expired.", None))
+    return out
+
+
+def _print_assertion_summary_row(r: dict) -> None:
+    """Print one assertion result row in the summary output.
+
+    Same row shape as the full listing: icon, id, tier, PASS/FAIL,
+    then the full reasoning for failures or the first sentence for
+    passes. Pure rendering — verdict accounting happens elsewhere.
+    """
+    passed = r.get("result") == "pass"
+    icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
+    tier = r.get("tier", "?")
+    details_raw = r.get("details", "")
+    details = details_raw if isinstance(details_raw, str) else ""
+    reasoning_raw = r.get("reasoning", details)
+    reasoning = reasoning_raw if isinstance(reasoning_raw, str) else ""
+    aid = r.get("assertion_id", "<unknown>")
+    console.print(
+        f"    {icon} {aid}  Tier {tier} {'PASS' if passed else 'FAIL'}"
+    )
+    if reasoning:
+        if not passed:
+            for line in reasoning.split("\n"):
+                console.print(f"      {line}")
+        else:
+            first_line = (
+                reasoning.split(".")[0] + "."
+                if "." in reasoning
+                else reasoning[:100]
+            )
+            console.print(f"      {first_line}")
+
+
 def _verify_run_sigstore_bundle(
     bundle_json: str,
     bundle_bind_hash: str,
@@ -2281,7 +2526,10 @@ def _verify_run_sigstore_bundle(
             return policy.UnsafeNoOp()
 
         sig_policy, _ = _capture_stderr(_build_policy)
-        payload_type, payload_bytes = verifier.verify_dsse(bundle, sig_policy)
+        with _suppress_noop_policy_notice():
+            payload_type, payload_bytes = verifier.verify_dsse(
+                bundle, sig_policy
+            )
         if payload_type != "application/vnd.in-toto+json":
             return (
                 False,
@@ -2377,6 +2625,9 @@ def _verify_contributing_runs(
     run_covered_aids: set = set()
     verified_covered_aids: set = set()
     reconstructed: dict = {}
+    # One entry per well-formed run, mirroring the printed one-liner +
+    # notes. The summary output mode re-renders runs from this list.
+    display_rows: list[dict] = []
 
     for entry in runs:
         if not isinstance(entry, dict):
@@ -2606,16 +2857,22 @@ def _verify_contributing_runs(
             sigstore_str = "failed"
         else:
             sigstore_str = "no"
-        console.print(
+        note_style = "red" if status == _RUN_STATUS_TAMPER else "yellow"
+        run_line = (
             f"  run {short}  {submitted}  {provider}"
             f"{('/' + sha[:12]) if sha else ''}  "
             f"{len(aids)} assertion(s)  "
             f"{_RUN_STATUS_MARKUP[status]}  sigstore: {sigstore_str}"
         )
+        console.print(run_line)
         for message, hint in notes:
-            style = "red" if status == _RUN_STATUS_TAMPER else "yellow"
-            console.print(f"      [{style}]{message}[/{style}]")
+            console.print(f"      [{note_style}]{message}[/{note_style}]")
             _remediation_hint(hint)
+        display_rows.append({
+            "line": run_line,
+            "status": status,
+            "notes": [(m, h, note_style) for m, h in notes],
+        })
 
         if status == _RUN_STATUS_VERIFIED:
             verified_covered_aids.update(aids)
@@ -2696,6 +2953,7 @@ def _verify_contributing_runs(
         "total": len(runs),
         "counts": counts,
         "malformed": malformed,
+        "display_rows": display_rows,
         "sigstore_verified": sigstore_verified_count,
         "verified_assertion_ids": verified_covered_aids,
         "manifest_only": manifest_only,
@@ -2970,6 +3228,22 @@ def _verify_contributing_runs(
         "pattern as Sigstore bundle missing / signature INVALID."
     ),
 )
+@click.option(
+    "--full",
+    "full_output",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print the exhaustive evidence listing in verification order: "
+        "per-assertion result detail, the full composition/coverage "
+        "enumeration with per-CO contributing controls, the "
+        "inheritance-binding rows, and the producer's provenance-health "
+        "panel. Without this flag the audit prints a verdict-first "
+        "summary that shows counts and auto-expands detail only for "
+        "elements that fail or degrade. Exit codes are identical in "
+        "both modes; scripted consumers should gate on the exit code."
+    ),
+)
 def audit(
     package_file: str,
     key_url: str,
@@ -2989,6 +3263,7 @@ def audit(
     rekor_entry_snapshot_dir: str | None,
     require_verification: bool,
     allow_orphan_results: bool,
+    full_output: bool,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
 
@@ -3041,6 +3316,61 @@ def audit(
     live Mipiti or Rekor access required. Mutually exclusive with
     --rekor-anchor (URL-based one-shot vs directory-based search).
     """
+    render = _AuditRender(full=full_output)
+    try:
+        _audit_impl(
+            package_file=package_file,
+            key_url=key_url,
+            sigstore_tuf_url=sigstore_tuf_url,
+            sigstore_trust_config_path=sigstore_trust_config_path,
+            expected_model_id=expected_model_id,
+            expected_commit_sha=expected_commit_sha,
+            expected_ci_identity=expected_ci_identity,
+            ci_identity_from_env=ci_identity_from_env,
+            expected_issuer=expected_issuer,
+            expected_workspace_key_fingerprint=expected_workspace_key_fingerprint,
+            expected_customer_key_path=expected_customer_key_path,
+            platform_pubkey_path=platform_pubkey_path,
+            rekor_anchor_url=rekor_anchor_url,
+            expected_anchor_identity=expected_anchor_identity,
+            expected_anchor_issuer=expected_anchor_issuer,
+            rekor_entry_snapshot_dir=rekor_entry_snapshot_dir,
+            require_verification=require_verification,
+            allow_orphan_results=allow_orphan_results,
+            render=render,
+        )
+    finally:
+        # Any abort path (usage error, hard verification failure, an
+        # unexpected exception) while a summary capture is open must
+        # still surface every captured byte — failure evidence is never
+        # lost to the capture buffer.
+        render.abort_flush()
+
+
+def _audit_impl(
+    *,
+    package_file: str,
+    key_url: str,
+    sigstore_tuf_url: str | None,
+    sigstore_trust_config_path: str | None,
+    expected_model_id: str | None,
+    expected_commit_sha: str | None,
+    expected_ci_identity: str | None,
+    ci_identity_from_env: bool,
+    expected_issuer: str | None,
+    expected_workspace_key_fingerprint: str | None,
+    expected_customer_key_path: str | None,
+    platform_pubkey_path: str | None,
+    rekor_anchor_url: str | None,
+    expected_anchor_identity: str | None,
+    expected_anchor_issuer: str | None,
+    rekor_entry_snapshot_dir: str | None,
+    require_verification: bool,
+    allow_orphan_results: bool,
+    render: _AuditRender,
+) -> None:
+    """Audit-command implementation. See ``audit`` for the contract;
+    ``render`` selects between the summary and full output modes."""
     # Resolve --ci-identity-from-env to an explicit SAN. Precedence:
     # explicit flag (or MIPITI_VERIFY_CI_IDENTITY env var) > auto-derive
     # flag > none. When both are set we surface a notice on divergence
@@ -3400,6 +3730,12 @@ def audit(
         )
         raise SystemExit(1)
 
+    # Summary mode captures the cryptographic evidence blocks
+    # (provenance, content integrity, manifest, key-source dispatch)
+    # while verification runs and replays them verbatim after the
+    # summary sections, so the verdict leads and the compact evidence
+    # detail follows. Full mode prints in verification order.
+    render.capture_begin()
     console.print("\n[bold]Audit Package Verification[/bold]")
     console.print("=" * 40)
     has_failure = False
@@ -3504,18 +3840,18 @@ def audit(
                     has_failure = True
                 else:
                     try:
-                        # Construct the identity policy under stderr
-                        # capture: sigstore-python's `UnsafeNoOp`
-                        # prints "unsafe (no-op) verification policy
-                        # used! no verification performed!" to stderr
-                        # at INSTANTIATION time, not at verify_dsse
-                        # call time. Without capture the warning
-                        # prints between our "Provenance (Sigstore)"
-                        # header and our own status lines, breaking
-                        # the visual flow and contradicting the
-                        # SKIPPED line we'll emit a few lines below.
-                        # The capture lets us frame both as one
-                        # coherent message in the SKIPPED block.
+                        # sigstore-python's `UnsafeNoOp` policy emits
+                        # "unsafe (no-op) verification policy used! no
+                        # verification performed!" — depending on the
+                        # library version either to stderr at policy
+                        # instantiation or via the policy module's
+                        # logger at verify time. Both channels are
+                        # covered: `_capture_stderr` around the
+                        # constructor, `_suppress_noop_policy_notice`
+                        # around the verify call. The message would
+                        # otherwise contradict the SKIPPED block
+                        # emitted below, which states precisely what
+                        # was verified and what was no-op'd.
                         def _build_policy():
                             if expected_ci_identity and resolved_issuer:
                                 return policy.Identity(
@@ -3559,9 +3895,10 @@ def audit(
                         # gives the auditor tamper-evidence on the binding
                         # claim itself — flipping bundle_bind_hash without
                         # also forging the signature is detected here.
-                        payload_type, payload_bytes = verifier.verify_dsse(
-                            bundle, sig_policy
-                        )
+                        with _suppress_noop_policy_notice():
+                            payload_type, payload_bytes = verifier.verify_dsse(
+                                bundle, sig_policy
+                            )
                         if payload_type != "application/vnd.in-toto+json":
                             raise ValueError(
                                 f"unexpected DSSE payload type: {payload_type!r} "
@@ -4490,6 +4827,14 @@ def audit(
             )
             has_failure = True
 
+    # End of the cryptographic evidence blocks — keep the captured
+    # segment for replay after the summary. Everything from here to the
+    # end of the composition section is enumeration detail: in summary
+    # mode it is captured and discarded, and re-rendered as counts from
+    # the structured data below.
+    render.capture_keep()
+    render.capture_begin()
+
     # --- Results ---
     # Normalise pkg sub-fields to their expected types so a forged
     # package with mismatched types (e.g. `"controls": []` instead of
@@ -4781,185 +5126,202 @@ def audit(
         if _render_composition(comp_raw):
             has_failure = True
 
-    # --- Trust contract summary ---
-    console.print()
-    console.print("[bold]Trust contract[/bold]")
-    if provenance_verified:
-        console.print(
-            "  Cryptographic chain:    [green]VERIFIED[/green] "
-            "(Sigstore bundle + Rekor inclusion + bundle-bind)"
-        )
-    elif bundle_json:
-        console.print(
-            "  Cryptographic chain:    [red]FAILED[/red] "
-            "(bundle present but did not verify cleanly)"
-        )
-    else:
-        console.print(
-            "  Cryptographic chain:    [yellow]ABSENT[/yellow] "
-            "(no Sigstore bundle in package)"
-        )
+    # End of the enumeration detail region.
+    render.capture_discard()
+
     # Detect whether the legacy `signature` + `results_hash` fields were
     # populated. The manifest path is the strong, whole-body integrity
     # claim; the legacy fields are kept for one backward-compat release
-    # window and will be removed in a follow-up. Surface the deprecation
-    # status accordingly in the trust-contract summary below.
+    # window and will be removed in a follow-up.
     legacy_fields_present = bool(
         ci and isinstance(ci, dict)
         and ci.get("signature") and ci.get("results_hash")
     )
-    if manifest_verified:
-        if legacy_fields_present:
+
+    # Orphans are a package-integrity failure, not a sufficiency or
+    # cryptographic-chain issue. Default fail-closed (same precedent as
+    # bundle signature INVALID and the --require-verification flag): a
+    # single verdict floating free of any control or assumption means
+    # the auditor can't verify CONSISTENCY of the package, and
+    # consistency is a precondition for trusting any other check.
+    # ``--allow-orphan-results`` lets an auditor who's manually
+    # reviewed the orphans (e.g., known-benign data-migration race)
+    # downgrade the verdict to PARTIALLY VERIFIED.
+    if unmapped_results and not allow_orphan_results:
+        has_failure = True
+
+    # --- Trust contract summary ---
+    def _print_trust_contract() -> None:
+        console.print()
+        console.print("[bold]Trust contract[/bold]")
+        if provenance_verified:
             console.print(
-                "  Audit-pack manifest:    [green]VERIFIED[/green] "
-                "(whole-body coverage via signed section hashes; "
-                "legacy results_hash + signature ignored — deprecated)"
+                "  Cryptographic chain:    [green]VERIFIED[/green] "
+                "(Sigstore bundle + Rekor inclusion + bundle-bind)"
+            )
+        elif bundle_json:
+            console.print(
+                "  Cryptographic chain:    [red]FAILED[/red] "
+                "(bundle present but did not verify cleanly)"
             )
         else:
             console.print(
-                "  Audit-pack manifest:    [green]VERIFIED[/green] "
-                "(whole-body coverage via signed section hashes)"
+                "  Cryptographic chain:    [yellow]ABSENT[/yellow] "
+                "(no Sigstore bundle in package)"
             )
-    elif manifest_present:
-        console.print(
-            "  Audit-pack manifest:    [red]FAILED[/red] "
-            "(manifest fields present but did not verify)"
-        )
-    else:
-        console.print(
-            "  Audit-pack manifest:    [yellow]ABSENT[/yellow] "
-            "(pack predates manifest signing; legacy signature only)"
-        )
-        # Legacy-only verification path: the legacy `signature` over
-        # `results_hash` covers only `verification_run.results`. Model
-        # state, controls, assumptions, assertions, and composition are
-        # NOT signature-bound by the legacy path. Issue an advisory so
-        # the auditor knows the verification scope is narrower than the
-        # manifest path's whole-body coverage, and the pack issuer
-        # should update Mipiti to a release that emits the manifest.
-        # Advisory only — does NOT change the verdict or exit code: the
-        # legacy verification still produces a valid result for what it
-        # covers.
-        if legacy_fields_present:
+        if manifest_verified:
+            if legacy_fields_present:
+                console.print(
+                    "  Audit-pack manifest:    [green]VERIFIED[/green] "
+                    "(whole-body coverage via signed section hashes; "
+                    "legacy results_hash + signature ignored — deprecated)"
+                )
+            else:
+                console.print(
+                    "  Audit-pack manifest:    [green]VERIFIED[/green] "
+                    "(whole-body coverage via signed section hashes)"
+                )
+        elif manifest_present:
             console.print(
-                "  [yellow]WARNING[/yellow] [yellow]Legacy-only "
-                "signature path — verification scope is narrow.[/yellow]"
-            )
-            console.print(
-                "    [yellow]The legacy `signature` over `results_hash` "
-                "binds only `verification_run.results`.[/yellow]"
-            )
-            console.print(
-                "    [yellow]The model definition, controls, assumptions, "
-                "assertions, and composition[/yellow]"
-            )
-            console.print(
-                "    [yellow]section are NOT signature-bound by the "
-                "legacy path — tampering of those[/yellow]"
-            )
-            console.print(
-                "    [yellow]sections is not detected by legacy "
-                "verification alone.[/yellow]"
-            )
-            console.print(
-                "    [yellow]Action: ask the pack issuer (operator) to "
-                "update Mipiti to a release that[/yellow]"
-            )
-            console.print(
-                "    [yellow]emits the signed audit-pack manifest. The "
-                "legacy fields are deprecated and[/yellow]"
-            )
-            console.print(
-                "    [yellow]will be removed in a future "
-                "release.[/yellow]"
-            )
-    if content_verified:
-        console.print(
-            "  Content-integrity sig:  [green]VERIFIED[/green]"
-        )
-    elif content_anchored_in_sigstore:
-        # Sigstore was the authoritative trust anchor for this row and
-        # the inline content_integrity signature was intentionally not
-        # checked. Reporting FAILED here would mis-describe the state:
-        # the signature wasn't tried-and-broken, it was deliberately
-        # skipped because the upstream Sigstore bundle covers the same
-        # claim with a stronger transparency-log proof.
-        console.print(
-            "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
-            "(Sigstore provenance is the trust anchor for this row)"
-        )
-    elif ci and ci.get("signature"):
-        console.print(
-            "  Content-integrity sig:  [red]FAILED[/red] "
-            "(signature present but did not verify)"
-        )
-    elif provenance_verified:
-        console.print(
-            "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
-            "(Sigstore provenance is the trust anchor for this row)"
-        )
-    else:
-        console.print(
-            "  Content-integrity sig:  [yellow]ABSENT[/yellow]"
-        )
-    # Run-level provenance summary. UNKNOWN (not a failure) for
-    # envelopes that predate the contributing-runs disclosure — for
-    # those reports the audit above reflects latest-run evidence only
-    # and run-level provenance coverage is unknown.
-    if run_prov is not None:
-        _ver = run_prov["counts"][_RUN_STATUS_VERIFIED]
-        _total = run_prov["total"]
-        _tamper = run_prov["counts"][_RUN_STATUS_TAMPER]
-        if run_prov["failed"]:
-            console.print(
-                f"  Run-level provenance:   [red]FAILED[/red] "
-                f"({_ver}/{_total} run(s) verified, "
-                f"{_tamper} tamper-mismatch)"
-            )
-        elif _ver == _total and not run_prov["manifest_only"]:
-            console.print(
-                f"  Run-level provenance:   [green]VERIFIED[/green] "
-                f"({_ver}/{_total} run(s), full assertion coverage)"
-            )
-        else:
-            _mo = len(run_prov["manifest_only"])
-            _mo_part = f", {_mo} manifest-only assertion(s)" if _mo else ""
-            console.print(
-                f"  Run-level provenance:   [yellow]PARTIAL[/yellow] "
-                f"({_ver}/{_total} run(s) verified{_mo_part})"
-            )
-    elif run_disclosure_present:
-        console.print(
-            "  Run-level provenance:   [yellow]NONE[/yellow] "
-            "(disclosed, but no contributing runs embedded)"
-        )
-    else:
-        console.print(
-            "  Run-level provenance:   [yellow]UNKNOWN[/yellow] "
-            "(report predates run-level provenance disclosure; "
-            "latest-run evidence only)"
-        )
-    # Auditor pin enforcement.
-    pin_lines = [
-        ("Identity (SAN/issuer):  ", expected_ci_identity, "--expected-ci-identity"),
-        ("Workspace key:          ", expected_workspace_key_fingerprint, "--expected-workspace-key"),
-        ("Model ID:               ", expected_model_id, "--expected-model-id"),
-        ("Commit SHA:             ", expected_commit_sha, "--expected-commit-sha"),
-    ]
-    for label, pin_value, flag_name in pin_lines:
-        if pin_value:
-            # Pinned. Outcome (matched / mismatched / failed) is
-            # already reported in the per-section output above; the
-            # summary states only that the pin was active.
-            console.print(
-                f"  {label}[green]ENFORCED[/green] "
-                f"({flag_name} = {pin_value!r})"
+                "  Audit-pack manifest:    [red]FAILED[/red] "
+                "(manifest fields present but did not verify)"
             )
         else:
             console.print(
-                f"  {label}[yellow]not enforced[/yellow] "
-                f"(supply {flag_name} to gate on this)"
+                "  Audit-pack manifest:    [yellow]ABSENT[/yellow] "
+                "(pack predates manifest signing; legacy signature only)"
             )
+            # Legacy-only verification path: the legacy `signature` over
+            # `results_hash` covers only `verification_run.results`. Model
+            # state, controls, assumptions, assertions, and composition are
+            # NOT signature-bound by the legacy path. Issue an advisory so
+            # the auditor knows the verification scope is narrower than the
+            # manifest path's whole-body coverage, and the pack issuer
+            # should update Mipiti to a release that emits the manifest.
+            # Advisory only — does NOT change the verdict or exit code: the
+            # legacy verification still produces a valid result for what it
+            # covers. The summary mode carries the same advisory in its
+            # Caveats section instead.
+            if legacy_fields_present and render.full:
+                console.print(
+                    "  [yellow]WARNING[/yellow] [yellow]Legacy-only "
+                    "signature path — verification scope is narrow.[/yellow]"
+                )
+                console.print(
+                    "    [yellow]The legacy `signature` over `results_hash` "
+                    "binds only `verification_run.results`.[/yellow]"
+                )
+                console.print(
+                    "    [yellow]The model definition, controls, assumptions, "
+                    "assertions, and composition[/yellow]"
+                )
+                console.print(
+                    "    [yellow]section are NOT signature-bound by the "
+                    "legacy path — tampering of those[/yellow]"
+                )
+                console.print(
+                    "    [yellow]sections is not detected by legacy "
+                    "verification alone.[/yellow]"
+                )
+                console.print(
+                    "    [yellow]Action: ask the pack issuer (operator) to "
+                    "update Mipiti to a release that[/yellow]"
+                )
+                console.print(
+                    "    [yellow]emits the signed audit-pack manifest. The "
+                    "legacy fields are deprecated and[/yellow]"
+                )
+                console.print(
+                    "    [yellow]will be removed in a future "
+                    "release.[/yellow]"
+                )
+        if content_verified:
+            console.print(
+                "  Content-integrity sig:  [green]VERIFIED[/green]"
+            )
+        elif content_anchored_in_sigstore:
+            # Sigstore was the authoritative trust anchor for this row and
+            # the inline content_integrity signature was intentionally not
+            # checked. Reporting FAILED here would mis-describe the state:
+            # the signature wasn't tried-and-broken, it was deliberately
+            # skipped because the upstream Sigstore bundle covers the same
+            # claim with a stronger transparency-log proof.
+            console.print(
+                "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
+                "(Sigstore provenance is the trust anchor for this row)"
+            )
+        elif ci and ci.get("signature"):
+            console.print(
+                "  Content-integrity sig:  [red]FAILED[/red] "
+                "(signature present but did not verify)"
+            )
+        elif provenance_verified:
+            console.print(
+                "  Content-integrity sig:  [yellow]SKIPPED[/yellow] "
+                "(Sigstore provenance is the trust anchor for this row)"
+            )
+        else:
+            console.print(
+                "  Content-integrity sig:  [yellow]ABSENT[/yellow]"
+            )
+        # Run-level provenance summary. UNKNOWN (not a failure) for
+        # envelopes that predate the contributing-runs disclosure — for
+        # those reports the audit above reflects latest-run evidence only
+        # and run-level provenance coverage is unknown.
+        if run_prov is not None:
+            _ver = run_prov["counts"][_RUN_STATUS_VERIFIED]
+            _total = run_prov["total"]
+            _tamper = run_prov["counts"][_RUN_STATUS_TAMPER]
+            if run_prov["failed"]:
+                console.print(
+                    f"  Run-level provenance:   [red]FAILED[/red] "
+                    f"({_ver}/{_total} run(s) verified, "
+                    f"{_tamper} tamper-mismatch)"
+                )
+            elif _ver == _total and not run_prov["manifest_only"]:
+                console.print(
+                    f"  Run-level provenance:   [green]VERIFIED[/green] "
+                    f"({_ver}/{_total} run(s), full assertion coverage)"
+                )
+            else:
+                _mo = len(run_prov["manifest_only"])
+                _mo_part = f", {_mo} manifest-only assertion(s)" if _mo else ""
+                console.print(
+                    f"  Run-level provenance:   [yellow]PARTIAL[/yellow] "
+                    f"({_ver}/{_total} run(s) verified{_mo_part})"
+                )
+        elif run_disclosure_present:
+            console.print(
+                "  Run-level provenance:   [yellow]NONE[/yellow] "
+                "(disclosed, but no contributing runs embedded)"
+            )
+        else:
+            console.print(
+                "  Run-level provenance:   [yellow]UNKNOWN[/yellow] "
+                "(report predates run-level provenance disclosure; "
+                "latest-run evidence only)"
+            )
+        # Auditor pin enforcement.
+        pin_lines = [
+            ("Identity (SAN/issuer):  ", expected_ci_identity, "--expected-ci-identity"),
+            ("Workspace key:          ", expected_workspace_key_fingerprint, "--expected-workspace-key"),
+            ("Model ID:               ", expected_model_id, "--expected-model-id"),
+            ("Commit SHA:             ", expected_commit_sha, "--expected-commit-sha"),
+        ]
+        for label, pin_value, flag_name in pin_lines:
+            if pin_value:
+                # Pinned. Outcome (matched / mismatched / failed) is
+                # already reported in the per-section output above; the
+                # summary states only that the pin was active.
+                console.print(
+                    f"  {label}[green]ENFORCED[/green] "
+                    f"({flag_name} = {pin_value!r})"
+                )
+            else:
+                console.print(
+                    f"  {label}[yellow]not enforced[/yellow] "
+                    f"(supply {flag_name} to gate on this)"
+                )
 
     # --- Verdict ---
     # Emit a verdict that accurately describes what was actually
@@ -4980,24 +5342,44 @@ def audit(
             parts.append(f"{suff_count}/{ctrl_count} controls sufficient")
         return ", ".join(parts)
 
-    console.print()
-    # Orphans are a package-integrity failure, not a sufficiency or
-    # cryptographic-chain issue. Default fail-closed (same precedent as
-    # bundle signature INVALID and the --require-verification flag): a
-    # single verdict floating free of any control or assumption means
-    # the auditor can't verify CONSISTENCY of the package, and
-    # consistency is a precondition for trusting any other check.
-    # ``--allow-orphan-results`` lets an auditor who's manually
-    # reviewed the orphans (e.g., known-benign data-migration race)
-    # downgrade the verdict to PARTIALLY VERIFIED.
-    if unmapped_results and not allow_orphan_results:
-        has_failure = True
-
-    if has_failure or total_fail > 0:
-        if unmapped_results and not allow_orphan_results and total_fail == 0:
-            # Specific framing for the orphan-fail case so the auditor
-            # immediately understands this is an integrity issue, not a
-            # cryptographic-chain failure or assertion verdict failure.
+    def _print_verdict() -> None:
+        console.print()
+        if has_failure or total_fail > 0:
+            if unmapped_results and not allow_orphan_results and total_fail == 0:
+                # Specific framing for the orphan-fail case so the auditor
+                # immediately understands this is an integrity issue, not a
+                # cryptographic-chain failure or assertion verdict failure.
+                verified_parts = []
+                if provenance_verified:
+                    verified_parts.append("provenance authentic")
+                if manifest_verified:
+                    verified_parts.append("pack manifest authentic")
+                if content_verified or content_anchored_in_sigstore:
+                    verified_parts.append("content intact")
+                chain_state = ", ".join(verified_parts) if verified_parts else "no cryptographic chain"
+                console.print(
+                    f"[red bold]Verdict: FAILED[/red bold] — package contains "
+                    f"{len(unmapped_results)} unmappable result(s); refusing to "
+                    f"certify an internally-inconsistent audit."
+                )
+                console.print(
+                    f"  Cryptographic chain itself is INTACT ({chain_state})."
+                )
+                console.print(
+                    "  Each unmappable result's assertion_id appears nowhere in "
+                    "the controls or\n  assumptions blocks. Possible causes: "
+                    "assertion hard-deleted after this run;\n  envelope tampered "
+                    "post-signing; verification run attached to wrong model.\n"
+                    "  To override after manual review of the orphan list above:\n"
+                    "  [bold]mipiti-verify audit ... --allow-orphan-results[/bold]"
+                )
+            else:
+                console.print(f"[red bold]Verdict: FAILED[/red bold] — {_assertion_breakdown()}")
+        elif unmapped_results:
+            # ``--allow-orphan-results`` was supplied. Render as PARTIALLY
+            # VERIFIED with the orphan count so the verdict line still
+            # reflects the package's known inconsistency — overriding the
+            # fail-close shouldn't make the inconsistency invisible.
             verified_parts = []
             if provenance_verified:
                 verified_parts.append("provenance authentic")
@@ -5005,91 +5387,316 @@ def audit(
                 verified_parts.append("pack manifest authentic")
             if content_verified or content_anchored_in_sigstore:
                 verified_parts.append("content intact")
-            chain_state = ", ".join(verified_parts) if verified_parts else "no cryptographic chain"
+            prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
             console.print(
-                f"[red bold]Verdict: FAILED[/red bold] — package contains "
-                f"{len(unmapped_results)} unmappable result(s); refusing to "
-                f"certify an internally-inconsistent audit."
+                f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
+                f"{_assertion_breakdown()} ({len(unmapped_results)} orphan, "
+                f"--allow-orphan-results override active)"
             )
+        elif not provenance_verified and not content_verified and not manifest_verified:
+            # No cryptographic verification ran. Don't claim authenticity.
             console.print(
-                f"  Cryptographic chain itself is INTACT ({chain_state})."
+                f"[yellow bold]Verdict: UNVERIFIED[/yellow bold] — no Sigstore "
+                f"provenance and no content_integrity signature were verified. "
+                f"This package contains no cryptographic evidence of authenticity. "
+                f"{_assertion_breakdown()}"
             )
+        elif ctrl_count > 0 and suff_count < ctrl_count:
+            # Any non-sufficient control (insufficient OR pending) demotes
+            # the verdict to PARTIALLY VERIFIED. "Pending" means the
+            # sufficiency evaluation hasn't completed yet (e.g. the
+            # backend's LLM-collective check is queued); the proof is
+            # incomplete, so claiming a flat VERIFIED would overstate.
+            verified_parts = []
+            if provenance_verified:
+                verified_parts.append("provenance authentic")
+            if manifest_verified:
+                verified_parts.append("pack manifest authentic")
+            if content_verified or content_anchored_in_sigstore:
+                verified_parts.append("content intact")
+            prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+            # Build a precise breakdown of WHY the controls aren't sufficient
+            # so the auditor can act.
+            pending_count = ctrl_count - suff_count - insuff_count
+            breakdown_parts = []
+            if insuff_count > 0:
+                breakdown_parts.append(f"{insuff_count} insufficient")
+            if pending_count > 0:
+                breakdown_parts.append(f"{pending_count} pending")
+            breakdown = " (" + ", ".join(breakdown_parts) + ")" if breakdown_parts else ""
             console.print(
-                "  Each unmappable result's assertion_id appears nowhere in "
-                "the controls or\n  assumptions blocks. Possible causes: "
-                "assertion hard-deleted after this run;\n  envelope tampered "
-                "post-signing; verification run attached to wrong model.\n"
-                "  To override after manual review of the orphan list above:\n"
-                "  [bold]mipiti-verify audit ... --allow-orphan-results[/bold]"
+                f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
+                f"{_assertion_breakdown()}{breakdown}"
             )
         else:
-            console.print(f"[red bold]Verdict: FAILED[/red bold] — {_assertion_breakdown()}")
-    elif unmapped_results:
-        # ``--allow-orphan-results`` was supplied. Render as PARTIALLY
-        # VERIFIED with the orphan count so the verdict line still
-        # reflects the package's known inconsistency — overriding the
-        # fail-close shouldn't make the inconsistency invisible.
-        verified_parts = []
-        if provenance_verified:
-            verified_parts.append("provenance authentic")
-        if manifest_verified:
-            verified_parts.append("pack manifest authentic")
-        if content_verified or content_anchored_in_sigstore:
-            verified_parts.append("content intact")
-        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+            verified_parts = []
+            if provenance_verified:
+                verified_parts.append("provenance authentic")
+            if manifest_verified:
+                verified_parts.append("pack manifest authentic")
+            if content_verified or content_anchored_in_sigstore:
+                verified_parts.append("content intact")
+            prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
+            console.print(
+                f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
+                f"{_assertion_breakdown()}"
+            )
+
+    # --- Summary-mode sections ---
+    # Each renders one block of the workpaper summary from the
+    # structured state collected above. Detail auto-expands only for
+    # elements that failed or degraded; everything else is a count.
+
+    def _register_caveats() -> None:
+        if not bundle_json:
+            render.caveat(
+                "No Sigstore provenance in package.", _HINT_NO_SIGSTORE
+            )
+        if legacy_fields_present and not manifest_present:
+            render.caveat(
+                "Legacy-only signature path — verification scope is "
+                "narrow. The legacy `signature` over `results_hash` binds "
+                "only `verification_run.results`; the model definition, "
+                "controls, assumptions, assertions, and composition "
+                "sections are NOT signature-bound by the legacy path.",
+                "Ask the pack issuer (operator) to update Mipiti to a "
+                "release that emits the signed audit-pack manifest; the "
+                "legacy fields are deprecated.",
+            )
+        if isinstance(provenance_health_raw, dict):
+            for message, hint in _provenance_health_caveats(
+                provenance_health_raw
+            ):
+                render.caveat(message, hint)
+        if run_prov is not None:
+            manifest_only = run_prov["manifest_only"]
+            if manifest_only:
+                sample = ", ".join(sorted(manifest_only)[:10])
+                suffix = ", …" if len(manifest_only) > 10 else ""
+                render.caveat(
+                    f"{len(manifest_only)} manifest-only assertion(s) — "
+                    f"present in the report's assertion records but not "
+                    f"determined by any embedded run: {sample}{suffix}",
+                    _HINT_MANIFEST_ONLY,
+                )
+            if run_prov["unverified_determined"]:
+                render.caveat(
+                    f"{len(run_prov['unverified_determined'])} assertion(s) "
+                    "are determined by embedded runs that could not be "
+                    "fully verified (see run statuses above)."
+                )
+            # Notes attached to VERIFIED runs (e.g. an unbindable
+            # bundle on a run that still verified via hash+signature)
+            # are not shown under the run line in summary mode — they
+            # surface here so nothing warning-grade is dropped.
+            for row in run_prov["display_rows"]:
+                if row["status"] == _RUN_STATUS_VERIFIED:
+                    for message, hint, _style in row["notes"]:
+                        render.caveat(message, hint)
+        if isinstance(comp_raw, dict):
+            if comp_raw.get("available") is False:
+                err = comp_raw.get("error", "composition_compute_failed")
+                render.caveat(
+                    f"Composition unavailable: {err} — the rest of the "
+                    "audit pack (controls, assertions, sufficiency) is "
+                    "unaffected; composition is an additive view."
+                )
+            dangling = comp_raw.get("dangling_override_linkages")
+            if isinstance(dangling, int) and dangling > 0:
+                render.caveat(
+                    f"{dangling} dangling override linkage(s) — inherited "
+                    "assumption overrides whose linked CO ids do not "
+                    "resolve to an effective CO. Review the ancestor "
+                    "models for CO renames or deletions that broke the "
+                    "link."
+                )
+
+    def _print_runs_summary() -> None:
+        if run_prov is None:
+            if isinstance(contributing_runs_raw, list):
+                # Disclosed run-level provenance with zero embedded runs.
+                console.print("\n[bold]Contributing runs (0)[/bold]")
+                console.print(
+                    "  [yellow]The report discloses run-level provenance "
+                    "but embeds no contributing runs.[/yellow]"
+                )
+            return
         console.print(
-            f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
-            f"{_assertion_breakdown()} ({len(unmapped_results)} orphan, "
-            f"--allow-orphan-results override active)"
+            f"\n[bold]Contributing runs ({run_prov['total']})[/bold]"
         )
-    elif not provenance_verified and not content_verified and not manifest_verified:
-        # No cryptographic verification ran. Don't claim authenticity.
-        console.print(
-            f"[yellow bold]Verdict: UNVERIFIED[/yellow bold] — no Sigstore "
-            f"provenance and no content_integrity signature were verified. "
-            f"This package contains no cryptographic evidence of authenticity. "
-            f"{_assertion_breakdown()}"
+        if run_prov["malformed"]:
+            _m = run_prov["malformed"]
+            console.print(
+                f"  [red]{_m} malformed contributing_runs entr"
+                f"{'y' if _m == 1 else 'ies'} (not an object) — treating "
+                "as failure.[/red]"
+            )
+        for row in run_prov["display_rows"]:
+            console.print(row["line"])
+            if row["status"] != _RUN_STATUS_VERIFIED:
+                for message, hint, style in row["notes"]:
+                    console.print(f"      [{style}]{message}[/{style}]")
+                    _remediation_hint(hint)
+        reconstructed = run_prov["reconstructed"]
+        if reconstructed:
+            rec_pass = sum(1 for v in reconstructed.values() if v == "pass")
+            console.print(
+                f"  Reconstructed from verified runs: "
+                f"{len(reconstructed)} assertion result(s) "
+                f"([green]{rec_pass} pass[/green], "
+                f"[red]{len(reconstructed) - rec_pass} fail[/red])"
+            )
+
+    def _print_disclosure_crosscheck() -> None:
+        if run_prov is None:
+            return
+        console.print("\n[bold]Producer-disclosure cross-check[/bold]")
+        ph = (
+            provenance_health_raw
+            if isinstance(provenance_health_raw, dict)
+            else None
         )
-    elif ctrl_count > 0 and suff_count < ctrl_count:
-        # Any non-sufficient control (insufficient OR pending) demotes
-        # the verdict to PARTIALLY VERIFIED. "Pending" means the
-        # sufficiency evaluation hasn't completed yet (e.g. the
-        # backend's LLM-collective check is queued); the proof is
-        # incomplete, so claiming a flat VERIFIED would overstate.
-        verified_parts = []
-        if provenance_verified:
-            verified_parts.append("provenance authentic")
-        if manifest_verified:
-            verified_parts.append("pack manifest authentic")
-        if content_verified or content_anchored_in_sigstore:
-            verified_parts.append("content intact")
-        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
-        # Build a precise breakdown of WHY the controls aren't sufficient
-        # so the auditor can act.
-        pending_count = ctrl_count - suff_count - insuff_count
-        breakdown_parts = []
-        if insuff_count > 0:
-            breakdown_parts.append(f"{insuff_count} insufficient")
-        if pending_count > 0:
-            breakdown_parts.append(f"{pending_count} pending")
-        breakdown = " (" + ", ".join(breakdown_parts) + ")" if breakdown_parts else ""
-        console.print(
-            f"[blue bold]Verdict: PARTIALLY VERIFIED[/blue bold] — {prefix}"
-            f"{_assertion_breakdown()}{breakdown}"
-        )
+        claimed_mo = ph.get("assertions_manifest_only") if ph else None
+        computed = len(run_prov["not_verifiably_covered"])
+        if not isinstance(claimed_mo, int):
+            console.print(
+                "  [yellow]No producer disclosure to cross-check "
+                "(provenance_health absent or incomplete).[/yellow]"
+            )
+        elif claimed_mo == computed:
+            console.print(
+                f"  [green]AGREES[/green] — producer disclosed "
+                f"{claimed_mo} assertion(s) without auditor-verifiable "
+                f"run coverage; independent cross-reference finds "
+                f"{computed}."
+            )
+        else:
+            console.print(
+                f"  [yellow]Producer disclosure disagreement: "
+                f"provenance_health.assertions_manifest_only = "
+                f"{claimed_mo}, but cross-referencing the embedded runs "
+                f"the auditor could verify finds {computed} assertion(s) "
+                f"without auditor-verifiable run coverage.[/yellow]"
+            )
+
+    def _print_caveats() -> None:
+        console.print()
+        if not render.caveats:
+            console.print("[bold]Caveats[/bold]: none")
+            return
+        console.print(f"[bold]Caveats ({len(render.caveats)})[/bold]")
+        for message, hint in render.caveats:
+            console.print(f"  [yellow]• {message}[/yellow]")
+            if hint:
+                _remediation_hint(hint, indent="      ")
+
+    def _print_results_summary() -> None:
+        console.print(f"\n[bold]Results ({', '.join(header_parts)})[/bold]")
+        if malformed_count:
+            console.print(
+                f"  [red]{malformed_count} malformed result entr"
+                f"{'y' if malformed_count == 1 else 'ies'} (missing "
+                "required fields). Treating as failure to avoid silent "
+                "acceptance of structurally-invalid packages.[/red]"
+            )
+        suff_markup = {
+            "sufficient": "[green]sufficient[/green]",
+            "insufficient": "[blue]insufficient[/blue]",
+        }
+        for ctrl_id, ctrl_results in sorted(by_ctrl.items()):
+            ctrl = controls_map.get(ctrl_id, {})
+            ctrl = ctrl if isinstance(ctrl, dict) else {}
+            marker = (
+                " [yellow](retired)[/yellow]"
+                if bool(ctrl.get("deleted", False))
+                else ""
+            )
+            n_pass = sum(
+                1 for r in ctrl_results if r.get("result") == "pass"
+            )
+            n_fail = len(ctrl_results) - n_pass
+            suff = sufficiency_map.get(ctrl_id, {})
+            suff = suff if isinstance(suff, dict) else {}
+            suff_status = suff.get("status", "pending")
+            suff_disp = suff_markup.get(
+                suff_status, f"[yellow]{suff_status}[/yellow]"
+            )
+            fail_disp = (
+                f"[red]{n_fail} fail[/red]" if n_fail else f"{n_fail} fail"
+            )
+            console.print(
+                f"  [bold]{ctrl_id}[/bold]{marker}  "
+                f"{len(ctrl_results)} assertion(s): {n_pass} pass, "
+                f"{fail_disp}  Sufficiency: {suff_disp}"
+            )
+            for r in ctrl_results:
+                if r.get("result") != "pass":
+                    _print_assertion_summary_row(r)
+            if suff_status == "insufficient" and suff.get("details"):
+                console.print(
+                    f"    Sufficiency detail: {suff.get('details')}"
+                )
+        for as_id, as_results in sorted(by_asm.items()):
+            asm = assumptions_map.get(as_id, {})
+            asm = asm if isinstance(asm, dict) else {}
+            marker = (
+                " [yellow](retired)[/yellow]"
+                if bool(asm.get("deleted", False))
+                else ""
+            )
+            status = asm.get("status", "")
+            status_marker = (
+                f" [dim]({status})[/dim]"
+                if status and status != "active"
+                else ""
+            )
+            n_pass = sum(1 for r in as_results if r.get("result") == "pass")
+            n_fail = len(as_results) - n_pass
+            fail_disp = (
+                f"[red]{n_fail} fail[/red]" if n_fail else f"{n_fail} fail"
+            )
+            console.print(
+                f"  [bold]{as_id}[/bold]{marker}{status_marker}  "
+                f"{len(as_results)} assertion(s): {n_pass} pass, "
+                f"{fail_disp}  (assumption)"
+            )
+            for r in as_results:
+                if r.get("result") != "pass":
+                    _print_assertion_summary_row(r)
+        if unmapped_results:
+            console.print("\n[yellow bold]Unmapped results[/yellow bold]")
+            console.print(
+                "  These results reference assertions that don't appear in either\n"
+                "  the controls or assumptions blocks of this package. Possible\n"
+                "  causes: assertion hard-deleted after this run; run pulled from\n"
+                "  a different model; envelope corrupted between sign and audit."
+            )
+            for r in unmapped_results:
+                _print_assertion_summary_row(r)
+            backend_orphans = vr.get("orphan_result_assertion_ids")
+            if isinstance(backend_orphans, list) and backend_orphans:
+                console.print(
+                    f"  [dim]Backend marked {len(backend_orphans)} "
+                    "assertion id(s) as orphaned in this run.[/dim]"
+                )
+
+    if render.summary:
+        _register_caveats()
+        _print_verdict()
+        _print_trust_contract()
+        _print_runs_summary()
+        _print_disclosure_crosscheck()
+        _print_caveats()
+        _print_results_summary()
+        if isinstance(comp_raw, dict):
+            _render_composition_summary(comp_raw)
+        evidence_detail = render.take_saved()
+        if evidence_detail:
+            console.print()
+            console.file.write(evidence_detail)
     else:
-        verified_parts = []
-        if provenance_verified:
-            verified_parts.append("provenance authentic")
-        if manifest_verified:
-            verified_parts.append("pack manifest authentic")
-        if content_verified or content_anchored_in_sigstore:
-            verified_parts.append("content intact")
-        prefix = ", ".join(verified_parts) + ", " if verified_parts else ""
-        console.print(
-            f"[green bold]Verdict: VERIFIED[/green bold] — {prefix}"
-            f"{_assertion_breakdown()}"
-        )
+        _print_trust_contract()
+        _print_verdict()
     console.print()
 
     sys.exit(1 if (has_failure or total_fail > 0) else 0)

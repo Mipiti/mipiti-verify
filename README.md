@@ -70,9 +70,12 @@ Shows Tier 1/2 pass/fail counts, control verification status, drift detection, a
 ```bash
 mipiti-verify audit report.html
 mipiti-verify audit audit-package.json
+mipiti-verify audit audit-package.json --full
 ```
 
 Independently verifies ECDSA document signatures on exported HTML reports and JSON audit packages. Validates OIDC provenance, content integrity, and per-assertion reasoning.
+
+**Output modes.** The default output is a verdict-first workpaper summary: the verdict line, the trust contract, one line per contributing run, the producer-disclosure cross-check, an itemized Caveats section (each with its remediation hint), per-control pass/fail counts, condensed composition aggregates, and the compact cryptographic evidence blocks. Detail auto-expands only for elements that fail or degrade — a failed assertion prints its full row, a hash mismatch prints expected vs. recomputed hashes, an unverifiable run keeps its explanation — so a clean report is short and a problem report shows exactly the problem. `--full` restores the exhaustive listing in verification order (per-assertion detail, per-CO composition enumeration, inheritance-binding rows, the provenance-health panel). Exit codes are identical in both modes; scripted consumers should gate on the exit code.
 
 **Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
 
@@ -99,7 +102,7 @@ A signed audit package (PDF or JSON) carries the following per-row evidence:
 Verification state in a report accumulates across (often partial) CI runs — each assertion's current status was earned by its most recent run. Newer envelopes disclose that history through two additive top-level keys:
 
 - `contributing_runs` — one entry per status-determining run. Each entry carries the run's exact canonical results text (`results_canonical` — the exact bytes whose hash was signed), its own `content_integrity` block (`results_hash`, `signature`, key material), the assertion ids that run determines, and optionally a per-run Sigstore bundle (the canonical trust anchor for that run when present).
-- `provenance_health` — the producer's own coverage disclosure (assertions run-covered vs. manifest-only, per-run key/serialization limitations, warnings). Rendered as a summary panel; the per-run verification below it is the independent auditor-side check.
+- `provenance_health` — the producer's own coverage disclosure (assertions run-covered vs. manifest-only, per-run key/serialization limitations, warnings). Rendered as a panel in `--full` output; the default summary surfaces its warnings in the Caveats section and reports the agreement/disagreement outcome of the auditor-side cross-check. The per-run verification is the independent auditor-side check in both modes.
 
 The verifier checks each run independently: SHA-256 recomputed over the exact `results_canonical` bytes against `results_hash`, the signature over the hash with the run's key (embedded PEM or JWKS lookup by fingerprint), and the per-run Sigstore bundle when present. Each run is reported as `VERIFIED`, `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`, or `UNSIGNED`. A run whose `content_integrity` declares `unverifiable_serialization` (signed material exists but the signed bytes can no longer be re-derived; the serialization predates canonical freezing) is a coverage limitation — reported distinctly from a hash mismatch and never treated as tampering. A genuine mismatch over present `results_canonical` fails the audit.
 
@@ -139,7 +142,7 @@ Pins are **out-of-band knowledge** the auditor brings to the verification: they'
 - `--expected-customer-key '<path-to-pubkey.pem>'` — pin the customer's public key (PEM) for the customer-keyed offline DSSE path. The verifier requires the SHA-256 fingerprint of this key's DER SubjectPublicKeyInfo to equal the key that actually signed the bundle. Source the public key from the customer out-of-band, never from the envelope. Required whenever the package carries a `customer_dsse` envelope — without it, the audit fails closed.
 - `--expected-model-id`, `--expected-commit-sha` — pin predicate fields signed inside the bundle. For `customer_dsse`, `--expected-customer-key` is the analogue of a SAN pin: it makes the predicate pins meaningful (the predicate is signed by the customer's own key), so predicate pins may be used together with it without `--expected-ci-identity`.
 
-The verifier emits a "Trust contract" summary block at the end of each audit listing which pins were enforced and which were skipped, so an auditor can see at a glance what their command actually checked.
+The verifier emits a "Trust contract" summary block in every audit — immediately after the verdict in the default summary, at the end of the `--full` listing — naming which pins were enforced and which were skipped, so an auditor can see at a glance what their command actually checked.
 
 ### Failure modes (every check fails closed)
 

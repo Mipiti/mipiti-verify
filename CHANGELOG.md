@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The `audit` command's default output is now an auditor-first
+  workpaper summary instead of the exhaustive evidence listing. Order:
+  verdict line first, trust contract, contributing runs (one line per
+  run, remediation detail kept for non-`VERIFIED` runs), the
+  producer-disclosure cross-check outcome, an itemized Caveats section
+  (producer warnings and auditor-side warnings, each with its
+  remediation hint), per-control assertion counts with sufficiency
+  status, condensed composition aggregates (entity table plus a single
+  coverage line), and the compact cryptographic evidence blocks
+  (provenance, content integrity, manifest). Detail auto-expands only
+  on failure or degradation: a failed assertion prints its full row, a
+  hash mismatch prints expected vs. recomputed hashes, an
+  unresolvable or unverifiable run keeps its explanation and
+  remediation lines. Exit codes are unchanged in both modes — scripted
+  consumers should rely on exit codes (or opt into `--full`).
+
 ### Added
+
+- `audit --full` flag restoring the previous exhaustive output in
+  verification order: per-assertion result detail, the full
+  composition/coverage enumeration with per-CO contributing controls,
+  the inheritance-binding rows, and the producer's provenance-health
+  panel.
+
+### Fixed
+
+- The sigstore library's "unsafe (no-op) verification policy used! no
+  verification performed!" notice no longer leaks into `audit` output
+  when no `--expected-ci-identity` is pinned. The notice contradicted
+  the CLI's own accurate explanation (the cryptographic chain is
+  verified; only the identity match is skipped) and is now filtered —
+  targeted to that one message, only around the verification call.
 
 - Run-level provenance verification for the `audit` command. Newer
   audit envelopes carry two additive top-level keys:
