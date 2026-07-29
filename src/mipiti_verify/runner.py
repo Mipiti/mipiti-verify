@@ -873,6 +873,28 @@ class Runner:
                                 content = content[:16000] + "\n... (truncated)"
                         else:
                             content = content[:16000] + "\n... (truncated)"
+                    # For function_calls, center context on the caller's
+                    # definition so a large file doesn't hide the caller past
+                    # the 16K head window (leaving the reviewer with no way to
+                    # see the call).
+                    elif len(content) > 16000 and a_type == "function_calls":
+                        import re
+                        caller = params.get("caller", "")
+                        if caller:
+                            def_pat = rf'^[ \t]*(async\s+)?def\s+{re.escape(caller)}\s*\('
+                            match = re.search(def_pat, content, re.MULTILINE)
+                            if match:
+                                center = match.start()
+                                # Bias toward showing the body (4K before, 12K after)
+                                start = max(0, center - 4000)
+                                end = min(len(content), center + 12000)
+                                prefix = "... (truncated)\n" if start > 0 else ""
+                                suffix = "\n... (truncated)" if end < len(content) else ""
+                                content = prefix + content[start:end] + suffix
+                            else:
+                                content = content[:16000] + "\n... (truncated)"
+                        else:
+                            content = content[:16000] + "\n... (truncated)"
                     elif len(content) > 16000:
                         content = content[:16000] + "\n... (truncated)"
                     source_code = content
