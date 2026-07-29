@@ -125,6 +125,99 @@ class TestFunctionCalls:
         )
         assert r.passed is False
 
+    def test_multiline_signature_caller(self, project_root):
+        # A caller whose signature wraps across lines: the closing `) -> T:`
+        # sits at def-level indent. A body slice that stops at the first
+        # def-indent line would miss the call and report a false negative.
+        f = project_root / "wrapped.py"
+        f.write_text(
+            "def verify_registration(\n"
+            "    user_id: str,\n"
+            "    credential: object,\n"
+            ") -> dict:\n"
+            "    challenge = get_challenge(user_id)\n"
+            "    verification = verify_registration_response(\n"
+            "        credential=credential,\n"
+            "    )\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        v = FunctionCallsVerifier()
+        r = v.verify(
+            {"file": "wrapped.py", "caller": "verify_registration",
+             "callee": "verify_registration_response"},
+            project_root,
+        )
+        assert r.passed is True
+
+    def test_attribute_call(self, project_root):
+        f = project_root / "attr.py"
+        f.write_text(
+            "def unwrap(self, blob):\n"
+            "    return self._client.decrypt(CiphertextBlob=blob)\n",
+            encoding="utf-8",
+        )
+        v = FunctionCallsVerifier()
+        r = v.verify(
+            {"file": "attr.py", "caller": "unwrap", "callee": "decrypt"},
+            project_root,
+        )
+        assert r.passed is True
+
+    def test_method_with_multiline_signature(self, project_root):
+        f = project_root / "method.py"
+        f.write_text(
+            "class Service:\n"
+            "    async def handle(\n"
+            "        self,\n"
+            "        request: object,\n"
+            "    ) -> None:\n"
+            "        await self.enforce(request)\n",
+            encoding="utf-8",
+        )
+        v = FunctionCallsVerifier()
+        r = v.verify(
+            {"file": "method.py", "caller": "handle", "callee": "enforce"},
+            project_root,
+        )
+        assert r.passed is True
+
+    def test_callee_absent_multiline(self, project_root):
+        f = project_root / "wrapped2.py"
+        f.write_text(
+            "def caller(\n"
+            "    a: int,\n"
+            ") -> int:\n"
+            "    return a + 1\n",
+            encoding="utf-8",
+        )
+        v = FunctionCallsVerifier()
+        r = v.verify(
+            {"file": "wrapped2.py", "caller": "caller", "callee": "never_called"},
+            project_root,
+        )
+        assert r.passed is False
+
+    def test_non_python_multiline_signature_fallback(self, project_root):
+        # Go-style multi-line signature exercises the regex fallback's
+        # paren-balancing body extraction.
+        f = project_root / "handler.go"
+        f.write_text(
+            "func Handle(\n"
+            "    w http.ResponseWriter,\n"
+            "    r *http.Request,\n"
+            ") {\n"
+            "    verifySignature(r)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        v = FunctionCallsVerifier()
+        r = v.verify(
+            {"file": "handler.go", "caller": "Handle", "callee": "verifySignature"},
+            project_root,
+        )
+        assert r.passed is True
+
 
 class TestImportPresent:
     def test_python_import(self, python_file, project_root):

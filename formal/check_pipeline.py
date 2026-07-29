@@ -457,6 +457,35 @@ def check_real_verifiers():
                 violations.append(f"C8: tier1 unexpected status {t1['status']} for {case['type']}")
             configs += 1
 
+        # C11: function_calls positive cross-check — the real verifier must
+        # PASS when the caller genuinely calls the callee, including when the
+        # caller has a MULTI-LINE signature. The invariants I1/I3/C3/C8 all
+        # guard against false POSITIVES; without a positive function_calls
+        # case the formal layer is blind to a false NEGATIVE (correct code
+        # wrongly failing Tier 1), which is a real class of defect for a
+        # verification product.
+        v = get_verifier("function_calls")
+        (tmpdir / "calls.py").write_text(
+            "def wrapped(\n"
+            "    a: int,\n"
+            "    b: int,\n"
+            ") -> int:\n"
+            "    return helper(a, b)\n"
+            "\n"
+            "def single(x):\n"
+            "    return other(x)\n"
+        )
+        r = v.verify({"file": "calls.py", "caller": "wrapped", "callee": "helper"}, tmpdir)
+        if not r.passed:
+            violations.append("C11: function_calls should pass for multi-line-signature caller")
+        r = v.verify({"file": "calls.py", "caller": "single", "callee": "other"}, tmpdir)
+        if not r.passed:
+            violations.append("C11: function_calls should pass for single-line caller")
+        r = v.verify({"file": "calls.py", "caller": "wrapped", "callee": "absent"}, tmpdir)
+        if r.passed:
+            violations.append("C11: function_calls should fail when callee is absent")
+        configs += 3
+
         # C9: I6 cross-check — after tier1 fail, _run_tier for tier 2 would
         # not receive this assertion (server filters). But verify locally:
         # _verify_tier2 returns skipped when no provider (already C6).
@@ -844,7 +873,7 @@ def main():
         print(f"  I5: Tier 2 only runs after Tier 1 (both modes)")
         print(f"  I6a: Tier 1 failure skips Tier 2 (reverify=false)")
         print(f"  I6b: All assertions get Tier 2 evaluated (reverify=true)")
-        print(f"  C1-C9: Real code cross-check ({cross_configs} configs)")
+        print(f"  C1-C11: Real code cross-check ({cross_configs} configs)")
         print(f"  Model-based: invariants verified on real code (both modes)")
         print(f"  S1-S6: AST structural proofs ({ast_proofs} proofs)")
         print(f"{'=' * 70}")
