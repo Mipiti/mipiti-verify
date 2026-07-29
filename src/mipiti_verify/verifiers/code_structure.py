@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 import re2
 from pathlib import Path
 
@@ -113,7 +115,20 @@ class DecoratorPresentVerifier:
 
 @register("function_calls")
 class FunctionCallsVerifier:
-    """Check that a function calls another function."""
+    """Check that a function calls another function.
+
+    Python sources are analysed with the ``ast`` module: the caller's
+    definition is located and its body walked for a call to the callee.
+    This handles multi-line signatures, decorators, methods, and nested
+    calls — cases a line-indentation body slice mishandles, because the
+    closing line of a wrapped signature sits at the ``def``-level indent
+    and would otherwise be mistaken for the end of the body. Bare calls
+    (``callee(...)``) and attribute calls (``obj.callee(...)``) both count.
+
+    Other languages fall back to a regex scan of the caller's body; that
+    scan skips past the (possibly multi-line) signature by balancing the
+    signature's parentheses before collecting body lines.
+    """
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -126,28 +141,82 @@ class FunctionCallsVerifier:
         caller = params["caller"]
         callee = params["callee"]
 
-        # Find the caller function body
+        if str(source).endswith(".py"):
+            verdict = self._verify_python(content, caller, callee)
+            if verdict is not None:
+                return verdict
+            # Unparseable Python falls through to the regex scan below.
+
+        return self._verify_regex(content, caller, callee)
+
+    @staticmethod
+    def _verify_python(content: str, caller: str, callee: str) -> VerifierResult | None:
+        """AST analysis. Returns a result, or None if the source will not
+        parse (so the caller can fall back to the regex scan)."""
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return None
+
+        found_caller = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == caller:
+                found_caller = True
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        func = sub.func
+                        name = getattr(func, "id", None) or getattr(func, "attr", None)
+                        if name == callee:
+                            return VerifierResult(
+                                passed=True,
+                                details=f"Function '{caller}' calls '{callee}'",
+                            )
+        if not found_caller:
+            return VerifierResult(passed=False, details=f"Caller function '{caller}' not found")
+        return VerifierResult(passed=False, details=f"Function '{caller}' does not call '{callee}'")
+
+    @staticmethod
+    def _verify_regex(content: str, caller: str, callee: str) -> VerifierResult:
+        """Regex fallback for non-Python languages."""
         caller_pattern = rf"(?:def|function|fn|func)\s+{re2.escape(caller)}\s*\("
         caller_match = re2.search(caller_pattern, content)
         if not caller_match:
             return VerifierResult(passed=False, details=f"Caller function '{caller}' not found")
 
-        # Get the function body (until next function definition at same indentation)
-        rest = content[caller_match.start():]
-        lines = rest.split("\n")
-        if not lines:
+        # Skip past the (possibly multi-line) signature by balancing the
+        # parentheses from the first '(' after the caller name.
+        open_idx = content.find("(", caller_match.start())
+        if open_idx == -1:
+            return VerifierResult(passed=False, details=f"Caller function '{caller}' has no signature")
+        depth = 0
+        i = open_idx
+        while i < len(content):
+            ch = content[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        # Body begins after the line that closes the signature.
+        nl = content.find("\n", i)
+        if nl == -1:
             return VerifierResult(passed=False, details=f"Caller function '{caller}' has no body")
 
-        # Collect body lines (indented more than the function definition)
+        # Collect body lines until a non-comment line dedents below the
+        # first body line's indentation.
         body_lines = []
-        first_indent = len(lines[0]) - len(lines[0].lstrip())
-        for i, line in enumerate(lines[1:], 1):
+        ref_indent = None
+        for line in content[nl + 1:].split("\n"):
             stripped = line.lstrip()
             if not stripped:
                 body_lines.append(line)
                 continue
             indent = len(line) - len(stripped)
-            if indent <= first_indent and stripped and not stripped.startswith("#") and not stripped.startswith("//"):
+            if ref_indent is None:
+                ref_indent = indent
+            elif indent < ref_indent and not stripped.startswith("#") and not stripped.startswith("//"):
                 break
             body_lines.append(line)
 
