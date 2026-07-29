@@ -65,6 +65,30 @@ class TestBuildMessageRendering:
         assert "verify_hmac" in msg
         assert "compare_digest" in msg
 
+    def test_existence_types_scope_tier2_to_semantics_only(self):
+        # Existence is a structural fact Tier 1 already settled. The Tier-2
+        # rubric for function_exists / class_exists must confine the model to
+        # the semantic judgment (meaningful vs stub) and forbid rejecting a
+        # structurally-present symbol on category/naming grounds (e.g. "a
+        # method is not a standalone function") — the model straying out of
+        # its lane is what produced run-to-run false NOs.
+        for a_type, params, src in (
+            ("function_exists",
+             {"name": "test_non_owner_cannot_get_model", "file": "t.py"},
+             "class TestOwnership:\n    def test_non_owner_cannot_get_model(self):\n"
+             "        assert client.get('/m/1').status_code == 404\n"),
+            ("class_exists",
+             {"name": "AuthService", "file": "a.py"},
+             "class AuthService:\n    def check(self): return True\n"),
+        ):
+            msg = _build_message(
+                assertion_type=a_type, assertion_params=params, source_code=src,
+            )
+            low = msg.lower()
+            assert "existence" in low and "not your decision" in low, a_type
+            assert "structural" in low and "naming" in low, a_type
+            assert "only the semantics" in low, a_type
+
     def test_fresh_token_per_call(self):
         """Each call to ``_build_message`` mints a new token. This is
         the security-critical freshness property — an attacker who
