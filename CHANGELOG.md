@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `audit` command now renders the audit pack's `findings` section — the
+  full dispositioned finding set (open, remediated, and dismissed), grouped by
+  disposition with a per-bucket summary. Each finding shows its kind, control,
+  severity, and title; dismissed and remediated findings additionally show who
+  disposed of them and why, so an auditor sees not only the live gaps but the
+  decisions that closed or accepted the rest. Finding kinds are displayed
+  directly from the pack data (never matched against a fixed list), so kinds
+  introduced later still render. The section is additive: packs without it
+  render nothing, and the render is informational (it never changes the audit
+  verdict). Signed packs that include the section already verify unchanged —
+  manifest verification hashes every section the manifest enumerates.
+
 ### Changed
 
 - The `audit` command's default output is now an auditor-first

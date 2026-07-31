@@ -1988,6 +1988,90 @@ def _render_composition(comp: dict) -> bool:
     return False
 
 
+def _render_findings(pkg: dict) -> bool:
+    """Render the signed findings section of the audit pack.
+
+    The pack carries the FULL dispositioned finding set — open, remediated, and
+    dismissed — so the auditor sees not only the live gaps but the decisions
+    that disposed of the others: who dismissed or remediated each one, and why.
+    Because the set is signed, it cannot be sanitised by dismissing or
+    remediating a finding immediately before export.
+
+    Additive and backward-compatible: older packs carry no findings section, so
+    this renders nothing. Informational at the auditor surface — returns False
+    (never fails the audit). A finding is a disclosure; accepting one is the
+    operator's recorded decision to inspect, not a verifier-side failure.
+    """
+    findings = pkg.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return False
+
+    def _bucket(status: str) -> str:
+        s = (status or "").lower()
+        if s == "dismissed":
+            return "dismissed"
+        if s in ("remediated", "verified"):
+            return "resolved"
+        return "open"
+
+    def _sort_key(f: dict):
+        return (f.get("control_id") or "", f.get("kind") or "", f.get("id") or "")
+
+    valid = [f for f in findings if isinstance(f, dict)]
+    open_f = sorted((f for f in valid if _bucket(f.get("status", "")) == "open"), key=_sort_key)
+    resolved_f = sorted((f for f in valid if _bucket(f.get("status", "")) == "resolved"), key=_sort_key)
+    dismissed_f = sorted((f for f in valid if _bucket(f.get("status", "")) == "dismissed"), key=_sort_key)
+
+    console.print("\n[bold]Findings[/bold] (full disposition)")
+    console.print(
+        f"  [yellow]{len(open_f)} open[/yellow]  "
+        f"[green]{len(resolved_f)} resolved[/green]  "
+        f"[dim]{len(dismissed_f)} dismissed[/dim]  "
+        f"({len(valid)} total)"
+    )
+
+    def _pretty_kind(k: str) -> str:
+        # The kind is data from the package — display it generically, never
+        # matched against a hardcoded list, so any kind (including ones added
+        # after this build) renders.
+        return (k or "finding").replace("_", " ").strip().title() or "Finding"
+
+    def _row(f: dict) -> None:
+        kind = _pretty_kind(f.get("kind", ""))
+        ctrl = f.get("control_id") or ""
+        sev = (f.get("severity") or "").upper()
+        title = f.get("title") or ""
+        ctrl_disp = f"{ctrl}  " if ctrl else ""
+        sev_disp = f"[dim]{sev}[/dim]" if sev else ""
+        console.print(f"    [bold]{kind}[/bold]  {ctrl_disp}{sev_disp}")
+        if title:
+            console.print(f"      {title}")
+
+    if open_f:
+        console.print("\n  [yellow]Open[/yellow]")
+        for f in open_f:
+            _row(f)
+    if dismissed_f:
+        console.print("\n  [dim]Dismissed (operator-accepted residual)[/dim]")
+        for f in dismissed_f:
+            _row(f)
+            who = f.get("dismissed_by") or "?"
+            why = f.get("dismissed_reason") or ""
+            line = f"      [dim]dismissed by {who}"
+            if why:
+                line += f": {why}"
+            console.print(line + "[/dim]")
+    if resolved_f:
+        console.print("\n  [green]Resolved[/green]")
+        for f in resolved_f:
+            _row(f)
+            who = f.get("remediated_by") or ""
+            if who:
+                console.print(f"      [dim]remediated by {who}[/dim]")
+
+    return False
+
+
 # Known top-level audit-pack sections a signed manifest may cover, for
 # documentation and test fixtures. Verification does NOT depend on
 # this list: section hashes are, by contract, SHA-256 over the
@@ -2007,6 +2091,7 @@ _MANIFEST_SECTIONS: tuple[str, ...] = (
     "verification_run",
     "composition",
     "functional_tests",
+    "findings",
     "assertions_by_functional_test",
     "contributing_runs",
     "provenance_health",
@@ -5069,6 +5154,12 @@ def _audit_impl(
                 f"  [dim]Backend marked {len(backend_orphans)} assertion id(s) "
                 "as orphaned in this run.[/dim]"
             )
+
+    # --- Findings (full dispositioned set) ---
+    # Additive signed section: the open + remediated + dismissed findings, so
+    # the auditor sees the live gaps and every disposition decision. Absent on
+    # older packs (renders nothing). Informational — never fails the audit.
+    _render_findings(pkg)
 
     # --- Run-level provenance (contributing runs) ---
     # Additive envelope keys: `contributing_runs` (one entry per
