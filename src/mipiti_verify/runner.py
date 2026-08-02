@@ -1052,32 +1052,13 @@ def _source_digest(project_root: Path, assertions: list[dict[str, Any]]) -> str:
 
 
 def _pipeline_metadata() -> dict[str, str]:
-    """Build pipeline metadata from environment."""
-    # GitHub Actions
-    if os.environ.get("GITHUB_ACTIONS"):
-        return {
-            "provider": "github_actions",
-            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-            "run_url": f"{os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
-            "commit_sha": os.environ.get("GITHUB_SHA", ""),
-            "branch": os.environ.get("GITHUB_REF", ""),
-        }
+    """Build pipeline metadata via the VCS-neutral source-provenance resolver.
 
-    # GitLab CI
-    if os.environ.get("GITLAB_CI"):
-        return {
-            "provider": "gitlab_ci",
-            "run_id": os.environ.get("CI_PIPELINE_ID", ""),
-            "run_url": os.environ.get("CI_PIPELINE_URL", ""),
-            "commit_sha": os.environ.get("CI_COMMIT_SHA", ""),
-            "branch": os.environ.get("CI_COMMIT_REF_NAME", ""),
-        }
+    Delegates provider selection (GitHub / GitLab / generic-env / local) to
+    ``provenance.resolve_provenance``. The dict shape is unchanged — ``commit_sha``
+    carries the opaque revision id from whatever source-control the provider uses
+    — so the signed predicate stays byte-compatible while a non-git runner can now
+    supply provenance via SOURCE_REVISION / SOURCE_REPO / SOURCE_BRANCH."""
+    from .provenance import resolve_provenance
 
-    # Local / unknown
-    return {
-        "provider": "local",
-        "run_id": "",
-        "run_url": "",
-        "commit_sha": "",
-        "branch": "",
-    }
+    return resolve_provenance().to_pipeline_dict()
