@@ -467,6 +467,9 @@ class Runner:
         details.extend(t1_details)
 
         pipeline = _pipeline_metadata()
+        # VCS-neutral "same code" identity — a content digest of the verified
+        # files. Shared by both tier submissions below. Independent of git/SVN/P4.
+        pipeline["source_digest"] = _source_digest(self.project_root, t1_assertions)
 
         t1_run_id = ""
         if t1_results and not self.dry_run and not self._developer_key:
@@ -1009,6 +1012,43 @@ def _auto_detect_oidc(audience: str = "") -> str:
         return gl_token
 
     return ""
+
+
+def _source_digest(project_root: Path, assertions: list[dict[str, Any]]) -> str:
+    """A VCS-neutral content digest of the verified code.
+
+    Hashes the files the assertions reference (``params["file"]``), so it is the
+    precise "same code" identity independent of any source-control system — two
+    runs whose verified files are byte-identical produce the same digest even
+    under a rebase or on a different branch. Deterministic (files sorted; each
+    entry binds path + content); missing/out-of-root files are recorded as such
+    rather than skipped, so a deletion still changes the digest. Empty when no
+    assertion is file-scoped (e.g. pattern-only globs); the server then falls back
+    to the revision id."""
+    files = sorted(
+        {
+            f
+            for a in (assertions or [])
+            if (f := ((a.get("params") or {}).get("file", "")))
+        }
+    )
+    if not files:
+        return ""
+    root = project_root.resolve()
+    h = hashlib.sha256()
+    for rel in files:
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            p = (root / rel).resolve()
+            if p.is_file() and p.is_relative_to(root):
+                h.update(hashlib.sha256(p.read_bytes()).hexdigest().encode("ascii"))
+            else:
+                h.update(b"<missing>")
+        except OSError:
+            h.update(b"<error>")
+        h.update(b"\n")
+    return "sha256:" + h.hexdigest()
 
 
 def _pipeline_metadata() -> dict[str, str]:
