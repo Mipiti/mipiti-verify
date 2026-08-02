@@ -3109,6 +3109,19 @@ def _verify_contributing_runs(
     ),
 )
 @click.option(
+    "--expected-source-digest",
+    "expected_source_digest",
+    default=None,
+    help=(
+        "Pin the expected VCS-neutral source_digest (content hash of the "
+        "verified files) on the bundle's signed predicate pipeline.source_digest. "
+        "Like --expected-commit-sha but source-control-neutral and content-based: "
+        "it pins the exact verified code rather than a revision label, so it works "
+        "for any VCS and is invariant to rebases/branches. The digest lives in the "
+        "signed predicate, so it cannot be forged without the customer's CI OIDC."
+    ),
+)
+@click.option(
     "--expected-ci-identity",
     "expected_ci_identity",
     default=None,
@@ -3336,6 +3349,7 @@ def audit(
     sigstore_trust_config_path: str | None,
     expected_model_id: str | None,
     expected_commit_sha: str | None,
+    expected_source_digest: str | None,
     expected_ci_identity: str | None,
     ci_identity_from_env: bool,
     expected_issuer: str | None,
@@ -3410,6 +3424,7 @@ def audit(
             sigstore_trust_config_path=sigstore_trust_config_path,
             expected_model_id=expected_model_id,
             expected_commit_sha=expected_commit_sha,
+            expected_source_digest=expected_source_digest,
             expected_ci_identity=expected_ci_identity,
             ci_identity_from_env=ci_identity_from_env,
             expected_issuer=expected_issuer,
@@ -3440,6 +3455,7 @@ def _audit_impl(
     sigstore_trust_config_path: str | None,
     expected_model_id: str | None,
     expected_commit_sha: str | None,
+    expected_source_digest: str | None,
     expected_ci_identity: str | None,
     ci_identity_from_env: bool,
     expected_issuer: str | None,
@@ -3516,7 +3532,7 @@ def _audit_impl(
     # attacker cannot mint a predicate the customer's key didn't sign),
     # so this is the customer-DSSE analogue of a SAN pin.
     if (
-        (expected_model_id or expected_commit_sha)
+        (expected_model_id or expected_commit_sha or expected_source_digest)
         and not expected_ci_identity
         and not expected_customer_key_path
     ):
@@ -3685,6 +3701,7 @@ def _audit_impl(
             or expected_workspace_key_fingerprint
             or expected_model_id
             or expected_commit_sha
+            or expected_source_digest
         )
         # Detect "model only" reports — exports of a threat model where the
         # owner has not run mipiti-verify in CI yet. Two shapes reach the
@@ -3780,6 +3797,7 @@ def _audit_impl(
             or expected_workspace_key_fingerprint
             or expected_model_id
             or expected_commit_sha
+            or expected_source_digest
         ):
             console.print(
                 "[red]Error:[/red] identity-pinning flags "
@@ -4247,6 +4265,9 @@ def _audit_impl(
                         if not isinstance(pipeline_field, dict):
                             pipeline_field = {}
                         bundle_commit_sha = pipeline_field.get("commit_sha") or ""
+                        bundle_source_digest = (
+                            pipeline_field.get("source_digest") or ""
+                        )
                         if expected_model_id:
                             if bundle_model_id == expected_model_id:
                                 console.print(
@@ -4276,6 +4297,24 @@ def _audit_impl(
                                     f"bundle predicate has {bundle_commit_sha!r}). "
                                     "The audit package binds to a different "
                                     "commit than the auditor pinned — possible "
+                                    "replay of an older verification run."
+                                )
+                                has_failure = True
+                        if expected_source_digest:
+                            if bundle_source_digest == expected_source_digest:
+                                console.print(
+                                    f"  Source digest pin: [green]MATCHED[/green] "
+                                    f"(predicate.pipeline.source_digest = "
+                                    f"{bundle_source_digest!r})"
+                                )
+                            else:
+                                console.print(
+                                    f"  Source digest pin: [red]MISMATCH[/red] "
+                                    f"(expected {expected_source_digest!r}, "
+                                    f"bundle predicate has "
+                                    f"{bundle_source_digest!r}). "
+                                    "The audit package binds to different verified "
+                                    "source than the auditor pinned — possible "
                                     "replay of an older verification run."
                                 )
                                 has_failure = True
@@ -4437,6 +4476,7 @@ def _audit_impl(
         )
         if (
             expected_ci_identity or expected_model_id or expected_commit_sha
+            or expected_source_digest
         ) and not _has_dsse:
             console.print(
                 "  [red]A bundle-binding pin (--expected-ci-identity / "
@@ -4725,6 +4765,22 @@ def _audit_impl(
                             f"  Commit SHA pin:  [red]MISMATCH[/red] "
                             f"(expected {expected_commit_sha!r}, "
                             f"signed predicate carries {claimed_sha!r})"
+                        )
+                        has_failure = True
+                if expected_source_digest:
+                    claimed_source_digest = (
+                        pred.get("pipeline", {}) or {}
+                    ).get("source_digest", "")
+                    if claimed_source_digest == expected_source_digest:
+                        console.print(
+                            f"  Source digest pin: [green]MATCHED[/green] "
+                            f"({expected_source_digest!r})"
+                        )
+                    else:
+                        console.print(
+                            f"  Source digest pin: [red]MISMATCH[/red] "
+                            f"(expected {expected_source_digest!r}, "
+                            f"signed predicate carries {claimed_source_digest!r})"
                         )
                         has_failure = True
             except CustomerDsseVerificationError as e:
@@ -5398,6 +5454,7 @@ def _audit_impl(
             ("Workspace key:          ", expected_workspace_key_fingerprint, "--expected-workspace-key"),
             ("Model ID:               ", expected_model_id, "--expected-model-id"),
             ("Commit SHA:             ", expected_commit_sha, "--expected-commit-sha"),
+            ("Source digest:          ", expected_source_digest, "--expected-source-digest"),
         ]
         for label, pin_value, flag_name in pin_lines:
             if pin_value:

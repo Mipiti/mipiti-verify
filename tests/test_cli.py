@@ -1127,6 +1127,53 @@ class TestPredicatePins:
         assert "Commit SHA pin:" in out_flat
         assert "MISMATCH" in out_flat
 
+    def test_i13_source_digest_match_passes(self, tmp_path, monkeypatch):
+        """Bundle predicate.pipeline.source_digest matches the VCS-neutral
+        pin → no failure on the source_digest pin path."""
+        path, statement = self._build_pkg_with_bundle(
+            tmp_path,
+            predicate={
+                "model_id": "x",
+                "pipeline": {"source_digest": "sha256:cafef00d"},
+            },
+        )
+        bp, vp = self._patch_sigstore(statement, monkeypatch)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--expected-ci-identity",
+                "https://github.com/x/y/.github/workflows/v.yml@refs/heads/main",
+                "--expected-source-digest", "sha256:cafef00d",
+            ])
+        out_flat = " ".join(result.output.split())
+        assert "Source digest pin:" in out_flat
+        assert "MATCHED" in out_flat
+
+    def test_i13_source_digest_mismatch_fails(self, tmp_path, monkeypatch):
+        """Bundle predicate.pipeline.source_digest ≠ pin → FAILED.
+        Defends against replay of a verification run over different code."""
+        path, statement = self._build_pkg_with_bundle(
+            tmp_path,
+            predicate={
+                "model_id": "x",
+                "pipeline": {"source_digest": "sha256:0ldc0de"},
+            },
+        )
+        bp, vp = self._patch_sigstore(statement, monkeypatch)
+        with bp, vp:
+            runner = CliRunner()
+            result = runner.invoke(main, [
+                "audit", path,
+                "--expected-ci-identity",
+                "https://github.com/x/y/.github/workflows/v.yml@refs/heads/main",
+                "--expected-source-digest", "sha256:newc0de",
+            ])
+        assert result.exit_code == 1
+        out_flat = " ".join(result.output.split())
+        assert "Source digest pin:" in out_flat
+        assert "MISMATCH" in out_flat
+
     def test_i13_pin_set_no_bundle_fails(self, tmp_path):
         helper = TestAuditIdentityPinning()
         path, _ = helper._build_signed_pkg(tmp_path)
