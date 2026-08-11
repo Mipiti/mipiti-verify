@@ -1,5 +1,9 @@
 build
-twine
+# twine<7 hardcodes the valid Metadata-Version list at <=2.4, so `twine check`
+# rejects wheels built by current hatchling (which stamps Metadata-Version 2.5).
+# twine>=7 drops that hardcode and validates via packaging. Floor it so the
+# build lock can't regress to a version that fails the publish's Verify step.
+twine>=7.0.0
 
 # Transitive CVE floors (mirror of [tool.uv].constraint-dependencies in
 # pyproject.toml; build-env doesn't read pyproject.toml so the pins must
