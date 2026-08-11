@@ -925,6 +925,38 @@ class Runner:
                 ),
             }
 
+        # Deterministic structural-presence precheck for existence types.
+        # Whether a symbol EXISTS is a structural fact; the deterministic
+        # structural verifier (the mechanical tier) is its sole authority. The
+        # semantic tier assesses the QUALITY of a symbol that exists — it is not
+        # a source of truth for existence itself. So for existence-type
+        # assertions, re-run the authoritative structural verifier on the FULL
+        # file (not the possibly-truncated SOURCE_CODE window built above),
+        # which applies the same check tier 1 uses, and skip the semantic pass
+        # when the symbol is absent. This keeps the semantic tier able only to
+        # downgrade a result, never to establish existence: a symbol that is
+        # genuinely present still proceeds to the quality check unchanged. Fail
+        # open on an unexpected verifier error (tier 1 remains the independent
+        # structural authority on its own pass).
+        if a_type in ("function_exists", "class_exists"):
+            structural = get_verifier(a_type)
+            if structural is not None:
+                try:
+                    present = structural.verify(params, self.project_root)
+                except Exception:
+                    present = None
+                if present is not None and not present.passed:
+                    return {
+                        "status": "fail",
+                        "details": (
+                            f"Tier-2 refused: the {a_type} target is not "
+                            f"present in the source ({present.details}). "
+                            f"Tier-2 is a semantic check and cannot affirm a "
+                            f"symbol's existence — the structural check is the "
+                            f"authority, and it did not find the symbol."
+                        ),
+                    }
+
         try:
             from .tier2 import get_provider
 

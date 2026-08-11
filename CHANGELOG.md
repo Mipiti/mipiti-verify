@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Tier-2 semantic verification now defers to the deterministic structural check
+  for symbol existence on `function_exists` and `class_exists` assertions.
+  Whether a symbol exists is a structural fact, decided by the mechanical tier;
+  the semantic tier assesses the quality of a symbol that exists and is no
+  longer a source of truth for existence itself. Before consulting the model,
+  the runner re-runs the structural check on the full file (the same check the
+  mechanical tier applies) and skips the semantic pass when the symbol is
+  absent, so tier 2 can only ever downgrade a result, never establish one. A
+  symbol that is genuinely present still proceeds to the quality check
+  unchanged.
 - Raised the `cryptography` floor to `>=50.0.0` (from `>=48.0.1`) to clear
   advisory PYSEC-2026-3552. The three hash-pinned lockfiles are regenerated
   accordingly (`cryptography` 49.0.0 → 50.0.0, and its dependent `pyopenssl`
