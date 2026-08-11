@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Raised the `cryptography` floor to `>=50.0.0` (from `>=48.0.1`) to clear
+  advisory PYSEC-2026-3552. The three hash-pinned lockfiles are regenerated
+  accordingly (`cryptography` 49.0.0 → 50.0.0, and its dependent `pyopenssl`
+  26.3.0 → 26.4.0); no other resolved versions change.
+
 ### Added
 
 - The `audit` command now renders the audit pack's `findings` section — the
