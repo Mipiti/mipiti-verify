@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The signed attestation payload now carries each assertion's content
+  (id, type, params, description), binding (control / assumption /
+  functional-test / node ids, repo) and provenance (origin, inherited-from
+  model, author, creation time) instead of the full pulled record. The
+  platform's stored verdict state from earlier runs (tier statuses,
+  reviewer prose, verification timestamps, coherence results, supersession
+  and deletion flags) is left out: CI did not verify it, and the run's own
+  verdicts travel in `results`. The content hash is unchanged.
 - Tier-2 semantic verification of `function_exists` / `class_exists`
   assertions now reviews the isolated definition block instead of the
   enclosing file. Existence is decided by the structural tier; the semantic
