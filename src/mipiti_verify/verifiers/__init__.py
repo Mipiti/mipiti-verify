@@ -104,6 +104,30 @@ def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
     return None, "<no source>"
 
 
+def resolve_file_content(params: dict, project_root: Path) -> tuple[str | None, str]:
+    """Resolve assertion content from a codebase file only.
+
+    For verifiers whose subject is a repository artifact by definition (RTL
+    sources, for example) and for which platform-held content is not a valid
+    subject. A ``target`` param is refused rather than honoured, so the set
+    of types that accept a target is exactly the set that reads through
+    ``resolve_content``.
+
+    Returns (content, source_label). content is None if the file is not found.
+    Raises PathTraversalError for file path escapes.
+    Raises ValueError when a target is supplied.
+    """
+    if params.get("target"):
+        raise ValueError(
+            "This assertion type verifies a repository file and does not accept a 'target'"
+        )
+    file_param = params.get("file")
+    if file_param:
+        content = safe_read_file(project_root, file_param)
+        return content, file_param
+    return None, "<no source>"
+
+
 def safe_regex_search(pattern: str, content: str, timeout_seconds: float = 2.0) -> object | None:
     """Run regex search using RE2 with a cross-platform threading timeout.
 

@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviewer prose, verification timestamps, coherence results, supersession
   and deletion flags) is left out: CI did not verify it, and the run's own
   verdicts travel in `results`. The content hash is unchanged.
+- RTL verifiers (`module_exists`, `module_instantiated`, `port_exists`,
+  `parameter_defined`, `signal_exists`, `sva_assertion_present`,
+  `register_reset`) read repository files only. Their subject is an RTL
+  source by definition, so a `target` param is refused with a clear message
+  instead of being resolved to platform-held content. The set of assertion
+  types that accept a target is now exactly the set whose verifier reads
+  through the shared file-or-target resolver.
+
 - Tier-2 semantic verification of `function_exists` / `class_exists`
   assertions now reviews the isolated definition block instead of the
   enclosing file. Existence is decided by the structural tier; the semantic

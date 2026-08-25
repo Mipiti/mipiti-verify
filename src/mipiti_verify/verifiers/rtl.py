@@ -11,7 +11,7 @@ from . import (
     RegexTimeoutError,
     VerifierResult,
     register,
-    resolve_content,
+    resolve_file_content,
     safe_regex_search,
 )
 
@@ -59,7 +59,7 @@ class ModuleExistsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -87,7 +87,7 @@ class ModuleInstantiatedVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -132,7 +132,7 @@ class PortExistsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -182,7 +182,7 @@ class ParameterDefinedVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -252,7 +252,7 @@ class SignalExistsVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -310,7 +310,7 @@ class SvaAssertionPresentVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -347,7 +347,7 @@ class RegisterResetVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:

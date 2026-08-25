@@ -572,3 +572,29 @@ class TestRegistry:
             "register_reset",
         ):
             assert get_verifier(a_type) is not None, f"no verifier registered for {a_type}"
+
+
+class TestRtlVerifiersAreFileOnly:
+    """RTL verifiers verify repository sources; a platform target is refused."""
+
+    _TYPES = (
+        ("module_exists", {"name": "m"}),
+        ("module_instantiated", {"parent": "top", "child": "m"}),
+        ("port_exists", {"module": "m", "port": "clk"}),
+        ("parameter_defined", {"module": "m", "parameter": "W"}),
+        ("signal_exists", {"module": "m", "signal": "s"}),
+        ("sva_assertion_present", {"name": "p"}),
+        ("register_reset", {"signal": "r"}),
+    )
+
+    @pytest.mark.parametrize("type_name,extra", _TYPES)
+    def test_target_is_refused(self, type_name, extra, tmp_path):
+        from mipiti_verify.verifiers import get_verifier
+        verifier = get_verifier(type_name)
+        result = verifier.verify(
+            {**extra, "target": "feature_description",
+             "target_content": "module m; endmodule"},
+            tmp_path,
+        )
+        assert result.passed is False
+        assert "does not accept a 'target'" in result.details
