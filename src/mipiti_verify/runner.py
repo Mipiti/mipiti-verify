@@ -127,6 +127,50 @@ def compute_content_hash(
     return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
 
 
+# Fields of a pulled assertion record that describe the assertion itself:
+# the verified content (bound by ``compute_content_hash``) and its identity /
+# binding / provenance. Everything else on the record is the platform's
+# stored verdict state from earlier runs and is deliberately excluded.
+ATTESTED_ASSERTION_FIELDS: tuple[str, ...] = (
+    # content bound by the content hash
+    "id",
+    "type",
+    "params",
+    "description",
+    # binding: what the assertion evidences, and where
+    "control_id",
+    "assumption_id",
+    "functional_test_id",
+    "node_id",
+    "repo",
+    # provenance
+    "origin",
+    "inherited_from_model_id",
+    "created_by",
+    "created_at",
+)
+
+
+def attestation_assertion_records(
+    all_assertions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reduce pulled assertion records to what the attestation should carry.
+
+    A pulled record also holds the platform's stored verdict state from
+    earlier runs (tier statuses, reviewer prose, verification timestamps,
+    coherence results, supersession / deletion flags). CI did not verify
+    any of that, and this run's own verdicts travel in ``results``, so it
+    is left out. The signed payload is then a function of the assertion
+    specs, their bindings, and this run's verdicts — not of how much
+    history the platform holds on them. The content hash is unaffected:
+    every field it binds is kept.
+    """
+    return [
+        {k: a[k] for k in ATTESTED_ASSERTION_FIELDS if k in a}
+        for a in all_assertions
+    ]
+
+
 class Runner:
     """Orchestrates the pull → verify → submit flow."""
 
@@ -479,7 +523,7 @@ class Runner:
                 tier=1,
                 content_hash=content_hash,
                 pipeline=pipeline,
-                assertions=t1_assertions,
+                assertions=attestation_assertion_records(t1_assertions),
                 results=t1_results,
             )
             resp = self.client.submit_results(
@@ -506,7 +550,7 @@ class Runner:
                 tier=2,
                 content_hash=content_hash,
                 pipeline=pipeline,
-                assertions=t2_assertions,
+                assertions=attestation_assertion_records(t2_assertions),
                 results=t2_results,
             )
             resp = self.client.submit_results(
