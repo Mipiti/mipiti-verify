@@ -838,8 +838,26 @@ class Runner:
                     # For pattern_matches/pattern_absent, center context around
                     # the match rather than taking the file head — ensures the
                     # reviewer sees the relevant code even in large files.
+                    # For function_exists/class_exists, hand the reviewer the
+                    # isolated definition block rather than the enclosing
+                    # file. Existence is settled by the structural tier; the
+                    # semantic tier judges only the body, so it must never be
+                    # asked to locate the symbol first. When the block can't
+                    # be isolated, fall through to the file-level handling.
+                    isolated = None
+                    if a_type in ("function_exists", "class_exists"):
+                        from .definition_extract import extract_definition
+                        isolated = extract_definition(
+                            content,
+                            "function" if a_type == "function_exists" else "class",
+                            params.get("name", ""),
+                        )
+                        if isolated is not None:
+                            content = isolated
                     pattern = params.get("pattern", "")
-                    if len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
+                    if isolated is not None:
+                        pass
+                    elif len(content) > 16000 and pattern and a_type in ("pattern_matches", "pattern_absent"):
                         import re
                         match = re.search(pattern, content)
                         if match:

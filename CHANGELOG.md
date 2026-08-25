@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tier-2 semantic verification of `function_exists` / `class_exists`
+  assertions now reviews the isolated definition block instead of the
+  enclosing file. Existence is decided by the structural tier; the semantic
+  tier judges only the body, so it is no longer asked to locate the symbol
+  before judging it. Python definitions are cut by `ast` (decorators
+  included); other languages use a line-based block heuristic (matching
+  brace, or indentation). When the block cannot be isolated the reviewer
+  receives the enclosing file as before.
+
 ### Security
 
 - Tier-2 semantic verification now defers to the deterministic structural check
