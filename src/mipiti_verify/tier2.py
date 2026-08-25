@@ -9,7 +9,10 @@ that one render, and discarded. The token never crosses the network
 and is never persisted. The instruction preamble lives in the
 templates (trusted runner code) and sits outside the boundary;
 assertion params and source code are wrapped inside via the
-``| untrusted`` Jinja filter.
+``| untrusted`` Jinja filter. The subject of the evaluation — a
+repository file, or the model's feature description — is a
+runner-chosen value and is rendered outside the boundary too, so a
+template can frame its criterion for the thing actually being read.
 
 There is no legacy fallback. The runner refuses to evaluate when the
 backend payload is missing ``type`` / ``params``, returning a clear
@@ -32,6 +35,38 @@ from typing import Any, Mapping, Tuple
 # would work too, but this is simpler given templates are tiny.
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
+# Subject of a tier-2 evaluation. An assertion is normally verified
+# against a repository file, but some types may instead be verified
+# against platform-held content — today the model's feature
+# description, which is the design specification the threat model is
+# derived from. The two subjects are read differently: a regex match
+# in a repository file is code, while a regex match in a feature
+# description is a design statement, so the per-type criterion the
+# template states must name the right one. The runner resolves the
+# subject when it loads the content and passes it down; everything
+# that does not specify one is evaluated as a repository file, which
+# is the pre-existing behaviour.
+SUBJECT_REPOSITORY_FILE = "repository_file"
+SUBJECT_FEATURE_DESCRIPTION = "feature_description"
+
+_SUBJECT_LABELS: Mapping[str, str] = {
+    SUBJECT_REPOSITORY_FILE: "the repository file under verification",
+    SUBJECT_FEATURE_DESCRIPTION: (
+        "the model's feature description, which is the design "
+        "specification for the system"
+    ),
+}
+
+
+def subject_label(subject_kind: str) -> str:
+    """Human-readable name for a subject kind.
+
+    Unrecognised kinds fall back to the repository-file label so an
+    unexpected value degrades to the historical framing rather than
+    handing the reviewer an unnamed subject.
+    """
+    return _SUBJECT_LABELS.get(subject_kind, _SUBJECT_LABELS[SUBJECT_REPOSITORY_FILE])
+
 
 class Tier2Provider(ABC):
     """Abstract base for Tier 2 semantic verification providers."""
@@ -43,12 +78,19 @@ class Tier2Provider(ABC):
         assertion_type: str,
         assertion_params: Mapping[str, Any],
         source_code: str = "",
+        subject_kind: str = SUBJECT_REPOSITORY_FILE,
     ) -> Tuple[bool, str]:
         """Evaluate an assertion semantically.
 
         Returns ``(passed, reasoning)``. The runner picks the per-type
         template, renders it with a fresh boundary token, and submits
         the rendered message to the configured LLM provider.
+
+        ``subject_kind`` names what ``source_code`` actually is (see
+        the ``SUBJECT_*`` constants) so the template can state a
+        criterion in the right terms. It defaults to the repository
+        file, so a caller that does not set it gets the behaviour it
+        got before the subject was modelled explicitly.
         """
 
 
@@ -70,11 +112,13 @@ class OpenAIProvider(Tier2Provider):
         assertion_type: str,
         assertion_params: Mapping[str, Any],
         source_code: str = "",
+        subject_kind: str = SUBJECT_REPOSITORY_FILE,
     ) -> Tuple[bool, str]:
         message = _build_message(
             assertion_type=assertion_type,
             assertion_params=assertion_params,
             source_code=source_code,
+            subject_kind=subject_kind,
         )
         messages = [{"role": "user", "content": message}]
         # Newer OpenAI models (o-series, gpt-5+) require max_completion_tokens
@@ -109,11 +153,13 @@ class AnthropicProvider(Tier2Provider):
         assertion_type: str,
         assertion_params: Mapping[str, Any],
         source_code: str = "",
+        subject_kind: str = SUBJECT_REPOSITORY_FILE,
     ) -> Tuple[bool, str]:
         content = _build_message(
             assertion_type=assertion_type,
             assertion_params=assertion_params,
             source_code=source_code,
+            subject_kind=subject_kind,
         )
         message = self.client.messages.create(
             model=self.model,
@@ -148,11 +194,13 @@ class OllamaProvider(Tier2Provider):
         assertion_type: str,
         assertion_params: Mapping[str, Any],
         source_code: str = "",
+        subject_kind: str = SUBJECT_REPOSITORY_FILE,
     ) -> Tuple[bool, str]:
         content = _build_message(
             assertion_type=assertion_type,
             assertion_params=assertion_params,
             source_code=source_code,
+            subject_kind=subject_kind,
         )
         resp = self._client.post(
             f"{self.url}/api/chat",
@@ -201,6 +249,7 @@ def _build_message(
     assertion_type: str,
     assertion_params: Mapping[str, Any],
     source_code: str = "",
+    subject_kind: str = SUBJECT_REPOSITORY_FILE,
 ) -> str:
     """Build the LLM input message via runner-side template rendering.
 
@@ -209,6 +258,13 @@ def _build_message(
     preamble lives in the template (trusted runner code) and sits
     outside the boundary; ``assertion_params`` and ``source_code``
     are wrapped inside via the ``| untrusted`` filter.
+
+    ``subject_kind`` and its derived label describe what the
+    ``SOURCE_CODE`` payload is. Both are runner-chosen values, not
+    payload data, so they are rendered OUTSIDE the boundary as part of
+    the trusted instruction text. Templates that branch on the subject
+    use them to state the per-type criterion in the terms of the thing
+    actually being read.
 
     Raises :class:`UnknownAssertionTypeError` when no template exists
     for the given type — the runner refuses to evaluate rather than
@@ -225,8 +281,22 @@ def _build_message(
     from ._prompt_renderer import render_prompt
 
     template_text = template_path.read_text(encoding="utf-8")
+    params = dict(assertion_params) if assertion_params else {}
+    if subject_kind != SUBJECT_REPOSITORY_FILE:
+        # The subject is platform-held content, which the caller has
+        # already handed us as ``source_code`` — it is rendered below
+        # as SOURCE_CODE. The same text also rides in the params as
+        # ``target_content``; rendering it there too would show the
+        # reviewer identical bytes under two different labels and
+        # double the prompt for a long specification. Drop only that
+        # one key: the pattern, the target name, any scoping and flags
+        # are what the reviewer needs and are left exactly as they
+        # arrived. This changes the prompt only — the stored params,
+        # what tier 1 evaluated, and any hash taken over them are
+        # untouched.
+        params.pop("target_content", None)
     params_json = json.dumps(
-        dict(assertion_params) if assertion_params else {},
+        params,
         indent=2,
         sort_keys=True,
         ensure_ascii=False,
@@ -237,6 +307,8 @@ def _build_message(
             "ASSERTION_TYPE": assertion_type,
             "ASSERTION_PARAMS": params_json,
             "SOURCE_CODE": source_code,
+            "SUBJECT_KIND": subject_kind,
+            "SUBJECT_LABEL": subject_label(subject_kind),
         },
     )
 

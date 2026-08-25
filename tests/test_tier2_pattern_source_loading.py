@@ -84,7 +84,10 @@ class TestRunnerLoadsPatternSource:
         captured = {}
 
         class FakeProvider:
-            def evaluate(self, *, assertion_type, assertion_params, source_code):
+            def evaluate(
+                self, *, assertion_type, assertion_params, source_code,
+                subject_kind="repository_file",
+            ):
                 captured["type"] = assertion_type
                 captured["params"] = dict(assertion_params)
                 captured["source_code"] = source_code
@@ -119,7 +122,10 @@ class TestRunnerLoadsPatternSource:
         captured = {}
 
         class FakeProvider:
-            def evaluate(self, *, assertion_type, assertion_params, source_code):
+            def evaluate(
+                self, *, assertion_type, assertion_params, source_code,
+                subject_kind="repository_file",
+            ):
                 captured["source_code"] = source_code
                 return True, "YES"
 

@@ -20,7 +20,10 @@ class _CapturingProvider:
         self.source_code = None
         self.calls = 0
 
-    def evaluate(self, *, assertion_type, assertion_params, source_code):
+    def evaluate(
+        self, *, assertion_type, assertion_params, source_code,
+        subject_kind="repository_file",
+    ):
         self.calls += 1
         self.source_code = source_code
         return True, "Meaningful logic."
@@ -211,10 +214,10 @@ class TestRunnerHandsReviewerTheDefinition:
         assert p.source_code == "def target():\n    return check()"
 
     def test_falls_back_to_file_when_block_cannot_be_isolated(self, tmp_path):
-        # The structural tier's Java/C# pattern accepts a modifier-prefixed
-        # declaration; the fallback line patterns cover it too, so use a
-        # form only the structural tier matches: a bare call-shaped line.
-        src = "int x = 1;\ntarget(1, 2);\nint y = 2;\n"
+        # A prototype declares the symbol without opening a body, so there
+        # is no block to cut: the structural tier accepts the declaration
+        # and the reviewer receives the enclosing file.
+        src = "int x = 1;\nint target(const char *s, size_t n);\nint y = 2;\n"
         (tmp_path / "svc.c").write_text(src, encoding="utf-8")
         p = _CapturingProvider()
         _verify(tmp_path, p, "function_exists", "target", filename="svc.c")

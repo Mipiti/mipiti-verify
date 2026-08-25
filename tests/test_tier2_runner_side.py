@@ -377,3 +377,112 @@ class TestParamsJsonSerialization:
             source_code="",
         )
         assert "מיפיתי" in msg
+
+
+# ---------------------------------------------------------------------------
+# Subject resolution (the runner is the only place that knows what it loaded)
+# ---------------------------------------------------------------------------
+
+
+class _SubjectCapturingProvider:
+    """Records the subject the runner declared for the loaded content."""
+
+    def __init__(self) -> None:
+        self.seen: dict = {}
+
+    def evaluate(
+        self, *, assertion_type, assertion_params, source_code,
+        subject_kind="repository_file",
+    ):
+        self.seen = {
+            "source_code": source_code,
+            "subject_kind": subject_kind,
+        }
+        return True, "ok"
+
+
+class TestRunnerResolvesSubject:
+    """Whichever branch loads the content also settles what it is.
+
+    The template states its criterion in terms of the subject, so a
+    feature-description assertion must not be handed to the reviewer
+    framed as a repository file.
+    """
+
+    def _runner(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from mipiti_verify.runner import Runner
+
+        return Runner(
+            client=MagicMock(),
+            project_root=str(tmp_path),
+            tier2_provider="anthropic",
+            repo="acme/widgets",
+        )
+
+    def test_target_content_is_declared_as_the_feature_description(self, tmp_path):
+        from unittest.mock import patch
+
+        design = "Uploads are scanned before they reach the bucket."
+        provider = _SubjectCapturingProvider()
+        runner = self._runner(tmp_path)
+
+        with patch("mipiti_verify.tier2.get_provider", return_value=provider):
+            result = runner._verify_tier2({
+                "id": "asrt_target",
+                "type": "pattern_matches",
+                "params": {
+                    "pattern": "scanned before",
+                    "target": "feature_description",
+                    "target_content": design,
+                },
+                "repo": "acme/widgets",
+            })
+
+        assert result["status"] == "pass"
+        assert provider.seen["source_code"] == design
+        assert provider.seen["subject_kind"] == "feature_description"
+
+    def test_file_content_stays_the_repository_file_subject(self, tmp_path):
+        from unittest.mock import patch
+
+        (tmp_path / "upload.py").write_text(
+            "def handler():\n    scan(payload)\n", encoding="utf-8",
+        )
+        provider = _SubjectCapturingProvider()
+        runner = self._runner(tmp_path)
+
+        with patch("mipiti_verify.tier2.get_provider", return_value=provider):
+            result = runner._verify_tier2({
+                "id": "asrt_file",
+                "type": "pattern_matches",
+                "params": {"pattern": "scan", "file": "upload.py"},
+                "repo": "acme/widgets",
+            })
+
+        assert result["status"] == "pass"
+        assert "scan(payload)" in provider.seen["source_code"]
+        assert provider.seen["subject_kind"] == "repository_file"
+
+    def test_unrecognised_target_keeps_the_repository_file_subject(self, tmp_path):
+        """A target the runner has no framing for is not silently
+        re-interpreted — it keeps the framing it had before."""
+        from unittest.mock import patch
+
+        provider = _SubjectCapturingProvider()
+        runner = self._runner(tmp_path)
+
+        with patch("mipiti_verify.tier2.get_provider", return_value=provider):
+            runner._verify_tier2({
+                "id": "asrt_future_target",
+                "type": "pattern_matches",
+                "params": {
+                    "pattern": "x",
+                    "target": "some_future_target",
+                    "target_content": "content of a subject we cannot frame",
+                },
+                "repo": "acme/widgets",
+            })
+
+        assert provider.seen["subject_kind"] == "repository_file"

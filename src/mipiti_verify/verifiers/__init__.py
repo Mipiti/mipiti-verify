@@ -105,13 +105,27 @@ def resolve_content(params: dict, project_root: Path) -> tuple[str | None, str]:
 
 
 def resolve_file_content(params: dict, project_root: Path) -> tuple[str | None, str]:
-    """Resolve assertion content from a codebase file only.
+    """Resolve assertion content from a repository file, refusing a target.
 
-    For verifiers whose subject is a repository artifact by definition (RTL
-    sources, for example) and for which platform-held content is not a valid
-    subject. A ``target`` param is refused rather than honoured, so the set
-    of types that accept a target is exactly the set that reads through
-    ``resolve_content``.
+    For verifiers whose subject is a repository artifact by definition
+    (RTL sources, for example): platform-held content is not a subject
+    they can be evaluated against, so a ``target`` param is refused
+    rather than honoured.
+
+    A type may accept a target only where both of these hold:
+
+    1. Its tier-1 predicate is a caller-supplied regex evaluated over
+       arbitrary text, drawing on no structure of a source language.
+    2. Its tier-2 criterion and its schema description are stated over
+       the matched text itself, not over the role the scanned artifact
+       plays in the running system.
+
+    ``pattern_matches`` and ``pattern_absent`` are the two types that
+    meet both, and they read through ``resolve_content``. A type that
+    fails either half means something different of a design
+    specification than it does of a file — a symbol found in prose
+    describes the prose, not anything the running system does — so it
+    resolves through here and its subject stays the file.
 
     Returns (content, source_label). content is None if the file is not found.
     Raises PathTraversalError for file path escapes.

@@ -18,6 +18,7 @@ from .customer_dsse_signer import (
     sign_verification_statement as sign_customer_dsse_statement,
 )
 from .sigstore_signer import sign_verification_statement
+from .tier2 import SUBJECT_FEATURE_DESCRIPTION, SUBJECT_REPOSITORY_FILE
 from .verifiers import get_verifier
 from .workspace_key_signer import WorkspaceKeySigner
 
@@ -40,6 +41,15 @@ _PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists", "test_passes"})
 # its tier-2 template can produce a sound YES/NO verdict from params
 # alone.
 _EMPTY_SOURCE_OK_TYPES: frozenset[str] = frozenset()
+
+# Tier-2 subject resolution: which platform ``target`` values name a
+# subject the tier-2 templates can frame in their own terms. An
+# assertion whose content came from a target the runner has no framing
+# for keeps the repository-file framing it had before subjects were
+# modelled — the conservative default, not a silent re-interpretation.
+_TARGET_SUBJECT_KINDS: dict[str, str] = {
+    "feature_description": SUBJECT_FEATURE_DESCRIPTION,
+}
 
 
 def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
@@ -833,13 +843,61 @@ class Runner:
         else:
             source_file = params.get("file", "")
         source_code = ""
+        # What the loaded content IS. The tier-2 template states its
+        # criterion in terms of the subject, so whichever branch below
+        # loads the content is also what settles the subject: a regex
+        # match in a repository file is code, the same match in the
+        # model's feature description is a design statement, and the
+        # two are not judged by the same rule. The runner is the only
+        # place that knows which one it loaded.
+        subject_kind = SUBJECT_REPOSITORY_FILE
         # For target-based assertions (e.g., feature_description), use
         # platform-injected content instead of reading from disk.
         # No truncation — content must match what Tier 1 verified via
         # resolve_content(). If it exceeds the provider's context window,
         # the provider will fail naturally with an informative error.
         if not source_file and params.get("target_content"):
-            source_code = params["target_content"]
+            # The mechanical tier evaluates its predicate over the
+            # SCOPED region of the target content — the same
+            # ``scope_start`` / ``scope_end`` slice it applies to a
+            # repository file — so that is the region its verdict
+            # speaks about. The tier-2 instruction text states, as
+            # trusted framing outside the boundary, that a mechanical
+            # step has already settled the regex over the payload
+            # below; handing over the whole target while the
+            # mechanical step read one section would make that framing
+            # false. Slice with the mechanical tier's own helper so
+            # both tiers read byte-identical text.
+            #
+            # Only the two pattern types may carry a target today, and
+            # they are exactly the types that scope through this
+            # helper. Applying it unconditionally keeps the invariant
+            # (tier 2 never reviews more than the mechanical tier
+            # judged) intact for any target-bearing type added later.
+            from .verifiers import RegexTimeoutError
+            from .verifiers.file_based import _extract_scope
+
+            try:
+                source_code = _extract_scope(params["target_content"], params)
+            except RegexTimeoutError as e:
+                # Fail closed, as the mechanical tier does on the same
+                # helper: a scope that cannot be evaluated leaves the
+                # reviewed region undetermined, and the unsliced
+                # content would ship that false framing. A scope that
+                # matches nothing yields empty content, which the
+                # pre-LLM guard below turns into its own refusal.
+                return {
+                    "status": "fail",
+                    "details": (
+                        f"Tier-2 could not resolve the assertion's scope over "
+                        f"the {params.get('target', 'target')!r} content: {e}. "
+                        f"Refusing to review a region wider than the one the "
+                        f"mechanical tier evaluated."
+                    ),
+                }
+            subject_kind = _TARGET_SUBJECT_KINDS.get(
+                params.get("target", ""), SUBJECT_REPOSITORY_FILE
+            )
         elif not source_file and a_type in _PATTERN_GLOB_TYPES:
             # Pattern-based types (test_exists, test_passes) use
             # ``params["pattern"]`` and tier-1 globs it. Mirror that
@@ -1038,6 +1096,7 @@ class Runner:
                 assertion_type=a_type,
                 assertion_params=a_params,
                 source_code=source_code,
+                subject_kind=subject_kind,
             )
             return {
                 "status": "pass" if passed else "fail",

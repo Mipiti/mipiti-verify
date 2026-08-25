@@ -33,7 +33,10 @@ class TestFailClosedOnEmptySource:
         llm_called = {"called": False}
 
         class FakeProvider:
-            def evaluate(self, *, assertion_type, assertion_params, source_code):
+            def evaluate(
+                self, *, assertion_type, assertion_params, source_code,
+                subject_kind="repository_file",
+            ):
                 llm_called["called"] = True
                 return True, "YES"
 
@@ -66,7 +69,10 @@ class TestFailClosedOnEmptySource:
         llm_called = {"called": False}
 
         class FakeProvider:
-            def evaluate(self, *, assertion_type, assertion_params, source_code):
+            def evaluate(
+                self, *, assertion_type, assertion_params, source_code,
+                subject_kind="repository_file",
+            ):
                 llm_called["called"] = True
                 return True, "YES"
 
@@ -101,7 +107,10 @@ class TestFailClosedOnEmptySource:
         llm_called = {"called": False, "source": ""}
 
         class FakeProvider:
-            def evaluate(self, *, assertion_type, assertion_params, source_code):
+            def evaluate(
+                self, *, assertion_type, assertion_params, source_code,
+                subject_kind="repository_file",
+            ):
                 llm_called["called"] = True
                 llm_called["source"] = source_code
                 return True, "YES"

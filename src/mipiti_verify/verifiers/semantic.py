@@ -9,7 +9,7 @@ from __future__ import annotations
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, resolve_content
+from . import PathTraversalError, VerifierResult, register, resolve_file_content
 
 
 @register("parameter_validated")
@@ -18,7 +18,7 @@ class ParameterValidatedVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -49,7 +49,7 @@ class ErrorHandledVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -94,7 +94,7 @@ class MiddlewareRegisteredVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
@@ -129,7 +129,7 @@ class HttpHeaderSetVerifier:
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
