@@ -22,7 +22,10 @@ class _FakeYesProvider:
     def __init__(self, called):
         self._called = called
 
-    def evaluate(self, *, assertion_type, assertion_params, source_code):
+    def evaluate(
+        self, *, assertion_type, assertion_params, source_code,
+        subject_kind="repository_file",
+    ):
         self._called["called"] = True
         return True, "YES"
 

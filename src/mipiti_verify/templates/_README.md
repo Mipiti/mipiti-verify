@@ -32,6 +32,32 @@ Every template receives the same variable set:
   Always wrapped in `| untrusted` as a JSON-serialized blob.
 - `SOURCE_CODE` — text of the source-under-review excerpt. Always
   wrapped in `| untrusted`.
+- `SUBJECT_KIND` — what `SOURCE_CODE` actually is: `repository_file`
+  or `feature_description` (see the `SUBJECT_*` constants in
+  `tier2.py`). NOT wrapped in `| untrusted` — the runner settles it
+  when it loads the content, from the branch it took to load it, and
+  an unrecognised value falls back to `repository_file`. It never
+  carries assertion-controlled text into the prompt.
+- `SUBJECT_LABEL` — the human-readable name of that subject, from
+  `tier2.subject_label`. Also runner-chosen, also outside the
+  boundary, and also falls back to the repository-file wording for an
+  unrecognised kind.
+
+### Branching on the subject
+
+Only `tier2_pattern_matches.j2` and `tier2_pattern_absent.j2` branch on
+`SUBJECT_KIND`, because only `pattern_matches` and `pattern_absent`
+accept a platform target. Their criterion has to name the right
+subject: a regex match in a repository file is code, while the same
+match in a feature description is a design statement, and the two are
+not judged by the same rule.
+
+Every other template ignores both variables, and the file-subject
+rendering of the two that do branch is unchanged — `repository_file`
+is the default and takes the `{%- else -%}` arm, which holds the exact
+wording those templates had before subjects were modelled. Adding a
+branch to a template only makes sense once its type is one a target
+may name.
 
 ## Response shape
 

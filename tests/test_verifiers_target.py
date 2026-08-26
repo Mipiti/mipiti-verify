@@ -1,4 +1,8 @@
-"""Tests for verifiers using target_content instead of file (Flow M)."""
+"""Tests for verifiers using target_content instead of file (Flow M).
+
+Only pattern_matches and pattern_absent accept a target; every other type
+verifies a repository file and refuses one.
+"""
 
 from pathlib import Path
 
@@ -61,9 +65,12 @@ class TestPatternAbsentWithTarget:
         assert r.passed is False
 
 
-class TestFunctionExistsWithTarget:
-    def test_function_exists_with_target_content(self, project_root: Path):
-        """function_exists verifier passes when function found in target_content."""
+
+class TestFunctionExistsRefusesTarget:
+    """function_exists verifies a repository file; a platform target is refused."""
+
+    def test_target_is_refused_when_content_would_pass(self, project_root: Path):
+        """Refusal, not a pass, when target_content holds a matching definition."""
         params = {
             "target": "feature_description",
             "target_content": "def validate_input(data):\n    return len(data) > 0\n",
@@ -71,11 +78,11 @@ class TestFunctionExistsWithTarget:
         }
         v = FunctionExistsVerifier()
         r = v.verify(params, project_root)
-        assert r.passed is True
-        assert "validate_input" in r.details
+        assert r.passed is False
+        assert "does not accept a 'target'" in r.details
 
-    def test_function_exists_missing_with_target_content(self, project_root: Path):
-        """function_exists verifier fails when function not in target_content."""
+    def test_target_is_refused_when_content_would_fail(self, project_root: Path):
+        """Refusal, not a symbol-absent failure, when target_content lacks the name."""
         params = {
             "target": "feature_description",
             "target_content": "def other_function(x):\n    pass\n",
@@ -84,11 +91,14 @@ class TestFunctionExistsWithTarget:
         v = FunctionExistsVerifier()
         r = v.verify(params, project_root)
         assert r.passed is False
+        assert "does not accept a 'target'" in r.details
 
 
-class TestNoPlaintextSecretWithTarget:
-    def test_no_plaintext_secret_with_target_content(self, project_root: Path):
-        """no_plaintext_secret verifier passes when no secrets in target_content."""
+class TestNoPlaintextSecretRefusesTarget:
+    """no_plaintext_secret verifies a repository file; a platform target is refused."""
+
+    def test_target_is_refused_when_content_would_pass(self, project_root: Path):
+        """Refusal, not a pass, when target_content holds no secret."""
         params = {
             "target": "feature_description",
             "target_content": 'DB_URL = os.getenv("DATABASE_URL")\nAPI_KEY = os.getenv("API_KEY")\n',
@@ -99,10 +109,11 @@ class TestNoPlaintextSecretWithTarget:
         }
         v = NoPlaintextSecretVerifier()
         r = v.verify(params, project_root)
-        assert r.passed is True
+        assert r.passed is False
+        assert "does not accept a 'target'" in r.details
 
-    def test_no_plaintext_secret_fails_with_target_content(self, project_root: Path):
-        """no_plaintext_secret verifier fails when secrets found in target_content."""
+    def test_target_is_refused_when_content_would_fail(self, project_root: Path):
+        """Refusal, not a secret-found failure, when target_content holds a secret."""
         params = {
             "target": "feature_description",
             "target_content": 'password = "hunter2"\n',
@@ -111,11 +122,14 @@ class TestNoPlaintextSecretWithTarget:
         v = NoPlaintextSecretVerifier()
         r = v.verify(params, project_root)
         assert r.passed is False
+        assert "does not accept a 'target'" in r.details
 
 
-class TestEnvVarReferencedWithTarget:
-    def test_env_var_referenced_with_target_content(self, project_root: Path):
-        """env_var_referenced verifier passes when env var found in target_content."""
+class TestEnvVarReferencedRefusesTarget:
+    """env_var_referenced verifies a repository file; a platform target is refused."""
+
+    def test_target_is_refused_when_content_would_pass(self, project_root: Path):
+        """Refusal, not a pass, when target_content references the variable."""
         params = {
             "target": "feature_description",
             "target_content": 'secret = os.getenv("SECRET_KEY")\n',
@@ -123,11 +137,11 @@ class TestEnvVarReferencedWithTarget:
         }
         v = EnvVarReferencedVerifier()
         r = v.verify(params, project_root)
-        assert r.passed is True
-        assert "SECRET_KEY" in r.details
+        assert r.passed is False
+        assert "does not accept a 'target'" in r.details
 
-    def test_env_var_referenced_missing_with_target_content(self, project_root: Path):
-        """env_var_referenced verifier fails when env var not in target_content."""
+    def test_target_is_refused_when_content_would_fail(self, project_root: Path):
+        """Refusal, not a variable-absent failure, when target_content omits it."""
         params = {
             "target": "feature_description",
             "target_content": "x = 42\n",
@@ -136,3 +150,4 @@ class TestEnvVarReferencedWithTarget:
         v = EnvVarReferencedVerifier()
         r = v.verify(params, project_root)
         assert r.passed is False
+        assert "does not accept a 'target'" in r.details

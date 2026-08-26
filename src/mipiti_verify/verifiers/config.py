@@ -6,7 +6,7 @@ import json
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, RegexTimeoutError, VerifierResult, register, resolve_content, safe_read_file, safe_regex_search, safe_resolve_path
+from . import PathTraversalError, RegexTimeoutError, VerifierResult, register, resolve_file_content, safe_read_file, safe_regex_search, safe_resolve_path
 
 
 def _parse_config(project_root: Path, file_param: str) -> dict | None:
@@ -154,7 +154,7 @@ class ConfigValueMatchesVerifier:
 class EnvVarReferencedVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
-            content, source = resolve_content(params, project_root)
+            content, source = resolve_file_content(params, project_root)
         except (PathTraversalError, ValueError) as e:
             return VerifierResult(passed=False, details=str(e))
         if content is None:
