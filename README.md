@@ -342,4 +342,4 @@ This produces `requirements.lock` and `requirements-all.lock` with SHA-256 hashe
 
 ## License
 
-Proprietary. Copyright (c) 2026 Mipiti, LLC. All rights reserved. See [LICENSE](LICENSE) for details.
+Proprietary. Copyright (c) 2026 Mipiti, Inc. All rights reserved. See [LICENSE](LICENSE) for details.
