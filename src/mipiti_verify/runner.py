@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -1058,24 +1059,43 @@ class Runner:
         # genuinely present still proceeds to the quality check unchanged. Fail
         # open on an unexpected verifier error (tier 1 remains the independent
         # structural authority on its own pass).
-        if a_type in ("function_exists", "class_exists"):
-            structural = get_verifier(a_type)
-            if structural is not None:
-                try:
-                    present = structural.verify(params, self.project_root)
-                except Exception:
-                    present = None
-                if present is not None and not present.passed:
-                    return {
-                        "status": "fail",
-                        "details": (
-                            f"Tier-2 refused: the {a_type} target is not "
-                            f"present in the source ({present.details}). "
-                            f"Tier-2 is a semantic check and cannot affirm a "
-                            f"symbol's existence — the structural check is the "
-                            f"authority, and it did not find the symbol."
-                        ),
-                    }
+        # Applies to every DECLARATION type, not only the two symbol types:
+        # whatever mechanical criterion tier 1 owns — a file present, an import
+        # declared, a pattern matched, a dependency pinned — the semantic tier
+        # is a quality gate layered on it and cannot affirm the criterion
+        # itself.
+        #
+        # Scoped to verifiers that are pure and cheap, because the precheck
+        # RE-RUNS the structural verifier. Types whose verifier executes code
+        # or does substantial work are excluded: running a test suite as a side
+        # effect of a semantic check would duplicate the execution tier 1
+        # already performed.
+        # Skipped for target-based assertions: those are judged against content
+        # supplied with the assertion rather than a repository file, so a
+        # file-oriented structural verifier has nothing to re-check and would
+        # report a failure about the wrong subject.
+        structural_verdict = None
+        structural = (
+            get_verifier(a_type)
+            if a_type in _DECLARATION_TYPES and not params.get("target")
+            else None
+        )
+        if structural is not None:
+            try:
+                structural_verdict = structural.verify(params, self.project_root)
+            except Exception:
+                structural_verdict = None
+            if structural_verdict is not None and not structural_verdict.passed:
+                return {
+                    "status": "fail",
+                    "details": (
+                        f"Tier-2 refused: the {a_type} criterion does not hold "
+                        f"structurally ({structural_verdict.details}). Tier-2 is "
+                        f"a semantic check and cannot affirm a structural fact — "
+                        f"the structural check is the authority, and it did not "
+                        f"hold."
+                    ),
+                }
 
         try:
             from .tier2 import get_provider
@@ -1098,17 +1118,78 @@ class Runner:
                 source_code=source_code,
                 subject_kind=subject_kind,
             )
+            reviewer = f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}"
+            if (
+                not passed
+                and structural_verdict is not None
+                and structural_verdict.passed
+                and _declared_not_found(reasoning)
+            ):
+                # The structural tier holds and the semantic tier declined on
+                # the ground that it could not find the target. Those cannot
+                # both be true, and existence is not the semantic tier's to
+                # decide, so the verdict is discarded rather than recorded.
+                # Inconclusive, not a pass: the quality question went
+                # unanswered, and inventing a pass would be the same boundary
+                # violation in the opposite direction.
+                return {
+                    "status": "skipped",
+                    "details": (
+                        "Tier-2 verdict discarded: it declined on NOT_FOUND "
+                        "while the structural check confirms the target is "
+                        "present. Existence is settled structurally; tier-2 "
+                        "may only judge quality. The quality question is "
+                        "unanswered."
+                    ),
+                    "reasoning": reasoning,
+                    "reviewer": reviewer,
+                }
             return {
                 "status": "pass" if passed else "fail",
                 "details": reasoning,
                 "reasoning": reasoning,
-                "reviewer": f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}",
+                "reviewer": reviewer,
             }
         except ImportError as e:
             return {"status": "skipped", "details": f"Provider not available: {e}"}
         except Exception as e:
             return {"status": "fail", "details": f"Tier 2 error: {e}"}
 
+
+
+_DECLARATION_TYPES = frozenset({
+    # Types whose structural verifier answers a pure question about what the
+    # source DECLARES, with no execution and no significant cost, so it is safe
+    # to re-run while deciding whether the semantic tier may speak at all.
+    "class_exists", "config_key_exists", "config_value_matches",
+    "decorator_present", "dependency_exists", "dependency_version",
+    "env_var_referenced", "file_exists", "file_hash", "function_calls",
+    "function_exists", "http_header_set", "import_present",
+    "middleware_registered", "module_exists", "module_instantiated",
+    "no_plaintext_secret", "parameter_defined", "parameter_validated",
+    "pattern_absent", "pattern_matches", "port_exists", "register_reset",
+    "signal_exists", "sva_assertion_present", "test_exists",
+    # Deliberately absent: ``test_passes`` and ``error_handled`` — their
+    # verifiers run the code under test, and tier 1 already owns that result.
+})
+
+
+_NOT_FOUND_DECLARATION = re.compile(
+    r"^\s*REASON:\s*NOT_FOUND\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _declared_not_found(reasoning: str) -> bool:
+    """True when a refusal DECLARES it could not locate the target.
+
+    Read from the declared reason line the templates require on a NO, not
+    inferred from prose: a quality refusal may legitimately describe something
+    as absent ("contains no assertions") without that being a claim about the
+    target's existence, and inferring intent from free text would override real
+    downgrades. Absent the line — an older or third-party provider that does
+    not emit one — this is False and the verdict stands, so the check can only
+    ever discard a verdict that says in the protocol what it means.
+    """
+    return bool(_NOT_FOUND_DECLARATION.search(reasoning or ""))
 
 
 def _auto_detect_repo(project_root: Path) -> str:

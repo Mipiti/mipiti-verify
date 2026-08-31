@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The boundary between the two verification tiers is now enforced in both
+  directions, and across every declaration type rather than two symbol types.
+
+  Whether a criterion holds structurally — a symbol defined, a file present, an
+  import declared, a pattern matched, a dependency pinned — is settled by the
+  structural tier. The semantic tier is a quality gate layered on that fact: it
+  may judge a present target insufficient, and it may not decide the fact
+  itself.
+
+  Previously that was enforced only on entry: the semantic tier was refused
+  when the structural check did not hold. It could still DECLINE a target the
+  structural check had confirmed, on the ground that it could not locate it,
+  which contradicts a settled fact rather than judging quality. Such a verdict
+  is now discarded and the result reported as inconclusive, never converted
+  into a pass — affirming would be the same boundary violation reversed.
+
+  To make this decidable rather than inferred, a refusal now declares its
+  reason (`REASON: QUALITY` or `REASON: NOT_FOUND`) on the line after the
+  verdict. The check reads that declaration and never interprets prose, so a
+  quality refusal that happens to describe something as absent is untouched,
+  and a provider that emits no declaration has its verdicts left as they are.
+
+  The entry check also widens from two symbol types to every declaration type.
+  It stays scoped to verifiers that are pure and cheap, since it re-runs them:
+  types whose verifier executes the code under test are excluded, as running a
+  test suite as a side effect of a semantic check would duplicate work the
+  structural tier already did. Assertions judged against supplied content
+  rather than a repository file are likewise exempt.
+
+
 ### Changed
 
 - The signed attestation payload now carries each assertion's content
