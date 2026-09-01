@@ -42,6 +42,28 @@ class TestParseResponse:
         assert passed is True
         assert "validates input" in reasoning
 
+    def test_a_bare_verdict_records_no_reason(self):
+        """A verdict is not its own explanation.
+
+        Echoing the verdict token back as the reasoning manufactures a
+        justification: a stored "YES" reads downstream as a recorded reason
+        rather than an absent one, which is worse than recording nothing —
+        consumers can render an absence honestly, they cannot detect a
+        fabrication.
+        """
+        for verdict in ("YES", "NO", "PASS", "FAIL"):
+            passed, reasoning = _parse_response(verdict)
+            assert reasoning == "", f"{verdict!r} was echoed back as its own reason"
+
+    def test_a_bare_verdict_still_parses_its_verdict(self):
+        """Dropping the fabricated reason must not affect the verdict itself."""
+        assert _parse_response("YES")[0] is True
+        assert _parse_response("NO")[0] is False
+
+    def test_trailing_newline_alone_is_not_a_reason(self):
+        passed, reasoning = _parse_response("YES\n")
+        assert passed is True and reasoning == ""
+
     def test_no_response(self):
         passed, reasoning = _parse_response("NO\nNo validation found.")
         assert passed is False
