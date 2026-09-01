@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A semantic verdict that arrives with no explanation now records no reason,
+  instead of echoing the verdict token back as one.
+
+  When a response carried nothing after its verdict line, the parser used the
+  whole response as the reasoning — so a bare `YES` was stored as the
+  justification for itself. Downstream that is indistinguishable from a real
+  explanation, and worse than storing nothing: a consumer can render an absent
+  reason honestly, but cannot detect a fabricated one.
+
+  The verdict itself is unaffected; only the recorded reason changes, and only
+  when there was never a reason to record.
+
+
+### Fixed
+
 - The boundary between the two verification tiers is now enforced in both
   directions, and across every declaration type rather than two symbol types.
 

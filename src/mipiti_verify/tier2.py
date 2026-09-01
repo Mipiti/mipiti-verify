@@ -320,7 +320,12 @@ def _parse_response(text: str) -> Tuple[bool, str]:
     """
     text = text.strip()
     first_line = text.split("\n", 1)[0].strip().upper()
-    reasoning = text.split("\n", 1)[1].strip() if "\n" in text else text
+    # A verdict is not its own reason. When the response carries nothing after
+    # the verdict line there IS no reasoning, and echoing the verdict token
+    # back as the explanation manufactures one — a stored "YES" then reads as
+    # a recorded justification rather than as an absent one, which is worse
+    # than recording nothing.
+    reasoning = text.split("\n", 1)[1].strip() if "\n" in text else ""
 
     if re.match(r"^(YES|PASS|VERIFIED|COHERENT|SUFFICIENT)\b", first_line):
         return True, reasoning
