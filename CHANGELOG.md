@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The workflow example in the README pinned `actions/checkout` at v4.3.1, which
+  runs on a Node.js version GitHub now forces onto a newer runtime and has
+  announced for removal. Anyone who copied the snippet inherited the warning on
+  every run. Now pinned to v6.0.2, matching the pin this project's own workflows
+  already use.
+
 - A semantic verdict that arrives with no explanation now records no reason,
   instead of echoing the verdict token back as one.
 
