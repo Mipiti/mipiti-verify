@@ -375,6 +375,97 @@ def main() -> None:
     """Turnkey CI verification for Mipiti threat model assertions."""
 
 
+@main.command(name="attest-tests")
+@click.option("--junit", "junit_path", required=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="JUnit XML report produced by the test run")
+@click.option("--project-root", type=click.Path(exists=True), default=".",
+              help="Project root directory")
+@click.option("--commit", default="", help="Commit the run covers (default: CI env or .git/HEAD)")
+@click.option("--pattern", default="", help="Selector the run used, recorded for the reader")
+@click.option("--invocation", default="", help="Command the run executed, recorded for the reader")
+@click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
+              default="", type=click.Path(dir_okay=False),
+              help="ECDSA P-256 private key (PEM) for CI with no workload identity. Ignored where a CI identity is available, which signs keylessly.")
+@click.option("--key-passphrase", envvar="MIPITI_ATTESTATION_KEY_PASSPHRASE",
+              default="", help="Passphrase for an encrypted signing key.")
+@click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL")
+@click.option("--sigstore-trust-config", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Pre-downloaded Sigstore ClientTrustConfig JSON, for air-gapped CI")
+def attest_tests(junit_path: str, project_root: str, commit: str,
+                 pattern: str, invocation: str, key_path: str,
+                 key_passphrase: str, sigstore_tuf_url: str,
+                 sigstore_trust_config: str) -> None:
+    """Record that this CI job's tests ran, as a signed statement.
+
+    Reads a report the test run already produced. It does not run tests; the
+    workflow step that does is yours, and this command never invokes one.
+
+    Write this into the job that runs the tests, after them:
+
+        pytest --junitxml=report.xml
+        mipiti-verify attest-tests --junit report.xml
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from .attestation import (
+        ATTESTATION_DIR, AttestationError, build_statement, head_commit,
+        parse_junit, sign_statement,
+    )
+    from .runner import _auto_detect_oidc
+
+    root = _Path(project_root)
+    try:
+        summary = parse_junit(_Path(junit_path))
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    resolved_commit = commit.strip() or head_commit(root)
+    if not resolved_commit:
+        click.echo(
+            "Error: could not determine the commit this run covers. Pass "
+            "--commit explicitly.", err=True)
+        raise SystemExit(1)
+
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=invocation.split() if invocation else [],
+        selected_pattern=pattern,
+    )
+    # Same identity ladder the verification run uses: a CI workload identity
+    # first, an explicit key where none exists, unsigned only when neither is
+    # available.
+    attestation, provenance = sign_statement(
+        statement,
+        identity_token=_auto_detect_oidc("sigstore"),
+        key_path=key_path,
+        key_passphrase=key_passphrase,
+        tuf_url=sigstore_tuf_url,
+        trust_config_path=sigstore_trust_config,
+    )
+
+    out_dir = root / ATTESTATION_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"tests-{resolved_commit[:12]}.json"
+    out_path.write_text(attestation, encoding="utf-8")
+
+    totals = statement["predicate"]["totals"]
+    click.echo(
+        f"Attested {totals['total']} test(s) at {resolved_commit[:12]} "
+        f"({totals['passed']} passed, {totals['failed']} failed, "
+        f"{totals['skipped']} skipped) -> {out_path}"
+    )
+    click.echo(f"Signing identity: {provenance}")
+    if provenance == "unsigned":
+        click.echo(
+            "Note: no CI workload identity and no --signing-key, so this is "
+            "recorded as self-declared evidence.", err=True)
+
+
 @main.command()
 @click.argument("model_id", required=False, default=None)
 @click.option("--all", "run_all", is_flag=True, help="Verify all models in the API key's workspace")

@@ -1,11 +1,6 @@
 """Tests for test verifiers."""
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-from mipiti_verify.verifiers.tests import TestExistsVerifier, TestPassesVerifier
+from mipiti_verify.verifiers.tests import TestExistsVerifier
 
 
 class TestTestExists:
@@ -35,34 +30,7 @@ class TestTestExists:
         assert r.passed is True
 
 
-class TestTestPasses:
-    @patch("mipiti_verify.verifiers.tests.subprocess")
-    def test_tests_pass(self, mock_subprocess, project_root):
-        mock_subprocess.run.return_value = MagicMock(returncode=0, stdout="1 passed", stderr="")
-        (project_root / "pyproject.toml").write_text("[tool.pytest]\n")
-
-        v = TestPassesVerifier()
-        r = v.verify({"pattern": "test_auth"}, project_root)
-        assert r.passed is True
-
-    @patch("mipiti_verify.verifiers.tests.subprocess")
-    def test_tests_fail(self, mock_subprocess, project_root):
-        mock_subprocess.run.return_value = MagicMock(returncode=1, stdout="1 failed", stderr="")
-        (project_root / "pyproject.toml").write_text("[tool.pytest]\n")
-
-        v = TestPassesVerifier()
-        r = v.verify({"pattern": "test_auth"}, project_root)
-        assert r.passed is False
-
-    @patch("mipiti_verify.verifiers.tests.subprocess")
-    def test_tests_timeout(self, mock_subprocess, project_root):
-        import subprocess as real_subprocess
-
-        mock_subprocess.run.side_effect = real_subprocess.TimeoutExpired(cmd="pytest", timeout=300)
-        mock_subprocess.TimeoutExpired = real_subprocess.TimeoutExpired
-        (project_root / "pyproject.toml").write_text("[tool.pytest]\n")
-
-        v = TestPassesVerifier()
-        r = v.verify({"pattern": "test_auth"}, project_root)
-        assert r.passed is False
-        assert "timed out" in r.details
+# TestTestPasses was removed with the verifier it covered. It asserted that a
+# selector from an assertion was handed to subprocess.run -- the capability the
+# replacement exists to eliminate. Coverage for the successor lives in
+# tests/test_test_attested.py.

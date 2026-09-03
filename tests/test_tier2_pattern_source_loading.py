@@ -1,6 +1,6 @@
 """Tier-2 pattern-based source loading.
 
-Pattern-based tier-2 types (``test_exists``, ``test_passes``) use
+Pattern-based tier-2 types (``test_exists``) use
 ``params["pattern"]`` instead of ``params["file"]``. The runner must
 glob the pattern the same way tier-1 does and load the matched file
 content into SOURCE_CODE — previously it looked up ``params["file"]``
@@ -107,11 +107,30 @@ class TestRunnerLoadsPatternSource:
         assert "test_verify_token_rejects_expired" in captured["source_code"]
         assert "# === " in captured["source_code"]
 
-    def test_test_passes_source_code_populated(self, tmp_path):
-        (tmp_path / "tests").mkdir()
-        (tmp_path / "tests" / "test_x.py").write_text(
-            "def test_thing():\n    assert True\n", encoding="utf-8"
+    def test_test_attested_source_is_the_attestation(self, tmp_path):
+        """test_attested has no source file to glob -- its evidence is the
+        signed statement, so tier 2 is handed that instead of empty content."""
+        import json as _json
+
+        from mipiti_verify.attestation import (
+            ATTESTATION_DIR, build_statement, parse_junit, sign_statement,
         )
+
+        report = tmp_path / "r.xml"
+        report.write_text(
+            '<testsuites><testsuite name="s">'
+            '<testcase classname="t" name="test_thing"/>'
+            "</testsuite></testsuites>",
+            encoding="utf-8",
+        )
+        statement = build_statement(
+            commit="a" * 40, summary=parse_junit(report), invocation=["pytest"],
+        )
+        att_dir = tmp_path / ATTESTATION_DIR
+        att_dir.mkdir(parents=True)
+        attestation, _ = sign_statement(statement)
+        (att_dir / "tests.json").write_text(attestation, encoding="utf-8")
+
         client = MagicMock()
         runner = Runner(
             client=client,
@@ -132,11 +151,12 @@ class TestRunnerLoadsPatternSource:
         with patch("mipiti_verify.tier2.get_provider", return_value=FakeProvider()):
             runner._verify_tier2(
                 {
-                    "id": "asrt_pattern_2",
-                    "type": "test_passes",
-                    "params": {"pattern": "tests/test_x.py"},
+                    "id": "asrt_attested_1",
+                    "type": "test_attested",
+                    "params": {"test": "test_thing"},
                     "repo": "acme/widgets",
                 }
             )
 
         assert "test_thing" in captured["source_code"]
+        assert "predicate" in captured["source_code"]

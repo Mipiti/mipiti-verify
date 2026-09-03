@@ -233,10 +233,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Your tests, run by you. Write a JUnit report so the result can be
+      # recorded as evidence; verification reads it and runs nothing itself.
+      - run: pytest --junitxml=report.xml
+
       - uses: Mipiti/mipiti-verify@103af2761170eb61b0b17af23bbd800d557175b8 # v0.51.5
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}
+
+          # Needed for test_attested assertions. Points at the report the step
+          # above wrote; the action records a signed attestation from it before
+          # verifying. Space-separate several paths for more than one suite.
+          # Signed keylessly through Sigstore using the run's OIDC token — no
+          # secret to create or rotate. Only CI without a workload identity
+          # needs attestation-signing-key.
+          junit-report: report.xml
 
           # Model selection (one of these)
           all: true                    # Verify all models in the workspace
@@ -299,13 +312,13 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 
 ## Two-Tier Verification
 
-**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls:
+**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls. No assertion type executes project code:
 - `function_exists`, `class_exists`, `decorator_present`, `function_calls`
 - `pattern_matches`, `pattern_absent`, `import_present`
 - `file_exists`, `file_hash`
 - `config_key_exists`, `config_value_matches`
 - `dependency_exists`, `dependency_version`
-- `test_passes`, `test_exists`
+- `test_attested`, `test_exists`
 - `env_var_referenced`, `error_handled`
 - `no_plaintext_secret`, `middleware_registered`, `http_header_set`
 - `module_exists`, `module_instantiated`, `port_exists`, `parameter_defined`, `signal_exists`, `sva_assertion_present`, `register_reset` (RTL/Verilog)

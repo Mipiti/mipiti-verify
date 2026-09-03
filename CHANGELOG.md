@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`test_passes` is replaced by `test_attested`.** Verification is a read-only
+  operation: it reads evidence your project already produced and runs nothing.
+  `test_passes` was the one type that did not fit that rule, so it is removed.
+
+  A test result now reaches verification as a statement your CI signed about a
+  run your own workflow performed. Have your test step write a JUnit report and
+  point the action at it:
+
+  ```yaml
+  - run: pytest --junitxml=report.xml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      all: true
+      junit-report: report.xml
+  ```
+
+  No extra step, nothing to install, and no secret: the attestation is signed
+  keylessly with the run's own OIDC identity, the same way verification runs
+  are already signed. The certificate binds the repository, ref and workflow,
+  so the result carries where it came from. CI with no workload identity signs
+  with `attestation-signing-key` (ECDSA P-256) instead, and CI with neither
+  records the result as self-declared.
+
+  Outside GitHub Actions the equivalent is `mipiti-verify attest-tests --junit
+  report.xml`, run after your tests. Either way the report is read, never
+  produced -- the step that runs your tests is yours.
+
+  Verification pins the signing identity it expects: for a keyless signature,
+  the workflow of the repository being verified; for a key, one the reader
+  configured, never the key carried inside the attestation. Verification then
+  checks the signature, that the attestation covers the commit under
+  verification, that the run selected tests and that they passed, and that the
+  named test appears in it. A run that selected nothing, or in which everything
+  was skipped, is rejected rather than treated as a pass -- both otherwise
+  present as a zero failure count.
+
+  An attestation without a signature is accepted and recorded as self-declared
+  only where no verification key is configured. Where one is, an unsigned
+  attestation is refused, so removing a signature cannot lower the bar a result
+  is held to.
+
+  With this change no assertion type executes anything.
+
 ### Fixed
 
 - The workflow example in the README pinned `actions/checkout` at v4.3.1, which
