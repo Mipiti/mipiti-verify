@@ -528,3 +528,78 @@ def test_an_assertion_without_an_env_param_is_unaffected(project, monkeypatch):
     """The field is additive: existing assertions do not start failing."""
     _write_attestation(project)
     assert _verify(project, {"test": NAMED_TEST}, monkeypatch=monkeypatch).passed is True
+
+
+# ---------------------------------------------------------------------------
+# The keyless path is reachable
+# ---------------------------------------------------------------------------
+
+def test_the_keyless_verifier_helper_resolves():
+    """The strongest provenance class must not fail on a bad import.
+
+    Every other test in this file deletes the workload-identity variables, so
+    the keyless branch is never entered and a wiring error inside it stays
+    invisible until a real CI run reaches it.
+    """
+    from mipiti_verify.cli import _build_sigstore_verifier  # noqa: F401
+
+
+def test_a_malformed_keyless_attestation_fails_as_an_attestation_error(monkeypatch):
+    """Typed, so the verifier's loop can move on to the next envelope.
+
+    An untyped exception escaping here does not fail one attestation, it ends
+    the whole verification run.
+    """
+    monkeypatch.setenv("GITHUB_WORKFLOW_REF", "o/r/.github/workflows/ci.yml@refs/heads/main")
+    identity, issuer = expected_ci_identity()
+    assert identity and issuer
+
+    with pytest.raises(AttestationError):
+        verify_attestation(
+            '{"mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3"}',
+            expected_identity=identity,
+            expected_issuer=issuer,
+        )
+
+
+def test_a_second_suite_does_not_overwrite_the_first(tmp_path, monkeypatch):
+    """Several reports in one run share a commit, so the filename cannot be
+    keyed on the commit alone or each suite erases the last."""
+    from click.testing import CliRunner
+
+    from mipiti_verify.cli import attest_tests
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text(COMMIT)
+    for name, test in (("api", "test_api_thing"), ("web", "test_web_thing")):
+        (tmp_path / f"{name}.xml").write_text(
+            f'<testsuites><testsuite name="s">'
+            f'<testcase classname="t" name="{test}"/></testsuite></testsuites>')
+        r = CliRunner().invoke(attest_tests, ["--junit", f"{name}.xml"])
+        assert r.exit_code == 0, r.output
+
+    written = sorted((tmp_path / ATTESTATION_DIR).glob("*.json"))
+    assert len(written) == 2, [p.name for p in written]
+
+    v = get_verifier("test_attested")
+    for test in ("test_api_thing", "test_web_thing"):
+        assert v.verify({"test": test}, tmp_path).passed is True, test
+
+
+def test_one_unreadable_envelope_does_not_hide_a_sound_one(project, monkeypatch):
+    """Envelopes are read in filename order, so a bad file sorting first must
+    not end the run before a good one later is reached."""
+    _write_attestation(project)
+    good = (project / ATTESTATION_DIR / "tests.json").read_text()
+    # A payload that decodes to a non-object: every field read assumes a
+    # mapping, so this once raised an untyped error out of the whole run.
+    (project / ATTESTATION_DIR / "aaa-broken.json").write_text(json.dumps({
+        "v": 1, "kind": "unsigned", "payloadType": "application/vnd.in-toto+json",
+        "payload": base64.b64encode(b"[1,2,3]").decode(),
+    }))
+    (project / ATTESTATION_DIR / "zzz-good.json").write_text(good)
+    (project / ATTESTATION_DIR / "tests.json").unlink()
+
+    r = _verify(project, {"test": NAMED_TEST}, monkeypatch=monkeypatch)
+    assert r.passed is True

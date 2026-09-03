@@ -96,6 +96,12 @@ class TestAttestedVerifier:
             except AttestationError as e:
                 problems.append(str(e))
                 continue
+            except Exception as e:  # noqa: BLE001
+                # Envelopes are read in filename order, so an unreadable one
+                # early in the directory would otherwise hide a sound one
+                # later. A bad file is one problem, not the end of the run.
+                problems.append(f"{type(e).__name__}: {e}")
+                continue
 
             result = self._check(
                 statement, test_name, commit, provenance, params.get("env"))

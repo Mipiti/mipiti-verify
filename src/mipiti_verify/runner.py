@@ -66,12 +66,38 @@ def _load_attestation_source(project_root: Path) -> str:
     """
     import json
 
-    from .attestation import load_attestations, statement_of
+    from .attestation import (
+        AttestationError, expected_ci_identity, head_commit, load_attestations,
+        verify_attestation,
+    )
+    from .verifiers.tests import _expected_public_key
+
+    identity, issuer = expected_ci_identity()
+    try:
+        public_key = _expected_public_key()
+    except AttestationError:
+        return ""
+    allow_unsigned = not identity and not public_key
+    commit = head_commit(project_root)
 
     blocks = []
     for raw in load_attestations(project_root):
-        statement = statement_of(raw)
-        if statement is None:
+        # Verified here, not merely decoded. The semantic tier is told the
+        # mechanical tier already checked these, so handing it an envelope
+        # that failed -- or one for a different commit -- makes that framing
+        # false, and test names are free-form text that reaches the model.
+        try:
+            statement, _ = verify_attestation(
+                raw,
+                expected_identity=identity,
+                expected_issuer=issuer,
+                expected_key_pem=public_key,
+                allow_unsigned=allow_unsigned,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        attested_commit = str((statement.get("predicate") or {}).get("commit") or "")
+        if not commit or attested_commit != commit:
             continue
         blocks.append(json.dumps(statement, indent=2, sort_keys=True))
     if not blocks:

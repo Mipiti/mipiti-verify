@@ -387,6 +387,12 @@ def verify_attestation(
         )
         provenance = PROVENANCE_CI_OIDC
 
+    if not isinstance(statement, dict):
+        # A payload is attacker-supplied JSON: it need not be an object at all,
+        # and every read below assumes one.
+        raise AttestationError(
+            f"Attestation payload is a {type(statement).__name__}, not a statement."
+        )
     if statement.get("predicateType") != PREDICATE_TYPE:
         raise AttestationError(
             f"Unexpected predicateType {statement.get('predicateType')!r}; "
@@ -446,14 +452,14 @@ def _verify_sigstore(raw, expected_identity, expected_issuer,
     from sigstore.models import Bundle
     from sigstore.verify import policy
 
-    from .cli import _build_verifier
+    from .cli import _build_sigstore_verifier
 
     try:
         bundle = Bundle.from_json(raw)
     except Exception as e:  # noqa: BLE001
         raise AttestationError(f"Attestation is not a Sigstore bundle: {e}") from e
 
-    verifier = _build_verifier(trust_config_path, tuf_url)
+    verifier = _build_sigstore_verifier(trust_config_path, tuf_url)
     try:
         _, payload = verifier.verify_dsse(
             bundle,

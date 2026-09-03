@@ -412,6 +412,7 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
         mipiti-verify attest-tests --junit report.xml
     """
     import json as _json
+    import re as _re
     from pathlib import Path as _Path
 
     from .attestation import (
@@ -464,7 +465,12 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
 
     out_dir = root / ATTESTATION_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"tests-{resolved_commit[:12]}.json"
+    # Keyed on the report as well as the commit: several suites in one run
+    # share a commit, and keying on the commit alone let each overwrite the
+    # last, leaving every earlier suite's assertions failing as though the
+    # test were missing.
+    slug = _re.sub(r"[^A-Za-z0-9._-]", "-", _Path(junit_path).stem)[:48] or "tests"
+    out_path = out_dir / f"tests-{resolved_commit[:12]}-{slug}.json"
     out_path.write_text(attestation, encoding="utf-8")
 
     totals = statement["predicate"]["totals"]
