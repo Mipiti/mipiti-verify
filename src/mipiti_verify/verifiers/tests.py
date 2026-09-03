@@ -74,7 +74,10 @@ class TestAttestedVerifier:
 
         commit = head_commit(project_root)
         identity, issuer = expected_ci_identity()
-        public_key = _expected_public_key()
+        try:
+            public_key = _expected_public_key()
+        except AttestationError as e:
+            return VerifierResult(passed=False, details=str(e))
         # Unsigned is admissible only where nothing could have signed: no CI
         # workload identity and no configured key. Anywhere else, an unsigned
         # attestation is a weaker claim than the environment could produce.
@@ -114,16 +117,44 @@ class TestAttestedVerifier:
         selected = predicate.get("selected") or {}
         tests = predicate.get("tests") or []
 
-        # Bind to the tree under verification. Without this the attestation is
-        # replayable against any later commit. The commit lives in the
-        # predicate because an in-toto subject digest cannot be a sha1.
+        # Bind to the tree under verification. Absence fails: a binding that
+        # switches itself off when either side is missing would accept an
+        # attestation naming no commit against any tree at all, which is the
+        # replay this check exists to stop.
         attested_commit = str(predicate.get("commit") or "")
-        if commit and attested_commit and attested_commit != commit:
+        if not attested_commit:
+            return VerifierResult(
+                passed=False,
+                details="Attestation names no commit, so it cannot be bound to this tree.",
+            )
+        if not commit:
+            return VerifierResult(
+                passed=False,
+                details=(
+                    "Cannot determine the commit under verification, so an "
+                    "attestation cannot be bound to it."
+                ),
+            )
+        if attested_commit != commit:
             return VerifierResult(
                 passed=False,
                 details=(
                     f"Attestation is for commit {attested_commit[:12]}, "
                     f"not {commit[:12]}."
+                ),
+            )
+
+        incoherent = _totals_are_coherent(totals)
+        if incoherent:
+            return VerifierResult(
+                passed=False, details=f"Attestation is not self-consistent: {incoherent}.",
+            )
+        if tests and len(tests) != int(totals.get("total") or 0):
+            return VerifierResult(
+                passed=False,
+                details=(
+                    f"Attestation records {len(tests)} test(s) but claims a "
+                    f"total of {totals.get('total')}."
                 ),
             )
 
@@ -154,10 +185,29 @@ class TestAttestedVerifier:
                 ),
             )
 
-        if not any(test_name in str(t) for t in tests):
+        # The named test must itself have passed. A substring match over the
+        # run's test names would let a neighbouring test satisfy the claim,
+        # and presence alone says only that the test was collected -- a
+        # skipped test appears in the run exactly like one that ran.
+        matched = [t for t in tests if _names_test(t, test_name)]
+        if not matched:
             return VerifierResult(
                 passed=False,
-                details=f"Attested run does not include a test matching '{test_name}'.",
+                details=f"Attested run does not include a test named '{test_name}'.",
+            )
+        if len(matched) > 1:
+            return VerifierResult(
+                passed=False,
+                details=(
+                    f"'{test_name}' names {len(matched)} tests in the attested "
+                    f"run; name it unambiguously as 'classname::name'."
+                ),
+            )
+        status = str(matched[0].get("status") or "")
+        if status != "passed":
+            return VerifierResult(
+                passed=False,
+                details=f"'{test_name}' did not pass in the attested run: {status or 'no status recorded'}.",
             )
 
         return VerifierResult(
@@ -168,6 +218,45 @@ class TestAttestedVerifier:
                 f"{(attested_commit or commit)[:12]}."
             ),
         )
+
+
+def _names_test(entry: object, test_name: str) -> bool:
+    """Whether one recorded test is the one the assertion names.
+
+    Exact, against either the qualified id or the bare name, so a claim about
+    ``test_auth`` is not satisfied by ``test_auth_disabled``. An entry that is
+    not a structured record carries no outcome, so it can never evidence that a
+    named test passed and is refused here rather than matched loosely.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return test_name in (
+        str(entry.get("id") or ""),
+        str(entry.get("name") or ""),
+    ) and test_name != ""
+
+
+def _totals_are_coherent(totals: dict) -> str:
+    """Empty when the totals describe a run that could have happened.
+
+    A crafted predicate is not obliged to be arithmetically honest, and every
+    downstream check reads these numbers, so they are checked against each
+    other before they are believed.
+    """
+    try:
+        parts = {k: int(totals.get(k) or 0)
+                 for k in ("total", "passed", "failed", "skipped", "errors")}
+    except (TypeError, ValueError):
+        return "totals are not numbers"
+    if any(v < 0 for v in parts.values()):
+        return "totals contain a negative count"
+    counted = parts["passed"] + parts["failed"] + parts["skipped"] + parts["errors"]
+    if counted != parts["total"]:
+        return (
+            f"totals do not add up: {counted} outcomes against a total of "
+            f"{parts['total']}"
+        )
+    return ""
 
 
 def _expected_public_key() -> str:
@@ -187,5 +276,11 @@ def _expected_public_key() -> str:
         return value
     try:
         return _Path(value).read_text(encoding="utf-8")
-    except OSError:
-        return ""
+    except OSError as e:
+        # Returning "" here would read as "no key configured", which is what
+        # admits an unsigned attestation. A key that was configured and cannot
+        # be read is a misconfiguration, not an absence.
+        raise AttestationError(
+            f"MIPITI_ATTESTATION_PUBLIC_KEY points at {value!r}, which cannot "
+            f"be read: {e}"
+        ) from e

@@ -63,17 +63,31 @@ def parse_junit(report_path: Path) -> dict:
 
     cases = list(tree.getroot().iter("testcase"))
     failed = skipped = errored = 0
-    names: list[str] = []
+    tests: list[dict] = []
     for case in cases:
         name = case.get("name") or ""
         classname = case.get("classname") or ""
-        names.append(f"{classname}::{name}" if classname else name)
         if case.find("failure") is not None:
+            status = "failed"
             failed += 1
         elif case.find("error") is not None:
+            status = "error"
             errored += 1
         elif case.find("skipped") is not None:
+            status = "skipped"
             skipped += 1
+        else:
+            status = "passed"
+        # Each test carries its own outcome. A bare list of names cannot
+        # distinguish the test that passed from the one that was skipped in
+        # the same run, and a claim about a named test needs that distinction:
+        # adding a skip is the cheapest way to stop a test failing.
+        tests.append({
+            "id": f"{classname}::{name}" if classname else name,
+            "name": name,
+            "classname": classname,
+            "status": status,
+        })
 
     total = len(cases)
     return {
@@ -84,7 +98,7 @@ def parse_junit(report_path: Path) -> dict:
             "skipped": skipped,
             "errors": errored,
         },
-        "tests": names,
+        "tests": tests,
     }
 
 

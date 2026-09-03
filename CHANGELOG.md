@@ -41,9 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured, never the key carried inside the attestation. Verification then
   checks the signature, that the attestation covers the commit under
   verification, that the run selected tests and that they passed, and that the
-  named test appears in it. A run that selected nothing, or in which everything
-  was skipped, is rejected rather than treated as a pass -- both otherwise
-  present as a zero failure count.
+  test the assertion names passed in that run.
+
+  The attestation records each test's own outcome, and the named one must be
+  `passed`. Being present in the run says only that the test was collected: a
+  skipped test appears exactly like one that ran, and skipping leaves the
+  failure and error counts at zero, so every aggregate still reads green. The
+  name is matched exactly, so an assertion about `test_auth` is not satisfied
+  by `test_auth_disabled`. A run that selected nothing, or in which everything
+  was skipped, is likewise rejected rather than treated as a pass.
+
+  An attestation that names no commit is refused, as is one read where the
+  commit under verification cannot be determined. The binding is what stops a
+  result being replayed against a different tree, and a binding that lapsed
+  whenever either side was missing would not be one.
 
   An attestation without a signature is accepted and recorded as self-declared
   only where no verification key is configured. Where one is, an unsigned

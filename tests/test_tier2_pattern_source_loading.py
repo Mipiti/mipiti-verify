@@ -123,6 +123,11 @@ class TestRunnerLoadsPatternSource:
             "</testsuite></testsuites>",
             encoding="utf-8",
         )
+        # The attestation binds to a commit, so the fixture project needs one
+        # to be bound to; without it the structural tier refuses before tier 2
+        # is reached.
+        (tmp_path / ".git").mkdir(exist_ok=True)
+        (tmp_path / ".git" / "HEAD").write_text("a" * 40, encoding="utf-8")
         statement = build_statement(
             commit="a" * 40, summary=parse_junit(report), invocation=["pytest"],
         )
