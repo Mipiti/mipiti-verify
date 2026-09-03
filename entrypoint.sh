@@ -27,6 +27,9 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
       exit 1
     fi
     ATTEST_ARGS=("attest-tests" "--junit" "$resolved" "--project-root" "$INPUT_PROJECT_ROOT")
+    if [ -n "$INPUT_ATTESTATION_ENV" ]; then
+      ATTEST_ARGS+=("--env" "$INPUT_ATTESTATION_ENV")
+    fi
     if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
       ATTEST_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
     fi

@@ -382,6 +382,10 @@ def main() -> None:
 @click.option("--project-root", type=click.Path(exists=True), default=".",
               help="Project root directory")
 @click.option("--commit", default="", help="Commit the run covers (default: CI env or .git/HEAD)")
+@click.option("--env", "env_keys", multiple=True, envvar="MIPITI_ATTESTATION_ENV",
+              help="Environment key whose value this run should record, e.g. --env FEATURE_AUTH. "
+                   "Repeatable. Lets an assertion require that the run ran with a control switched on. "
+                   "Credential-looking names are refused.")
 @click.option("--pattern", default="", help="Selector the run used, recorded for the reader")
 @click.option("--invocation", default="", help="Command the run executed, recorded for the reader")
 @click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
@@ -394,7 +398,7 @@ def main() -> None:
               type=click.Path(exists=True, dir_okay=False),
               help="Pre-downloaded Sigstore ClientTrustConfig JSON, for air-gapped CI")
 def attest_tests(junit_path: str, project_root: str, commit: str,
-                 pattern: str, invocation: str, key_path: str,
+                 env_keys: tuple, pattern: str, invocation: str, key_path: str,
                  key_passphrase: str, sigstore_tuf_url: str,
                  sigstore_trust_config: str) -> None:
     """Record that this CI job's tests ran, as a signed statement.
@@ -411,8 +415,8 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     from pathlib import Path as _Path
 
     from .attestation import (
-        ATTESTATION_DIR, AttestationError, build_statement, head_commit,
-        parse_junit, sign_statement,
+        ATTESTATION_DIR, AttestationError, build_statement, collect_environment,
+        head_commit, parse_junit, sign_statement,
     )
     from .runner import _auto_detect_oidc
 
@@ -430,11 +434,21 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
             "--commit explicitly.", err=True)
         raise SystemExit(1)
 
+    # A key may arrive space- or comma-separated from a single CI input as
+    # well as from repeated --env flags.
+    nominated = [k for chunk in env_keys for k in chunk.replace(",", " ").split()]
+    try:
+        environment = collect_environment(nominated)
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
     statement = build_statement(
         commit=resolved_commit,
         summary=summary,
         invocation=invocation.split() if invocation else [],
         selected_pattern=pattern,
+        environment=environment,
     )
     # Same identity ladder the verification run uses: a CI workload identity
     # first, an explicit key where none exists, unsigned only when neither is

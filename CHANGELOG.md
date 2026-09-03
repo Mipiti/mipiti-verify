@@ -51,6 +51,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by `test_auth_disabled`. A run that selected nothing, or in which everything
   was skipped, is likewise rejected rather than treated as a pass.
 
+  An attestation can also record the configuration its run ran under, and an
+  assertion can require it:
+
+  ```yaml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      junit-report: report.xml
+      attestation-env: FEATURE_AUTH ENFORCE_TLS
+  ```
+
+  A suite can pass with the control it exercises switched off, and assertions
+  over files in the tree describe the configuration a repository *declares*
+  rather than the one a run *had*. Naming the keys records their values in the
+  signed statement, so `test_attested` can carry an `env` requirement and hold
+  the run to it. Only the names given are recorded, never the whole
+  environment; a nominated key that was unset is recorded as unset, so an
+  assertion can require that a flag was absent; and credential-looking names
+  are refused rather than redacted, since a signed artifact is distributed. A
+  run that recorded nothing cannot satisfy an environment requirement.
+
   An attestation that names no commit is refused, as is one read where the
   commit under verification cannot be determined. The binding is what stops a
   result being replayed against a different tree, and a binding that lapsed

@@ -251,6 +251,13 @@ jobs:
           # needs attestation-signing-key.
           junit-report: report.xml
 
+          # Optional, for assertions that require the run to have used a
+          # particular configuration. A suite can pass with the control it
+          # exercises switched off, and a file in the repository shows what is
+          # declared, not what the run had. Only these names are recorded, and
+          # a name that looks like a credential is refused.
+          attestation-env: FEATURE_AUTH ENFORCE_TLS
+
           # Model selection (one of these)
           all: true                    # Verify all models in the workspace
           # model-id: "tm-abc123"     # Or verify a specific model

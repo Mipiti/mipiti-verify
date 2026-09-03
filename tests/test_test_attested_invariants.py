@@ -35,7 +35,11 @@ SPACE = {
     "matched_count": ("many", "one", "zero"),
     "totals": ("ok", "all_skipped", "with_failure", "incoherent", "negative"),
     "named": ("passed", "skipped", "failed", "absent", "duplicate", "legacy_string"),
+    # The assertion always requires FEATURE_AUTH=on; the dimension is what the
+    # attested run recorded about it.
+    "env": ("satisfies", "wrong_value", "unset", "not_recorded", "absent_field"),
 }
+REQUIRED_ENV = {"FEATURE_AUTH": "on"}
 FIELDS = tuple(SPACE)
 
 
@@ -110,6 +114,17 @@ def build(state: dict) -> tuple[dict, str]:
     elif state["commit"] == "mismatch":
         predicate["commit"] = OTHER_COMMIT
 
+    env = state["env"]
+    if env == "satisfies":
+        predicate["environment"] = {"FEATURE_AUTH": "on"}
+    elif env == "wrong_value":
+        predicate["environment"] = {"FEATURE_AUTH": "off"}
+    elif env == "unset":
+        predicate["environment"] = {"FEATURE_AUTH": None}
+    elif env == "not_recorded":
+        predicate["environment"] = {"SOMETHING_ELSE": "x"}
+    # "absent_field" omits `environment` entirely
+
     return (
         {"_type": "https://in-toto.io/Statement/v1",
          "predicateType": PREDICATE_TYPE, "predicate": predicate},
@@ -165,13 +180,26 @@ def oracle(statement: dict, test_name: str, commit: str) -> bool:
              and test_name in (str(t.get("id") or ""), str(t.get("name") or ""))]
     if len(named) != 1:
         return False
-    return named[0].get("status") == "passed"
+    if named[0].get("status") != "passed":
+        return False
+
+    # I6  the run recorded the configuration it ran under, and it is the one
+    #     required. Unrecorded is unestablished, never assumed benign.
+    if "environment" not in p:
+        return False
+    recorded = p.get("environment") or {}
+    for key, want in REQUIRED_ENV.items():
+        if key not in recorded:
+            return False
+        if recorded[key] != want:
+            return False
+    return True
 
 
 def verdict(state: dict) -> bool:
     statement, commit = build(state)
     return get_verifier("test_attested")._check(
-        statement, NAMED, commit, PROVENANCE_UNSIGNED).passed
+        statement, NAMED, commit, PROVENANCE_UNSIGNED, REQUIRED_ENV).passed
 
 
 def _neighbours(state: dict):
@@ -233,6 +261,7 @@ def test_every_accepted_state_satisfies_each_invariant():
         assert state["matched_count"] != "zero", f"accepted an empty selection: {state}"
         assert state["totals"] == "ok", f"accepted incoherent totals: {state}"
         assert state["named"] == "passed", f"accepted without the named test passing: {state}"
+        assert state["env"] == "satisfies", f"accepted without the required configuration: {state}"
 
 
 def test_no_single_weakening_of_a_valid_attestation_is_accepted():
@@ -257,6 +286,8 @@ def test_no_single_weakening_of_a_valid_attestation_is_accepted():
     ("totals", "all_skipped"), ("totals", "incoherent"), ("totals", "negative"),
     ("named", "skipped"), ("named", "failed"),
     ("named", "absent"), ("named", "legacy_string"), ("named", "duplicate"),
+    ("env", "wrong_value"), ("env", "unset"),
+    ("env", "not_recorded"), ("env", "absent_field"),
 ])
 def test_each_defect_alone_is_enough_to_reject(field, value):
     """No single defect depends on another to be caught."""

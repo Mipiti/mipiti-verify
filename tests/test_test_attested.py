@@ -23,6 +23,7 @@ from mipiti_verify.attestation import (
     PROVENANCE_UNSIGNED,
     AttestationError,
     build_statement,
+    collect_environment,
     expected_ci_identity,
     head_commit,
     parse_junit,
@@ -32,6 +33,7 @@ from mipiti_verify.attestation import (
 from mipiti_verify.verifiers import get_verifier
 
 COMMIT = "abc123def456abc123def456abc123def456abcd"
+NAMED_TEST = "test_non_loopback_host_is_refused"
 
 
 @pytest.fixture(scope="module")
@@ -82,12 +84,14 @@ def project(tmp_path):
 
 
 def _write_attestation(project: Path, *, key_path: str = "",
-                       junit: str = _JUNIT_CLEAN, commit: str = COMMIT) -> Path:
+                       junit: str = _JUNIT_CLEAN, commit: str = COMMIT,
+                       environment: dict = None) -> Path:
     report = project / "report.xml"
     report.write_text(junit)
     statement = build_statement(
         commit=commit, summary=parse_junit(report),
         invocation=["pytest", "-q"], selected_pattern="",
+        environment=environment,
     )
     attestation, _ = sign_statement(statement, key_path=key_path)
     out = project / ATTESTATION_DIR
@@ -455,3 +459,72 @@ def test_head_commit_is_read_not_executed(project):
 def test_ci_commit_env_wins_over_the_checkout(project, monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "b" * 40)
     assert head_commit(project) == "b" * 40
+
+
+# ---------------------------------------------------------------------------
+# What the run ran under
+# ---------------------------------------------------------------------------
+
+def test_a_nominated_key_is_recorded_with_its_value(monkeypatch):
+    monkeypatch.setenv("FEATURE_AUTH", "on")
+    assert collect_environment(["FEATURE_AUTH"]) == {"FEATURE_AUTH": "on"}
+
+
+def test_a_nominated_key_that_is_unset_is_recorded_as_unset(monkeypatch):
+    monkeypatch.delenv("FEATURE_AUTH", raising=False)
+    # Recorded rather than omitted: silence cannot distinguish "the flag was
+    # absent" from "nobody asked", and an assertion may require it unset.
+    assert collect_environment(["FEATURE_AUTH"]) == {"FEATURE_AUTH": None}
+
+
+@pytest.mark.parametrize("name", [
+    "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "DB_PASSWORD",
+    "STRIPE_API_KEY", "SIGNING_KEY", "MY_PRIVATE_KEY",
+])
+def test_a_credential_name_is_refused_rather_than_recorded(name, monkeypatch):
+    """An attestation is signed and distributed, so a leak would be durable."""
+    monkeypatch.setenv(name, "s3kr3t")
+    with pytest.raises(AttestationError) as e:
+        collect_environment([name])
+    assert "s3kr3t" not in str(e.value)
+
+
+def test_an_assertion_can_require_the_run_ran_with_a_control_on(project, monkeypatch):
+    _write_attestation(project, environment={"FEATURE_AUTH": "on"})
+    r = _verify(project, {"test": NAMED_TEST, "env": {"FEATURE_AUTH": "on"}},
+                monkeypatch=monkeypatch)
+    assert r.passed is True
+
+
+def test_a_test_that_passed_with_the_control_off_does_not_verify(project, monkeypatch):
+    """The whole point: a green suite proves nothing if the control was off."""
+    _write_attestation(project, environment={"FEATURE_AUTH": "off"})
+    r = _verify(project, {"test": NAMED_TEST, "env": {"FEATURE_AUTH": "on"}},
+                monkeypatch=monkeypatch)
+    assert r.passed is False
+    assert "FEATURE_AUTH" in r.details
+
+
+def test_an_environment_requirement_fails_on_a_run_that_recorded_none(project, monkeypatch):
+    """Unrecorded is unestablished, never assumed benign."""
+    _write_attestation(project)
+    r = _verify(project, {"test": NAMED_TEST, "env": {"FEATURE_AUTH": "on"}},
+                monkeypatch=monkeypatch)
+    assert r.passed is False
+    assert "recorded no environment" in r.details
+
+
+def test_an_assertion_can_require_a_flag_was_not_set(project, monkeypatch):
+    _write_attestation(project, environment={"DISABLE_AUTH": None})
+    assert _verify(project, {"test": NAMED_TEST, "env": {"DISABLE_AUTH": None}},
+                   monkeypatch=monkeypatch).passed is True
+
+    _write_attestation(project, environment={"DISABLE_AUTH": "1"})
+    assert _verify(project, {"test": NAMED_TEST, "env": {"DISABLE_AUTH": None}},
+                   monkeypatch=monkeypatch).passed is False
+
+
+def test_an_assertion_without_an_env_param_is_unaffected(project, monkeypatch):
+    """The field is additive: existing assertions do not start failing."""
+    _write_attestation(project)
+    assert _verify(project, {"test": NAMED_TEST}, monkeypatch=monkeypatch).passed is True

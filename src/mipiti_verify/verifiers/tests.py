@@ -97,7 +97,8 @@ class TestAttestedVerifier:
                 problems.append(str(e))
                 continue
 
-            result = self._check(statement, test_name, commit, provenance)
+            result = self._check(
+                statement, test_name, commit, provenance, params.get("env"))
             if result.passed:
                 return result
             problems.append(result.details)
@@ -111,7 +112,7 @@ class TestAttestedVerifier:
         )
 
     def _check(self, statement: dict, test_name: str, commit: str,
-               provenance: str) -> VerifierResult:
+               provenance: str, required_env: object = None) -> VerifierResult:
         predicate = statement.get("predicate") or {}
         totals = predicate.get("totals") or {}
         selected = predicate.get("selected") or {}
@@ -210,6 +211,13 @@ class TestAttestedVerifier:
                 details=f"'{test_name}' did not pass in the attested run: {status or 'no status recorded'}.",
             )
 
+        shortfall = _environment_shortfall(predicate, required_env)
+        if shortfall:
+            return VerifierResult(
+                passed=False,
+                details=f"'{test_name}' passed, but {shortfall}.",
+            )
+
         return VerifierResult(
             passed=True,
             details=(
@@ -234,6 +242,43 @@ def _names_test(entry: object, test_name: str) -> bool:
         str(entry.get("id") or ""),
         str(entry.get("name") or ""),
     ) and test_name != ""
+
+
+def _environment_shortfall(predicate: dict, required: object) -> str:
+    """Empty when the attested run's environment satisfies what is required.
+
+    ``required`` maps an environment name to the value the run must have had.
+    A required value of ``None`` means the name must have been unset, which is
+    how a control is pinned as "not switched off".
+
+    A predicate carrying no ``environment`` cannot satisfy any requirement:
+    the run did not record what it ran under, so the fact is unestablished
+    rather than assumed benign.
+    """
+    if not required:
+        return ""
+    if not isinstance(required, dict):
+        return "the assertion's 'env' param is not a mapping of name to value"
+    if "environment" not in predicate:
+        return (
+            "the attested run recorded no environment, so what it ran under "
+            "cannot be established; nominate the keys when attesting"
+        )
+    actual = predicate.get("environment") or {}
+    if not isinstance(actual, dict):
+        return "the attested run's environment is not a mapping"
+    for name, expected in required.items():
+        if name not in actual:
+            return f"the attested run did not record {name!r}"
+        got = actual[name]
+        if expected is None:
+            if got is not None:
+                return f"{name} was set to {got!r} in the attested run; required unset"
+        elif got is None:
+            return f"{name} was unset in the attested run; required {expected!r}"
+        elif str(got) != str(expected):
+            return f"{name} was {got!r} in the attested run; required {expected!r}"
+    return ""
 
 
 def _totals_are_coherent(totals: dict) -> str:

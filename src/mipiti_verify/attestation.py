@@ -145,6 +145,56 @@ def _ci_context() -> dict:
     return {"provider": "", "run_id": "", "run_url": "", "workflow": ""}
 
 
+# Environment keys are nominated by name, never collected wholesale: a signed
+# artifact travels to the platform and to auditors, and a CI environment holds
+# credentials. These names are refused outright rather than redacted, so an
+# operator learns at attestation time instead of discovering a leaked value in
+# a signed record that has already been distributed.
+SECRET_NAME_PATTERN = re.compile(
+    r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|APIKEY|API_KEY"
+    r"|ACCESS_KEY|SIGNING_KEY|_KEY$|^KEY$",
+    re.IGNORECASE,
+)
+
+# A nominated key is recorded even when unset, as null. Silence would make
+# "the flag was absent" indistinguishable from "nobody asked about the flag",
+# and an assertion needs to be able to require that a flag was NOT set.
+MAX_ENV_KEYS = 32
+MAX_ENV_VALUE_LEN = 512
+
+
+def collect_environment(keys: list) -> dict:
+    """Read the nominated environment keys, for recording in the predicate.
+
+    What a test run proves depends on the configuration it ran under: a suite
+    can pass with the control it exercises switched off. Assertions over files
+    in the tree constrain the configuration a repository *declares*, not the
+    one a run *had*, so the run records its own.
+    """
+    names = [k.strip() for k in keys if k and k.strip()]
+    if len(names) > MAX_ENV_KEYS:
+        raise AttestationError(
+            f"{len(names)} environment keys nominated; at most {MAX_ENV_KEYS} "
+            f"may be recorded."
+        )
+    out: dict = {}
+    for name in names:
+        if SECRET_NAME_PATTERN.search(name):
+            raise AttestationError(
+                f"Refusing to record environment key {name!r}: the name marks "
+                f"it as a credential, and an attestation is signed and "
+                f"distributed. Nominate a key that describes configuration."
+            )
+        value = os.environ.get(name)
+        if value is not None and len(value) > MAX_ENV_VALUE_LEN:
+            raise AttestationError(
+                f"Environment key {name!r} holds {len(value)} characters; at "
+                f"most {MAX_ENV_VALUE_LEN} may be recorded."
+            )
+        out[name] = value
+    return out
+
+
 def build_statement(
     *,
     commit: str,
@@ -152,6 +202,7 @@ def build_statement(
     invocation: list[str],
     selected_pattern: str = "",
     coverage: Optional[dict] = None,
+    environment: Optional[dict] = None,
 ) -> dict:
     """Assemble the in-toto statement for one test run."""
     totals = summary["totals"]
@@ -171,6 +222,12 @@ def build_statement(
     }
     if coverage:
         predicate["coverage"] = coverage
+    if environment is not None:
+        # Present-but-empty is meaningful: it records that nothing was
+        # nominated, which is different from a predicate that predates the
+        # field. An assertion requiring an environment fact fails on both, but
+        # the reader can tell them apart.
+        predicate["environment"] = environment
     predicate["commit"] = commit
 
     # The subject digest is a sha256 over the predicate, not the commit: an
