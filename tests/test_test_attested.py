@@ -7,8 +7,10 @@ rather than handed to a judge as weak evidence.
 
 from __future__ import annotations
 
+import ast
 import base64
 import copy
+import importlib
 import json
 from pathlib import Path
 
@@ -129,14 +131,65 @@ def _verify(project: Path, params: dict, *, public_key: str = "", monkeypatch=No
 # The property the replacement exists for
 # ---------------------------------------------------------------------------
 
-def test_nothing_in_the_verifier_can_execute():
-    """Verification is read-only, so the module implementing it must contain no
-    way to run anything. Enforced here rather than stated in a comment."""
-    import mipiti_verify.verifiers.tests as mod
+# Modules on the read-only verification path. `git remote get-url origin` for
+# repo detection is the package's one subprocess and lives outside them.
+READ_ONLY_MODULES = ("mipiti_verify.verifiers.tests", "mipiti_verify.attestation")
 
-    source = Path(mod.__file__).read_text()
-    for forbidden in ("subprocess", "os.system", "Popen", "shell=True"):
-        assert forbidden not in source, f"{forbidden} reappeared in the test verifier"
+# Everything these modules may import. An execution capability arrives as an
+# import, so an allowlist refuses one that has no name yet, where a denylist of
+# known-bad names only refuses the ones already thought of.
+PERMITTED_IMPORTS = {
+    "__future__", "base64", "cryptography", "datetime", "glob", "hashlib",
+    "json", "os", "pathlib", "re", "sigstore", "typing", "xml",
+}
+
+# `os` is permitted for os.environ, and carries the process-spawning surface
+# with it, so attribute access is constrained separately.
+EXECUTION_SINKS = {
+    "system", "popen", "execv", "execve", "execvp", "execl", "execlp", "execle",
+    "spawnv", "spawnve", "spawnl", "spawnlp", "posix_spawn", "fork", "forkpty",
+    "Popen", "call", "check_call", "check_output", "run",
+}
+EXECUTION_BUILTINS = {"eval", "exec", "compile", "__import__"}
+
+
+@pytest.mark.parametrize("module_name", READ_ONLY_MODULES)
+def test_nothing_on_the_verification_path_can_execute(module_name):
+    """Verification reads; it never executes.
+
+    Asserted over the parsed module rather than its text, so a capability
+    reached under another name, or through a module imported for another
+    purpose, is refused rather than passing an inspection of the source.
+    """
+    mod = importlib.import_module(module_name)
+    tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                assert root in PERMITTED_IMPORTS, (
+                    f"{module_name} imports {alias.name}, which is not on the "
+                    f"read-only path's allowlist"
+                )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # relative, stays inside the package
+                continue
+            root = (node.module or "").split(".")[0]
+            assert root in PERMITTED_IMPORTS, (
+                f"{module_name} imports from {node.module}, which is not on "
+                f"the read-only path's allowlist"
+            )
+        elif isinstance(node, ast.Attribute):
+            assert node.attr not in EXECUTION_SINKS, (
+                f"{module_name} reaches {node.attr}, which starts a process"
+            )
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                assert fn.id not in EXECUTION_BUILTINS, (
+                    f"{module_name} calls {fn.id}()"
+                )
 
 
 def test_test_passes_is_gone():

@@ -118,3 +118,24 @@ def package_json(project_root: Path) -> Path:
         encoding="utf-8",
     )
     return f
+
+
+# A CI runner exports the commit and workload-identity variables the verifier
+# reads to decide what it is verifying and who signed it. A fixture project
+# built under tmp_path has its own commit, so a test that inherits the runner's
+# environment verifies against the wrong one -- passing on a workstation, where
+# the variables are absent, and failing only in CI. Clear them for every test;
+# one that wants a variable sets it explicitly and still wins, because
+# monkeypatch.setenv in the test body runs after this fixture.
+_AMBIENT_CI_ENV = (
+    # commit under verification
+    "GITHUB_SHA", "CI_COMMIT_SHA", "CIRCLE_SHA1", "BUILDKITE_COMMIT",
+    # workload identity for keyless signing
+    "GITHUB_WORKFLOW_REF", "CI_JOB_JWT_V2", "CI_PROJECT_URL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_ci_env(monkeypatch):
+    for var in _AMBIENT_CI_ENV:
+        monkeypatch.delenv(var, raising=False)

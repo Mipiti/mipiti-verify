@@ -30,7 +30,4 @@ class TestTestExists:
         assert r.passed is True
 
 
-# TestTestPasses was removed with the verifier it covered. It asserted that a
-# selector from an assertion was handed to subprocess.run -- the capability the
-# replacement exists to eliminate. Coverage for the successor lives in
-# tests/test_test_attested.py.
+# Coverage for test_attested lives in tests/test_test_attested.py.
