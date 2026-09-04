@@ -33,8 +33,11 @@ jobs:
       - name: Trigger submodule update in parent repo
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Expression values pass through env, never inline into the
+          # script body.
+          SHA: ${{ github.sha }}
         run: |
           gh api repos/Mipiti/mipiti/dispatches \
             -f event_type=submodule-update \
             -f 'client_payload[submodule]=verify' \
-            -f 'client_payload[ref]=${{ github.sha }}'
+            -f "client_payload[ref]=$SHA"

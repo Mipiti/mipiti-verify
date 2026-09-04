@@ -258,6 +258,25 @@ jobs:
 
 All assertions are re-verified by default. Use `reverify: false` to only check new assertions (reduces Tier 2 API costs on PRs). Omitting `tier2-provider` runs Tier 1 only — controls won't reach "verified" status without Tier 2.
 
+### Requiring an attestation (recommended)
+
+When the job has no OIDC token (no `id-token: write`) and no `workspace-signing-key`, the action still submits results, unsigned, and emits a `::warning::` annotation saying so. For a CI gate whose results are meant to be audited, set `require-attestation: true` so a run that cannot produce an attestation fails instead of submitting one the audit side cannot pin to a signing identity:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - uses: Mipiti/mipiti-verify@<pinned-sha> # vX.Y.Z
+    with:
+      api-key: ${{ secrets.MIPITI_API_KEY }}
+      all: true
+      require-attestation: true
+```
+
+The default stays `false` so existing workflows on runners without workload identity keep working; the annotation is the signal to either grant the permission, configure a key, or opt into failing closed.
+
 ### Attestation (Sigstore)
 
 `mipiti-verify` signs every submitted result set with [Sigstore](https://sigstore.dev): the runner's short-lived OIDC token is exchanged at Fulcio for a signing certificate, the verified content hash is signed, and the entry is recorded in Rekor (the public transparency log). Mipiti's backend receives only the resulting bundle — **the raw OIDC token never leaves CI**.

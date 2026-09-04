@@ -51,4 +51,6 @@ jobs:
           - audit_main_orphan_legacy
           - audit_bundle_bind
     steps:
-      - run: echo "Docs-only PR, skipping audit-spec ${{ matrix.cfg }}"
+      - env:
+          CFG: ${{ matrix.cfg }}
+        run: echo "Docs-only PR, skipping audit-spec $CFG"

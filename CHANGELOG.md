@@ -27,6 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The verdict itself is unaffected; only the recorded reason changes, and only
   when there was never a reason to record.
 
+### Changed
+
+- The GitHub Action emits a `::warning::` annotation when a run is about to
+  submit unsigned — no OIDC token in the job and no signing key configured.
+  Nothing else changes: the run still submits, and `require-attestation`
+  still defaults to `false`. The README now documents
+  `require-attestation: true` as the recommended setting for CI gates whose
+  results are audited.
+
+- The action passes the `tier2-api-key` value only to the SDK of the
+  provider named in `tier2-provider`, instead of exposing it under both the
+  OpenAI and Anthropic variable names.
+
+- The container image is published under its version tag only; the floating
+  `latest` tag is no longer pushed. `action.yml` pins the image by digest and
+  the README's `uses:` snippet is pinned by commit, so nothing resolves
+  through `latest`. Each published image now carries a build-provenance
+  attestation in the registry, verifiable with
+  `gh attestation verify oci://ghcr.io/mipiti/mipiti-verify@<digest> --owner Mipiti`.
+
 
 ### Fixed
 

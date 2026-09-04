@@ -25,15 +25,50 @@ jobs:
           # `git push` — all mutations go through `gh api`.
           persist-credentials: false
 
+      - name: Validate dispatch payload
+        id: payload
+        # The three payload fields come from a repository_dispatch event
+        # and are the only external input this job consumes. They pass
+        # through env (never inline into the script body) — GitHub's
+        # injection-safe pattern — and are accepted only in the exact
+        # shape publish.yml emits: a vN.N.N tag, a sha256 digest, and
+        # this repository's own image name. Anything else fails the job
+        # before the value reaches sed, git, or the API calls below.
+        env:
+          TAG: ${{ github.event.client_payload.tag }}
+          DIGEST: ${{ github.event.client_payload.digest }}
+          IMAGE: ${{ github.event.client_payload.image }}
+        run: |
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::client_payload.tag is not a vN.N.N version"
+            exit 1
+          fi
+          if ! printf '%s' "$DIGEST" | grep -qE '^sha256:[a-f0-9]{64}$'; then
+            echo "::error::client_payload.digest is not a sha256 digest"
+            exit 1
+          fi
+          if [ "$IMAGE" != "ghcr.io/mipiti/mipiti-verify" ]; then
+            echo "::error::client_payload.image is not this repository's image"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
       - name: Update action.yml with digest-pinned image
         id: update
+        env:
+          TAG: ${{ steps.payload.outputs.tag }}
+          DIGEST: ${{ steps.payload.outputs.digest }}
+          IMAGE: ${{ steps.payload.outputs.image }}
         run: |
-          TAG="${{ github.event.client_payload.tag }}"
-          DIGEST="${{ github.event.client_payload.digest }}"
-          IMAGE="${{ github.event.client_payload.image }}"
+          # Every component was validated above against a character class
+          # that excludes the sed delimiter and metacharacters, so the
+          # replacement is a literal. The `runs.image:` line is the only
+          # `image:` key in action.yml.
           FULL_REF="docker://${IMAGE}:${TAG}@${DIGEST}"
 
-          sed -i "s|image: .*|image: ${FULL_REF}|" action.yml
+          sed -i "s|^\([[:space:]]*image:\) .*|\1 ${FULL_REF}|" action.yml
           echo "Updated action.yml image to: ${FULL_REF}"
 
           if git diff --quiet action.yml; then
@@ -41,25 +76,25 @@ jobs:
             echo "action.yml already up to date"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create PR
         if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.payload.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ steps.update.outputs.tag }}"
           BRANCH="chore/pin-action-image-${TAG}"
 
-          HEAD=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          HEAD=$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')
           CONTENT=$(base64 -w 0 action.yml)
-          BASE_TREE=$(gh api "repos/${{ github.repository }}/git/commits/${HEAD}" --jq '.tree.sha')
+          BASE_TREE=$(gh api "repos/${REPO}/git/commits/${HEAD}" --jq '.tree.sha')
 
-          BLOB_SHA=$(gh api "repos/${{ github.repository }}/git/blobs" \
+          BLOB_SHA=$(gh api "repos/${REPO}/git/blobs" \
             -f "content=${CONTENT}" -f "encoding=base64" --jq '.sha')
 
-          TREE=$(gh api "repos/${{ github.repository }}/git/trees" \
+          TREE=$(gh api "repos/${REPO}/git/trees" \
             -f "base_tree=${BASE_TREE}" \
             -f "tree[][path]=action.yml" \
             -f "tree[][mode]=100644" \
@@ -67,13 +102,13 @@ jobs:
             -f "tree[][sha]=${BLOB_SHA}" \
             --jq '.sha')
 
-          COMMIT_SHA=$(gh api "repos/${{ github.repository }}/git/commits" \
+          COMMIT_SHA=$(gh api "repos/${REPO}/git/commits" \
             -f "message=chore: pin action image to ${TAG}" \
             -f "tree=${TREE}" \
             -f "parents[]=${HEAD}" \
             --jq '.sha')
 
-          gh api "repos/${{ github.repository }}/git/refs" \
+          gh api "repos/${REPO}/git/refs" \
             -f "ref=refs/heads/${BRANCH}" -f "sha=${COMMIT_SHA}"
 
           PR_URL=$(gh pr create \
