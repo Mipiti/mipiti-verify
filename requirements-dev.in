@@ -1,0 +1,5 @@
+# CI-only test tooling that is not part of the package's [dev] extra.
+# Compiled together with `pyproject.toml --extra=dev` into
+# requirements-dev.lock by lock-deps.py, so CI can install its test
+# tools with `pip install --require-hashes -r requirements-dev.lock`.
+pytest-xdist

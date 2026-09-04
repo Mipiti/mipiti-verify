@@ -1,0 +1,32 @@
+# Build context for the action image. The Dockerfile copies the tree to
+# /action and installs the package from it, so only what `pip install
+# /action[all]` and the entrypoint need is sent: pyproject.toml, README.md
+# (the package readme), LICENSE, src/, entrypoint.sh, requirements-all.lock.
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+action.yml
+tests
+formal
+scripts
+docs
+.venv
+.venv-test
+.env
+__pycache__
+*.pyc
+*.egg-info
+dist
+build
+lock-deps.py
+requirements.lock
+requirements-audit.in
+requirements-audit.lock
+requirements-build.in
+requirements-build.lock
+requirements-dev.in
+requirements-dev.lock
+CHANGELOG.md
+SECURITY.md

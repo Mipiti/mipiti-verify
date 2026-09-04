@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # In a GitHub Actions container action, the runner overrides HOME to
 # /github/home, owned by the runner uid — which the non-root `verifier` user
@@ -46,7 +46,9 @@ fi
 ARGS=("run")
 
 if [ -n "$INPUT_MODEL_ID" ]; then
-  ARGS+=("$INPUT_MODEL_ID")
+  # Positional argument; appended behind "--" once every option is in
+  # place, so the id is passed as an operand whatever it starts with.
+  MODEL_ID="$INPUT_MODEL_ID"
 elif [ "$INPUT_ALL" = "true" ]; then
   ARGS+=("--all")
 else
@@ -63,6 +65,16 @@ fi
 
 if [ -n "$INPUT_TIER2_MODEL" ]; then
   ARGS+=("--tier2-model" "$INPUT_TIER2_MODEL")
+fi
+
+# The provider key is handed only to the SDK of the provider selected:
+# each SDK reads its own variable, and the one for a provider that is
+# not in use has no reader in this process.
+if [ -n "$INPUT_TIER2_API_KEY" ]; then
+  case "$(printf '%s' "$INPUT_TIER2_PROVIDER" | tr '[:upper:]' '[:lower:]')" in
+    openai)    export OPENAI_API_KEY="$INPUT_TIER2_API_KEY" ;;
+    anthropic) export ANTHROPIC_API_KEY="$INPUT_TIER2_API_KEY" ;;
+  esac
 fi
 
 if [ "$INPUT_REVERIFY" = "false" ]; then
@@ -95,6 +107,21 @@ fi
 
 if [ "$INPUT_REQUIRE_ATTESTATION" = "true" ]; then
   ARGS+=("--require-attestation")
+elif [ "$INPUT_DRY_RUN" != "true" ] \
+  && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] \
+  && [ -z "$INPUT_WORKSPACE_SIGNING_KEY" ] \
+  && [ -z "${MIPITI_WORKSPACE_SIGNING_KEY:-}" ] \
+  && [ -z "${MIPITI_CUSTOMER_SIGNING_KEY:-}" ]; then
+  # No signer can be reached from this job: the runner exposes no OIDC
+  # token (the job lacks `id-token: write`) and no signing key is
+  # configured. The run still submits, unsigned, as it always has; the
+  # annotation makes that visible in the job summary instead of only in
+  # verbose output.
+  echo "::warning title=Unsigned submission::No attestation signer is available (no OIDC token — grant 'id-token: write' — and no workspace-signing-key), so results are submitted unsigned. Set 'require-attestation: true' to fail the run instead."
+fi
+
+if [ -n "${MODEL_ID:-}" ]; then
+  ARGS+=("--" "$MODEL_ID")
 fi
 
 exec mipiti-verify "${ARGS[@]}"

@@ -300,13 +300,15 @@ jobs:
         # standalone audit_manifest.tla module which models the
         # manifest signature path (Option β) independently of audit.tla.
         # See formal/COMPOSITION.md and formal/audit_manifest.tla.
+        env:
+          CFG: ${{ matrix.cfg }}
         run: |
           JAVA_OPTS="-Xmx8g -XX:+UseParallelGC"
-          case "${{ matrix.cfg }}" in
+          case "$CFG" in
             audit_manifest_*) TLA_MODULE=audit_manifest.tla ;;
             *)                TLA_MODULE=audit.tla ;;
           esac
-          java $JAVA_OPTS -jar tla2tools.jar -config ${{ matrix.cfg }}.cfg -workers auto "$TLA_MODULE"
+          java $JAVA_OPTS -jar tla2tools.jar -config "$CFG.cfg" -workers auto "$TLA_MODULE"
         working-directory: formal
 
   test-spec-invariants:

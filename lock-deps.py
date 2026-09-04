@@ -50,7 +50,20 @@ def main() -> None:
     run([*common, "--extra=all", "-o", "requirements-all.lock", "pyproject.toml"])
     strip_self_reference(ROOT / "requirements-all.lock")
 
-    print("Done. Review and commit requirements.lock and requirements-all.lock.")
+    # CI test tooling: the [dev] extra plus requirements-dev.in (tools
+    # that are CI-only and not part of the package's extras), constrained
+    # to requirements.lock so every package the two lockfiles share is
+    # pinned to the same version and CI can install both in sequence.
+    print("Compiling requirements-dev.lock ...")
+    run([
+        *common, "--extra=dev", "-c", "requirements.lock",
+        "-o", "requirements-dev.lock", "pyproject.toml", "requirements-dev.in",
+    ])
+
+    print(
+        "Done. Review and commit requirements.lock, requirements-all.lock "
+        "and requirements-dev.lock."
+    )
 
 
 if __name__ == "__main__":
