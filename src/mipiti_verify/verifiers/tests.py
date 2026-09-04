@@ -222,6 +222,7 @@ class TestAttestedVerifier:
             return VerifierResult(
                 passed=False,
                 details=f"'{test_name}' passed, but {shortfall}.",
+                provenance=provenance,
             )
 
         return VerifierResult(
@@ -231,6 +232,7 @@ class TestAttestedVerifier:
                 f"{totals.get('total', 0)} test(s) at commit "
                 f"{(attested_commit or commit)[:12]}."
             ),
+            provenance=provenance,
         )
 
 

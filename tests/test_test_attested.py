@@ -244,6 +244,7 @@ def test_a_test_that_ran_and_passed_verifies(project, keypair, monkeypatch):
                 public_key=public_pem, monkeypatch=monkeypatch)
     assert r.passed
     assert PROVENANCE_CUSTOMER_KEY in r.details
+    assert r.provenance == PROVENANCE_CUSTOMER_KEY
 
 
 def test_the_provenance_class_is_reported(project, monkeypatch):
@@ -251,6 +252,7 @@ def test_the_provenance_class_is_reported(project, monkeypatch):
     r = _verify(project, {"test": "test_non_loopback_host_is_refused"}, monkeypatch=monkeypatch)
     assert r.passed
     assert PROVENANCE_UNSIGNED in r.details
+    assert r.provenance == PROVENANCE_UNSIGNED
 
 
 # ---------------------------------------------------------------------------
@@ -603,3 +605,53 @@ def test_one_unreadable_envelope_does_not_hide_a_sound_one(project, monkeypatch)
 
     r = _verify(project, {"test": NAMED_TEST}, monkeypatch=monkeypatch)
     assert r.passed is True
+
+
+def test_gitlab_identity_is_the_workflow_san_under_id_tokens(monkeypatch):
+    monkeypatch.setenv("CI_PROJECT_URL", "https://gitlab.example.com/group/project")
+    monkeypatch.setenv("CI_CONFIG_PATH", ".gitlab-ci.yml")
+    monkeypatch.setenv("CI_COMMIT_REF_NAME", "main")
+    monkeypatch.setenv("CI_SERVER_URL", "https://gitlab.example.com")
+    monkeypatch.setenv("SIGSTORE_ID_TOKEN", "an-id-token")
+    identity, issuer = expected_ci_identity()
+    assert identity == "https://gitlab.example.com/group/project//.gitlab-ci.yml@main"
+    assert issuer == "https://gitlab.example.com"
+
+
+def test_gitlab_without_a_token_has_no_keyless_identity(monkeypatch):
+    monkeypatch.setenv("CI_PROJECT_URL", "https://gitlab.example.com/group/project")
+    monkeypatch.setenv("CI_CONFIG_PATH", ".gitlab-ci.yml")
+    monkeypatch.setenv("CI_COMMIT_REF_NAME", "main")
+    assert expected_ci_identity() == ("", "")
+
+
+def test_oidc_autodetect_prefers_gitlab_id_tokens(monkeypatch):
+    from mipiti_verify.runner import _auto_detect_oidc
+    monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_URL", raising=False)
+    monkeypatch.setenv("SIGSTORE_ID_TOKEN", "new-style")
+    monkeypatch.setenv("CI_JOB_JWT_V2", "old-style")
+    assert _auto_detect_oidc("sigstore") == "new-style"
+
+
+def test_provenance_rides_on_the_submitted_result_row():
+    from mipiti_verify.runner import _result_row
+    row = _result_row("a1", "test_attested", 1, {"status": "pass", "details": "d", "provenance": "ci_oidc"})
+    assert row["provenance"] == "ci_oidc"
+    plain = _result_row("a2", "file_exists", 1, {"status": "pass", "details": "d"})
+    assert "provenance" not in plain
+
+
+def test_the_published_schema_accepts_what_attest_tests_emits(project):
+    """The schema is the interface for third-party producers, so the CLI's
+    own output must conform to it."""
+    import json as _json
+    from pathlib import Path as _P
+    from mipiti_verify.attestation import build_statement, parse_junit
+    schema = _json.loads((_P(__file__).parent.parent / "schemas" / "test-result-v1.schema.json").read_text())
+    jsonschema = pytest.importorskip("jsonschema")
+    report = project / "report.xml"
+    report.write_text(_JUNIT_CLEAN)
+    summary = parse_junit(report)
+    statement = build_statement(commit="a" * 40, summary=summary, invocation=["pytest"], environment={"FEATURE_AUTH": "on"})
+    jsonschema.validate(statement["predicate"], schema)
+

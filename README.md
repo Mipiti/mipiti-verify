@@ -290,6 +290,18 @@ All assertions are re-verified by default. Use `reverify: false` to only check n
 
 Private or air-gapped deployments can also redirect signing itself at their own Sigstore instance via `sigstore-tuf-url` on the `run` command.
 
+### Test-result attestations (`test_attested`)
+
+A `test_attested` assertion is checked against a statement your CI signed about a test run your own workflow performed. `mipiti-verify attest-tests --junit <report>` (or the action's `junit-report` input) turns a JUnit report into an in-toto Statement with `predicateType` `https://mipiti.io/attestations/test-result/v1`, signs it, and writes it to `.mipiti/attestations/` in the checkout. Verification reads it and executes nothing.
+
+**Predicate schema.** Published at [`schemas/test-result-v1.schema.json`](schemas/test-result-v1.schema.json). Any producer that emits a conforming statement, signed under an identity the verifier is pinned to, is accepted; the CLI is one producer, not the interface. The load-bearing fields are `commit` (must equal the commit under verification), `totals` and `selected.matched_count` (a run that selected nothing or in which nothing passed is refused), and `tests[]` with a per-test `status` (the named test must itself be `passed`; a skip is not evidence). `environment` records only the variables nominated with `attestation-env`, and an assertion's `env` param requires their values.
+
+**Signing identity and what reaches the platform.** The attestation is signed the same way the verification run is: keylessly through Sigstore under the CI workload identity (`ci_oidc`) where one exists, with a customer-held ECDSA key (`customer_key`) where none does, and `unsigned` only where neither could apply. Each `test_attested` result submitted to the platform carries that class in a `provenance` field, so the audit envelope and the platform's sufficiency inputs can weigh a workflow-signed pass against a self-declared one as data rather than by reading prose.
+
+**Tests and verification in separate jobs.** `.mipiti/attestations/` lives in the runner's working tree, not in the repository. If your tests run in one job and verification in another, upload that directory as a workflow artifact from the test job and download it before the verify step. This is sound because freshness is not the guard, the commit binding is: an attestation names the commit its run covered, so a file from an older run names an older commit and is refused, and a file that names the current commit could only have been produced by a run against that tree. No file committed into the repository can name its own commit, since the commit hash covers the file. What an attestation cannot say is whether something outside the tree, such as a live service, changed between the run and the read; `attested_at` and `ci.run_url` are recorded for exactly that reader.
+
+**GitLab.** Keyless signing uses the `id_tokens` job keyword; expose the token as `SIGSTORE_ID_TOKEN` with audience `sigstore`. The retired `CI_JOB_JWT_V2` is still honoured.
+
 ### Action Inputs
 
 | Input | Required | Default | Description |

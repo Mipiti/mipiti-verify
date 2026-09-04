@@ -492,9 +492,16 @@ def expected_ci_identity() -> tuple[str, str]:
             f"https://github.com/{workflow_ref}",
             "https://token.actions.githubusercontent.com",
         )
-    gitlab_project = os.environ.get("CI_PROJECT_URL", "").strip()
-    if gitlab_project and os.environ.get("CI_JOB_JWT_V2"):
-        return gitlab_project, os.environ.get("CI_SERVER_URL", "").strip()
+    # GitLab: the Fulcio SAN is project URL // config path @ ref, the issuer
+    # is the GitLab server. A workload identity exists under the ``id_tokens``
+    # keyword (surfaced as SIGSTORE_ID_TOKEN by convention) or the retired
+    # CI_JOB_JWT_V2; without either the job cannot sign keylessly.
+    gl_url = os.environ.get("CI_PROJECT_URL", "").strip()
+    gl_path = os.environ.get("CI_CONFIG_PATH", "").strip()
+    gl_ref = os.environ.get("CI_COMMIT_REF_NAME", "").strip()
+    has_token = bool(os.environ.get("SIGSTORE_ID_TOKEN") or os.environ.get("CI_JOB_JWT_V2"))
+    if gl_url and gl_path and gl_ref and has_token:
+        return f"{gl_url}//{gl_path}@{gl_ref}", os.environ.get("CI_SERVER_URL", "").strip()
     return "", ""
 
 

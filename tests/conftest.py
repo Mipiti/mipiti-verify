@@ -131,7 +131,8 @@ _AMBIENT_CI_ENV = (
     # commit under verification
     "GITHUB_SHA", "CI_COMMIT_SHA", "CIRCLE_SHA1", "BUILDKITE_COMMIT",
     # workload identity for keyless signing
-    "GITHUB_WORKFLOW_REF", "CI_JOB_JWT_V2", "CI_PROJECT_URL",
+    "GITHUB_WORKFLOW_REF", "CI_JOB_JWT_V2", "CI_PROJECT_URL", "SIGSTORE_ID_TOKEN",
+    "CI_CONFIG_PATH", "CI_COMMIT_REF_NAME", "CI_SERVER_URL",
 )
 
 

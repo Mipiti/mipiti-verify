@@ -793,14 +793,7 @@ class Runner:
                         a_id = assertion["id"]
                         a_type = assertion["type"]
                         result = future.result()
-                        results.append({
-                            "assertion_id": a_id,
-                            "tier": tier,
-                            "result": result["status"],
-                            "details": result["details"],
-                            "reasoning": result.get("reasoning", ""),
-                            "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
-                        })
+                        results.append(_result_row(a_id, a_type, tier, result))
                         details.append({
                             "assertion_id": a_id,
                             "type": a_type,
@@ -821,14 +814,7 @@ class Runner:
                     else:
                         result = self._verify_tier2(assertion)
 
-                    results.append({
-                        "assertion_id": a_id,
-                        "tier": tier,
-                        "result": result["status"],
-                        "details": result["details"],
-                        "reasoning": result.get("reasoning", ""),
-                        "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
-                    })
+                    results.append(_result_row(a_id, a_type, tier, result))
                     details.append({
                         "assertion_id": a_id,
                         "type": a_type,
@@ -852,10 +838,13 @@ class Runner:
 
         try:
             result = verifier.verify(params, self.project_root)
-            return {
+            out = {
                 "status": "pass" if result.passed else "fail",
                 "details": result.details,
             }
+            if getattr(result, "provenance", ""):
+                out["provenance"] = result.provenance
+            return out
         except Exception as e:
             return {"status": "fail", "details": f"Verifier error: {e}"}
 
@@ -1280,8 +1269,32 @@ def _auto_detect_repo(project_root: Path) -> str:
     return ""
 
 
+def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
+    """One submitted result. ``provenance`` rides along only when a verifier
+    set it (signed-evidence types), as data rather than inside ``details``,
+    so the platform's audit envelope and sufficiency inputs can carry the
+    signing class without parsing prose."""
+    row = {
+        "assertion_id": a_id,
+        "tier": tier,
+        "result": result["status"],
+        "details": result["details"],
+        "reasoning": result.get("reasoning", ""),
+        "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
+    }
+    if result.get("provenance"):
+        row["provenance"] = result["provenance"]
+    return row
+
+
 def _auto_detect_oidc(audience: str = "") -> str:
-    """Auto-detect OIDC token from CI environment."""
+    """Auto-detect OIDC token from CI environment.
+
+    GitLab has two generations: the ``id_tokens`` job keyword (current)
+    exposes a token under a name the job chooses -- ``SIGSTORE_ID_TOKEN`` is
+    the convention Sigstore tooling reads -- and the older ``CI_JOB_JWT_V2``
+    (removed in GitLab 17). Both are honoured, newest first.
+    """
     # GitHub Actions
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
     token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
@@ -1300,10 +1313,11 @@ def _auto_detect_oidc(audience: str = "") -> str:
         except Exception:
             pass
 
-    # GitLab CI
-    gl_token = os.environ.get("CI_JOB_JWT_V2", "")
-    if gl_token:
-        return gl_token
+    # GitLab CI (id_tokens keyword, then the retired CI_JOB_JWT_V2)
+    for var in ("SIGSTORE_ID_TOKEN", "CI_JOB_JWT_V2"):
+        gl_token = os.environ.get(var, "")
+        if gl_token:
+            return gl_token
 
     return ""
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Each `test_attested` result submitted to the platform carries the signing
+  class of the attestation it was checked against (`ci_oidc`, `customer_key`
+  or `unsigned`) in a `provenance` field, as data rather than inside the
+  details prose, so the audit envelope and the platform can weigh it.
+- The test-result predicate schema is published at
+  `schemas/test-result-v1.schema.json`, so a producer other than this CLI can
+  emit a conforming attestation.
+- GitLab keyless signing recognises the `id_tokens` job keyword (token
+  exposed as `SIGSTORE_ID_TOKEN`) in addition to the retired `CI_JOB_JWT_V2`,
+  and the pinned identity is the workflow SAN (`project//config@ref`) rather
+  than the bare project URL.
+- README covers the predicate, provenance, running tests and verification in
+  separate jobs, and GitLab setup.
+
 ### Changed
 
 - **`test_passes` is replaced by `test_attested`.** Verification is a read-only

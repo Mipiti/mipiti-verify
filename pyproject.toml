@@ -54,6 +54,7 @@ dev = [
     "pytest>=8",
     "pytest-mock>=3",
     "respx>=0.22",
+    "jsonschema>=4",
 ]
 
 [tool.pytest.ini_options]
