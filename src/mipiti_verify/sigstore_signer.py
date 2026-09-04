@@ -96,7 +96,8 @@ def sign_verification_statement(
 
     Args:
         identity_token: Raw OIDC JWT from the CI runner (GitHub Actions
-            `ACTIONS_ID_TOKEN_REQUEST_URL` or GitLab `CI_JOB_JWT_V2`).
+            `ACTIONS_ID_TOKEN_REQUEST_URL`, or GitLab `id_tokens` /
+            `CI_JOB_JWT_V2`).
         model_id: ID of the Mipiti threat model under verification.
         tier: 1 (mechanical) or 2 (semantic / adversarial LLM).
         content_hash: `sha256:<hex>` digest of the canonical assertions +

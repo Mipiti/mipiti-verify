@@ -33,7 +33,7 @@ console = Console(stderr=True)
 # falling back to "if params has pattern, use it") preserves the
 # defense that types map to a single, expected source-resolution
 # strategy.
-_PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists", "test_passes"})
+_PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists"})
 
 # Tier-2 source-loading: types whose tier-2 criterion may legitimately
 # be evaluated with empty SOURCE_CODE. The conservative default is the
@@ -51,6 +51,58 @@ _EMPTY_SOURCE_OK_TYPES: frozenset[str] = frozenset()
 _TARGET_SUBJECT_KINDS: dict[str, str] = {
     "feature_description": SUBJECT_FEATURE_DESCRIPTION,
 }
+
+
+def _load_attestation_source(project_root: Path) -> str:
+    """Load attestation statements as tier-2 source content.
+
+    An attested test has no file in the tree that constitutes its evidence --
+    the evidence is what the CI run reported. Hand tier 2 the statements
+    themselves so it judges the claim against the recorded outcome, rather than
+    hitting the fail-closed empty-source guard.
+
+    Returns "" when nothing is present; the caller's guard turns that into a
+    refusal to ask the LLM about empty evidence.
+    """
+    import json
+
+    from .attestation import (
+        AttestationError, expected_ci_identity, head_commit, load_attestations,
+        verify_attestation,
+    )
+    from .verifiers.tests import _expected_public_key
+
+    identity, issuer = expected_ci_identity()
+    try:
+        public_key = _expected_public_key()
+    except AttestationError:
+        return ""
+    allow_unsigned = not identity and not public_key
+    commit = head_commit(project_root)
+
+    blocks = []
+    for raw in load_attestations(project_root):
+        # Verified here, not merely decoded. The semantic tier is told the
+        # mechanical tier already checked these, so handing it an envelope
+        # that failed -- or one for a different commit -- makes that framing
+        # false, and test names are free-form text that reaches the model.
+        try:
+            statement, _ = verify_attestation(
+                raw,
+                expected_identity=identity,
+                expected_issuer=issuer,
+                expected_key_pem=public_key,
+                allow_unsigned=allow_unsigned,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        attested_commit = str((statement.get("predicate") or {}).get("commit") or "")
+        if not commit or attested_commit != commit:
+            continue
+        blocks.append(json.dumps(statement, indent=2, sort_keys=True))
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)[:16000]
 
 
 def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
@@ -741,14 +793,7 @@ class Runner:
                         a_id = assertion["id"]
                         a_type = assertion["type"]
                         result = future.result()
-                        results.append({
-                            "assertion_id": a_id,
-                            "tier": tier,
-                            "result": result["status"],
-                            "details": result["details"],
-                            "reasoning": result.get("reasoning", ""),
-                            "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
-                        })
+                        results.append(_result_row(a_id, a_type, tier, result))
                         details.append({
                             "assertion_id": a_id,
                             "type": a_type,
@@ -769,14 +814,7 @@ class Runner:
                     else:
                         result = self._verify_tier2(assertion)
 
-                    results.append({
-                        "assertion_id": a_id,
-                        "tier": tier,
-                        "result": result["status"],
-                        "details": result["details"],
-                        "reasoning": result.get("reasoning", ""),
-                        "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
-                    })
+                    results.append(_result_row(a_id, a_type, tier, result))
                     details.append({
                         "assertion_id": a_id,
                         "type": a_type,
@@ -800,10 +838,13 @@ class Runner:
 
         try:
             result = verifier.verify(params, self.project_root)
-            return {
+            out = {
                 "status": "pass" if result.passed else "fail",
                 "details": result.details,
             }
+            if getattr(result, "provenance", ""):
+                out["provenance"] = result.provenance
+            return out
         except Exception as e:
             return {"status": "fail", "details": f"Verifier error: {e}"}
 
@@ -899,8 +940,14 @@ class Runner:
             subject_kind = _TARGET_SUBJECT_KINDS.get(
                 params.get("target", ""), SUBJECT_REPOSITORY_FILE
             )
+        elif a_type == "test_attested":
+            # The evidence for an attested test is the attestation, not a file
+            # in the tree. Hand tier 2 the statement so it judges the claim
+            # against what the run actually reported, rather than being asked
+            # to evaluate empty content.
+            source_code = _load_attestation_source(self.project_root)
         elif not source_file and a_type in _PATTERN_GLOB_TYPES:
-            # Pattern-based types (test_exists, test_passes) use
+            # Pattern-based types (test_exists) use
             # ``params["pattern"]`` and tier-1 globs it. Mirror that
             # resolution here so tier-2 has the matched file contents as
             # SOURCE_CODE — previously the runner looked up
@@ -1168,9 +1215,11 @@ _DECLARATION_TYPES = frozenset({
     "middleware_registered", "module_exists", "module_instantiated",
     "no_plaintext_secret", "parameter_defined", "parameter_validated",
     "pattern_absent", "pattern_matches", "port_exists", "register_reset",
-    "signal_exists", "sva_assertion_present", "test_exists",
-    # Deliberately absent: ``test_passes`` and ``error_handled`` — their
-    # verifiers run the code under test, and tier 1 already owns that result.
+    "signal_exists", "sva_assertion_present", "test_exists", "test_attested",
+    # Deliberately absent: ``error_handled`` — its verifier runs the code under
+    # test, and tier 1 already owns that result. ``test_passes`` was removed
+    # entirely; ``test_attested`` reads a signed statement and executes
+    # nothing, so it belongs here.
 })
 
 
@@ -1220,8 +1269,32 @@ def _auto_detect_repo(project_root: Path) -> str:
     return ""
 
 
+def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
+    """One submitted result. ``provenance`` rides along only when a verifier
+    set it (signed-evidence types), as data rather than inside ``details``,
+    so the platform's audit envelope and sufficiency inputs can carry the
+    signing class without parsing prose."""
+    row = {
+        "assertion_id": a_id,
+        "tier": tier,
+        "result": result["status"],
+        "details": result["details"],
+        "reasoning": result.get("reasoning", ""),
+        "reviewer": result.get("reviewer", f"mipiti-verify:{a_type}"),
+    }
+    if result.get("provenance"):
+        row["provenance"] = result["provenance"]
+    return row
+
+
 def _auto_detect_oidc(audience: str = "") -> str:
-    """Auto-detect OIDC token from CI environment."""
+    """Auto-detect OIDC token from CI environment.
+
+    GitLab has two generations: the ``id_tokens`` job keyword (current)
+    exposes a token under a name the job chooses -- ``SIGSTORE_ID_TOKEN`` is
+    the convention Sigstore tooling reads -- and the older ``CI_JOB_JWT_V2``
+    (removed in GitLab 17). Both are honoured, newest first.
+    """
     # GitHub Actions
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
     token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
@@ -1240,10 +1313,11 @@ def _auto_detect_oidc(audience: str = "") -> str:
         except Exception:
             pass
 
-    # GitLab CI
-    gl_token = os.environ.get("CI_JOB_JWT_V2", "")
-    if gl_token:
-        return gl_token
+    # GitLab CI (id_tokens keyword, then the retired CI_JOB_JWT_V2)
+    for var in ("SIGSTORE_ID_TOKEN", "CI_JOB_JWT_V2"):
+        gl_token = os.environ.get(var, "")
+        if gl_token:
+            return gl_token
 
     return ""
 

@@ -233,10 +233,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Your tests, run by you. Write a JUnit report so the result can be
+      # recorded as evidence; verification reads it and runs nothing itself.
+      - run: pytest --junitxml=report.xml
+
       - uses: Mipiti/mipiti-verify@103af2761170eb61b0b17af23bbd800d557175b8 # v0.51.5
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}
+
+          # Needed for test_attested assertions. Points at the report the step
+          # above wrote; the action records a signed attestation from it before
+          # verifying. Space-separate several paths for more than one suite.
+          # Signed keylessly through Sigstore using the run's OIDC token — no
+          # secret to create or rotate. Only CI without a workload identity
+          # needs attestation-signing-key.
+          junit-report: report.xml
+
+          # Optional, for assertions that require the run to have used a
+          # particular configuration. A suite can pass with the control it
+          # exercises switched off, and a file in the repository shows what is
+          # declared, not what the run had. Only these names are recorded, and
+          # a name that looks like a credential is refused.
+          attestation-env: FEATURE_AUTH ENFORCE_TLS
 
           # Model selection (one of these)
           all: true                    # Verify all models in the workspace
@@ -289,6 +309,18 @@ The default stays `false` so existing workflows on runners without workload iden
 
 Private or air-gapped deployments can also redirect signing itself at their own Sigstore instance via `sigstore-tuf-url` on the `run` command.
 
+### Test-result attestations (`test_attested`)
+
+A `test_attested` assertion is checked against a statement your CI signed about a test run your own workflow performed. `mipiti-verify attest-tests --junit <report>` (or the action's `junit-report` input) turns a JUnit report into an in-toto Statement with `predicateType` `https://mipiti.io/attestations/test-result/v1`, signs it, and writes it to `.mipiti/attestations/` in the checkout. Verification reads it and executes nothing.
+
+**Predicate schema.** Published at [`schemas/test-result-v1.schema.json`](schemas/test-result-v1.schema.json). Any producer that emits a conforming statement, signed under an identity the verifier is pinned to, is accepted; the CLI is one producer, not the interface. The load-bearing fields are `commit` (must equal the commit under verification), `totals` and `selected.matched_count` (a run that selected nothing or in which nothing passed is refused), and `tests[]` with a per-test `status` (the named test must itself be `passed`; a skip is not evidence). `environment` records only the variables nominated with `attestation-env`, and an assertion's `env` param requires their values.
+
+**Signing identity and what reaches the platform.** The attestation is signed the same way the verification run is: keylessly through Sigstore under the CI workload identity (`ci_oidc`) where one exists, with a customer-held ECDSA key (`customer_key`) where none does, and `unsigned` only where neither could apply. Each `test_attested` result submitted to the platform carries that class in a `provenance` field, so the audit envelope and the platform's sufficiency inputs can weigh a workflow-signed pass against a self-declared one as data rather than by reading prose.
+
+**Tests and verification in separate jobs.** `.mipiti/attestations/` lives in the runner's working tree, not in the repository. If your tests run in one job and verification in another, upload that directory as a workflow artifact from the test job and download it before the verify step. This is sound because freshness is not the guard, the commit binding is: an attestation names the commit its run covered, so a file from an older run names an older commit and is refused, and a file that names the current commit could only have been produced by a run against that tree. No file committed into the repository can name its own commit, since the commit hash covers the file. What an attestation cannot say is whether something outside the tree, such as a live service, changed between the run and the read; `attested_at` and `ci.run_url` are recorded for exactly that reader.
+
+**GitLab.** Keyless signing uses the `id_tokens` job keyword; expose the token as `SIGSTORE_ID_TOKEN` with audience `sigstore`. The retired `CI_JOB_JWT_V2` is still honoured.
+
 ### Action Inputs
 
 | Input | Required | Default | Description |
@@ -318,13 +350,13 @@ Private or air-gapped deployments can also redirect signing itself at their own 
 
 ## Two-Tier Verification
 
-**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls:
+**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls. No assertion type executes project code:
 - `function_exists`, `class_exists`, `decorator_present`, `function_calls`
 - `pattern_matches`, `pattern_absent`, `import_present`
 - `file_exists`, `file_hash`
 - `config_key_exists`, `config_value_matches`
 - `dependency_exists`, `dependency_version`
-- `test_passes`, `test_exists`
+- `test_attested`, `test_exists`
 - `env_var_referenced`, `error_handled`
 - `no_plaintext_secret`, `middleware_registered`, `http_header_set`
 - `module_exists`, `module_instantiated`, `port_exists`, `parameter_defined`, `signal_exists`, `sva_assertion_present`, `register_reset` (RTL/Verilog)

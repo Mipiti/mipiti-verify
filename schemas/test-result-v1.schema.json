@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mipiti.io/attestations/test-result/v1/schema.json",
+  "title": "Mipiti test-result attestation predicate (v1)",
+  "description": "The predicate of an in-toto Statement with predicateType https://mipiti.io/attestations/test-result/v1. Produced by `mipiti-verify attest-tests`; any producer that emits a conforming statement signed under an identity the verifier is pinned to is accepted. Verification reads the statement and executes nothing.",
+  "type": "object",
+  "required": [
+    "commit",
+    "invocation",
+    "outcome",
+    "totals",
+    "selected",
+    "tests",
+    "ci",
+    "attested_at"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "commit": {
+      "type": "string",
+      "minLength": 7,
+      "description": "Git commit the run covered. Must equal the commit under verification; an empty value fails."
+    },
+    "invocation": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "argv the producer's own test step executed, as recorded by the producer."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed"
+      ],
+      "description": "passed only when failed == 0, errors == 0 and passed > 0."
+    },
+    "totals": {
+      "type": "object",
+      "required": [
+        "total",
+        "passed",
+        "failed",
+        "skipped",
+        "errors"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "errors": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Must be self-consistent: passed + failed + skipped + errors == total."
+    },
+    "selected": {
+      "type": "object",
+      "required": [
+        "matched_count"
+      ],
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "matched_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "How many tests the run selected. matched_count must be > 0; a vacuous selection is refused."
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "classname::name, the unambiguous form."
+          },
+          "name": {
+            "type": "string"
+          },
+          "classname": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "passed",
+              "failed",
+              "skipped",
+              "error"
+            ]
+          }
+        }
+      },
+      "description": "One record per test with its own status. A test_attested assertion names one of these exactly and requires its status to be passed; a skipped test is not evidence."
+    },
+    "ci": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "run_url": {
+          "type": "string"
+        },
+        "workflow": {
+          "type": "string"
+        }
+      },
+      "description": "Recorded for a reader; never a trust anchor. Trust comes from the signature."
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "description": "Nominated environment variables and their values at run time; null records that a nominated name was unset. Absent when the producer nominated nothing, which cannot satisfy an assertion's env requirement."
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "description": "Optional: lines hit per path."
+    },
+    "attested_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

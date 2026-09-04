@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Each `test_attested` result submitted to the platform carries the signing
+  class of the attestation it was checked against (`ci_oidc`, `customer_key`
+  or `unsigned`) in a `provenance` field, as data rather than inside the
+  details prose, so the audit envelope and the platform can weigh it.
+- The test-result predicate schema is published at
+  `schemas/test-result-v1.schema.json`, so a producer other than this CLI can
+  emit a conforming attestation.
+- GitLab keyless signing recognises the `id_tokens` job keyword (token
+  exposed as `SIGSTORE_ID_TOKEN`) in addition to the retired `CI_JOB_JWT_V2`,
+  and the pinned identity is the workflow SAN (`project//config@ref`) rather
+  than the bare project URL.
+- README covers the predicate, provenance, running tests and verification in
+  separate jobs, and GitLab setup.
+
+### Changed
+
+- **`test_passes` is replaced by `test_attested`.** Verification is a read-only
+  operation: it reads evidence your project already produced and runs nothing.
+  `test_passes` was the one type that did not fit that rule, so it is removed.
+
+  A test result now reaches verification as a statement your CI signed about a
+  run your own workflow performed. Have your test step write a JUnit report and
+  point the action at it:
+
+  ```yaml
+  - run: pytest --junitxml=report.xml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      all: true
+      junit-report: report.xml
+  ```
+
+  No extra step, nothing to install, and no secret: the attestation is signed
+  keylessly with the run's own OIDC identity, the same way verification runs
+  are already signed. The certificate binds the repository, ref and workflow,
+  so the result carries where it came from. CI with no workload identity signs
+  with `attestation-signing-key` (ECDSA P-256) instead, and CI with neither
+  records the result as self-declared.
+
+  Outside GitHub Actions the equivalent is `mipiti-verify attest-tests --junit
+  report.xml`, run after your tests. Either way the report is read, never
+  produced -- the step that runs your tests is yours.
+
+  Verification pins the signing identity it expects: for a keyless signature,
+  the workflow of the repository being verified; for a key, one the reader
+  configured, never the key carried inside the attestation. Verification then
+  checks the signature, that the attestation covers the commit under
+  verification, that the run selected tests and that they passed, and that the
+  test the assertion names passed in that run.
+
+  The attestation records each test's own outcome, and the named one must be
+  `passed`. Being present in the run says only that the test was collected: a
+  skipped test appears exactly like one that ran, and skipping leaves the
+  failure and error counts at zero, so every aggregate still reads green. The
+  name is matched exactly, so an assertion about `test_auth` is not satisfied
+  by `test_auth_disabled`. A run that selected nothing, or in which everything
+  was skipped, is likewise rejected rather than treated as a pass.
+
+  An attestation can also record the configuration its run ran under, and an
+  assertion can require it:
+
+  ```yaml
+  - uses: Mipiti/mipiti-verify@<version>
+    with:
+      junit-report: report.xml
+      attestation-env: FEATURE_AUTH ENFORCE_TLS
+  ```
+
+  A suite can pass with the control it exercises switched off, and assertions
+  over files in the tree describe the configuration a repository *declares*
+  rather than the one a run *had*. Naming the keys records their values in the
+  signed statement, so `test_attested` can carry an `env` requirement and hold
+  the run to it. Only the names given are recorded, never the whole
+  environment; a nominated key that was unset is recorded as unset, so an
+  assertion can require that a flag was absent; and credential-looking names
+  are refused rather than redacted, since a signed artifact is distributed. A
+  run that recorded nothing cannot satisfy an environment requirement.
+
+  An attestation that names no commit is refused, as is one read where the
+  commit under verification cannot be determined. The binding is what stops a
+  result being replayed against a different tree, and a binding that lapsed
+  whenever either side was missing would not be one.
+
+  An attestation without a signature is accepted and recorded as self-declared
+  only where no verification key is configured. Where one is, an unsigned
+  attestation is refused, so removing a signature cannot lower the bar a result
+  is held to.
+
+  With this change no assertion type executes anything.
+
 ### Fixed
 
 - The workflow example in the README pinned `actions/checkout` at v4.3.1, which

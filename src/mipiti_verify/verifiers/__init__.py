@@ -11,10 +11,18 @@ from typing import Protocol
 
 @dataclass
 class VerifierResult:
-    """Result of a single Tier 1 verification."""
+    """Result of a single Tier 1 verification.
+
+    ``provenance`` names the class of signing identity the evidence carried,
+    for the verifiers whose evidence is a signed statement rather than a file
+    in the tree (``ci_oidc`` / ``customer_key`` / ``unsigned``). Empty for
+    every other verifier. It travels on the result record as data so the
+    platform and an auditor can weigh it without parsing prose.
+    """
 
     passed: bool
     details: str
+    provenance: str = ""
 
 
 class PathTraversalError(Exception):

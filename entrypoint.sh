@@ -8,6 +8,41 @@ set -euo pipefail
 # writable home so the cache (and any HOME-based state) works.
 export HOME=/home/verifier
 
+# A test result becomes evidence by being recorded from the report your own
+# test step produced. Done here so using the action is a single step: the
+# alternative would be installing the CLI separately just to run one command.
+# This reads the report; it does not run tests.
+if [ -n "$INPUT_JUNIT_REPORT" ]; then
+  for report in $INPUT_JUNIT_REPORT; do
+    # Accept a path relative to project-root (the natural way to write it) or
+    # one that already resolves as given. A plain `[ -f x ] && y=z` would abort
+    # the script under `set -e` whenever the first location misses, so the
+    # branch is explicit.
+    if [ -f "$INPUT_PROJECT_ROOT/$report" ]; then
+      resolved="$INPUT_PROJECT_ROOT/$report"
+    elif [ -f "$report" ]; then
+      resolved="$report"
+    else
+      echo "::error::junit-report '$report' not found. Point it at the report your test step wrote, relative to project-root."
+      exit 1
+    fi
+    ATTEST_ARGS=("attest-tests" "--junit" "$resolved" "--project-root" "$INPUT_PROJECT_ROOT")
+    if [ -n "$INPUT_ATTESTATION_ENV" ]; then
+      ATTEST_ARGS+=("--env" "$INPUT_ATTESTATION_ENV")
+    fi
+    if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
+      ATTEST_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+    fi
+    if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+      ATTEST_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+    fi
+    if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+      ATTEST_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+    fi
+    mipiti-verify "${ATTEST_ARGS[@]}"
+  done
+fi
+
 ARGS=("run")
 
 if [ -n "$INPUT_MODEL_ID" ]; then
