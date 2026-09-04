@@ -144,11 +144,13 @@ jobs:
             echo "Release $TAG already exists; appending Docker note if not present"
             EXISTING=$(gh release view "$TAG" --json body --jq '.body')
             if ! printf '%s' "$EXISTING" | grep -q "$DIGEST"; then
+              # Releases are immutable once published; a rerun that reaches
+              # this branch must not fail on a note it can no longer append.
               gh release edit "$TAG" --notes "${EXISTING}
 
           ---
 
-          ${NOTES}"
+          ${NOTES}" || echo "::notice::Release $TAG is immutable; Docker note not appended (the digest is in action.yml)."
             fi
           else
             gh release create "$TAG" --title "$TAG" --notes "$NOTES"
