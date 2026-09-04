@@ -198,7 +198,7 @@ class TestBuildMessageRendering:
 
     @pytest.mark.parametrize("a_type", [
         "function_exists", "class_exists", "decorator_present",
-        "function_calls", "parameter_validated", "test_passes",
+        "function_calls", "parameter_validated", "test_attested",
         "test_exists", "config_key_exists", "config_value_matches",
         "dependency_exists", "dependency_version", "file_exists",
         "file_hash", "pattern_matches", "pattern_absent",

@@ -145,7 +145,7 @@ jobs:
           pip-audit -r requirements-all.lock   --disable-pip $IGNORE
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx
+        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema
 
       - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
@@ -352,7 +352,7 @@ jobs:
         run: pip install --require-hashes -r requirements.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx pytest-xdist
+        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema pytest-xdist
 
       - name: Run audit-spec BFS implementation check
         # Parallelize across all available CPU cores via pytest-xdist.
