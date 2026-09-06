@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `formal/check_adapters.py` without the parser extra: the properties that
+  need a parser (mutation confinement, the drive for the compile and
+  clean-tree gates, the parser-versus-fallback comparison) are reported
+  not established instead of failing or aborting; the runtime's refusal to
+  mutate what it cannot isolate is unchanged.
+
 ### Added
 
 - A source mutation runs only on a definition the language layer isolates

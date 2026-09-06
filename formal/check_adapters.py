@@ -301,6 +301,14 @@ def check_a2() -> Tuple[int, List[str], List[str]]:
         try:
             mutated = _mutate(language, source, mechanism)
         except DisableError as e:
+            # Without the parser extra the language layer refuses to mutate
+            # what it cannot isolate exactly. That refusal is the property
+            # the runtime keeps; the confinement check itself is then not
+            # established for that case, not violated.
+            if not D.tree_sitter_available(D.language_of(file)) and D.language_of(file) not in D.HDL_LANGUAGES \
+                    and language != "python":
+                unestablished.append(f"A2 confinement for {mechanism} (parser extra not installed)")
+                continue
             violations.append(f"A2: {mechanism}: mutation refused: {e}")
             continue
         checked += 1
@@ -363,8 +371,9 @@ def _drive(root: Path, adapter_name: str, mechanism: str, check_reason: str,
         return run_pair(root, "the_test", mechanism, adapter=adapter)
 
 
-def check_a3_a4() -> Tuple[int, int, List[str]]:
+def check_a3_a4() -> Tuple[int, int, List[str], List[str]]:
     violations: List[str] = []
+    unestablished: List[str] = []
     a3 = a4 = 0
     root = _repo(_all_fixture_files())
     try:
@@ -373,7 +382,13 @@ def check_a3_a4() -> Tuple[int, int, List[str]]:
             path = root / file
             original = source.encode("utf-8")
             mechanism = DRIVE_MECHANISM[language]
-            mutated_expected = _mutate(language, source, mechanism).encode("utf-8")
+            try:
+                mutated_expected = _mutate(language, source, mechanism).encode("utf-8")
+            except DisableError:
+                if D.tree_sitter_available(D.language_of(file)):
+                    raise
+                unestablished.append(f"A3/A4 drive for {language} (parser extra not installed)")
+                continue
             for adapter_name in adapters:
                 where = f"{adapter_name}/{mechanism}"
 
@@ -431,13 +446,20 @@ def check_a3_a4() -> Tuple[int, int, List[str]]:
         log = []
         record = _drive(loose, "go", "a.go::Guard", "", log)
         a4 += 1
-        if record["status"] != OUTCOME_ERROR or "git checkout" not in record.get("note", ""):
+        if record["status"] != OUTCOME_ERROR:
             violations.append(f"A4: outside a checkout was not refused: {record}")
+        elif "git checkout" not in record.get("note", ""):
+            if D.tree_sitter_available("go"):
+                violations.append(f"A4: outside a checkout was refused for another reason: {record}")
+            else:
+                # Refused, nothing ran, bytes untouched; the stated reason is
+                # the isolation refusal that precedes the checkout gate here.
+                unestablished.append("A4 outside-a-checkout reason (parser extra not installed)")
         if log or (loose / "a.go").read_text() != GO:
             violations.append("A4: outside a checkout: something ran or the file changed")
     finally:
         shutil.rmtree(loose, ignore_errors=True)
-    return a3, a4, violations
+    return a3, a4, violations, unestablished
 
 
 # ---------------------------------------------------------------------------
@@ -724,13 +746,22 @@ def _report(label: str, count: int, violations: List[str]) -> bool:
 # A8  a mutation runs only on an exactly located span
 # ---------------------------------------------------------------------------
 
-def check_a8() -> Tuple[int, List[str]]:
+def check_a8() -> Tuple[int, List[str], List[str]]:
     violations: List[str] = []
+    unestablished: List[str] = []
     checked = 0
     for language, mechanism, _span, _extras, (kind, name) in MUTATION_CASES:
         file, source = FIXTURES[language]
         lang = D.language_of(file)
-        with_parser = _mutate(language, source, mechanism)
+        try:
+            with_parser = _mutate(language, source, mechanism)
+        except DisableError:
+            if D.tree_sitter_available(lang):
+                raise
+            # The property compares the parser arm with the fallback arm;
+            # without the parser there is only one arm.
+            unestablished.append(f"A8 for {mechanism} (parser extra not installed)")
+            continue
         with _ParserOff():
             located = D.locate(source, kind, name, language=lang)
             exact = located is not None and located.scope == D.SCOPE_SYMBOL
@@ -752,7 +783,7 @@ def check_a8() -> Tuple[int, List[str]]:
                 violations.append(f"A8: {mechanism}: fallback scope {scope!r}, yet the file was mutated")
             elif REASON_NOT_ISOLATED not in refused:
                 violations.append(f"A8: {mechanism}: refused without the documented reason: {refused}")
-    return checked, violations
+    return checked, violations, unestablished
 
 
 # ---------------------------------------------------------------------------
@@ -855,9 +886,10 @@ def main() -> int:
     all_pass &= _report("A2 mutation confined to the definition", c, v)
     unestablished += u
 
-    a3, a4, v = check_a3_a4()
+    a3, a4, v, u = check_a3_a4()
     all_pass &= _report("A3 compile check gates the run", a3, [x for x in v if x.startswith("A3")])
     all_pass &= _report("A4 dirty or unversioned file refused", a4, [x for x in v if x.startswith("A4")])
+    unestablished += u
 
     c, v, u, limits = check_a5()
     all_pass &= _report("A5 parser and fallback agree", c, v)
@@ -872,8 +904,9 @@ def main() -> int:
     c, v = check_a7()
     all_pass &= _report("A7 outcome mapping total and closed", c, v)
 
-    c, v = check_a8()
+    c, v, u = check_a8()
     all_pass &= _report("A8 mutation only on an exactly located span", c, v)
+    unestablished += u
 
     c, v = check_a9()
     all_pass &= _report("A9 hook strategy credits only with the location proof", c, v)
