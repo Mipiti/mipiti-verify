@@ -637,3 +637,25 @@ class TestMechanismReach:
     def test_suite_reach_never_establishes_reach(self, no_tree_sitter, project):
         entry = {"suite_reached": [{"file": "rtl/alu.sv", "lines": [16]}]}
         assert _reached_mechanism(entry, project, "rtl/alu.sv", "always:seq_logic") is None
+
+
+class TestMechanismKindVocabulary:
+    def test_one_tuple_everywhere(self):
+        from mipiti_verify.languages import definitions as D
+        from mipiti_verify.languages.adapters import _common as C
+        from mipiti_verify.verifiers.tests import mechanism_kinds
+
+        assert C.KINDS is D.MECHANISM_KINDS
+        assert set(D.HDL_KINDS) < set(D.MECHANISM_KINDS)
+        for kind in D.MECHANISM_KINDS:
+            assert mechanism_kinds(f"{kind}:x") == ((kind,), "x")
+            assert C.parse_mechanism(f"a/b.sv::{kind}:x").kind == kind
+        assert mechanism_kinds("widget:x") == (D.MECHANISM_KIND_ORDER, "widget:x")
+
+    def test_struct_and_impl_locate_as_class(self):
+        from mipiti_verify.languages.definitions import locate
+
+        src = "pub struct Limiter {\n    n: u32,\n}\n\nimpl Limiter {\n    pub fn allow(&self) -> bool { true }\n}\n"
+        found = locate(src, "struct", "Limiter", language="rust")
+        assert found is not None and found.start_line == 1
+        assert locate(src, "class", "Limiter", language="rust").start_line == 1

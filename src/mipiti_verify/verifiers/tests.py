@@ -313,13 +313,13 @@ def mechanism_kinds(symbol: str) -> tuple[tuple[str, ...], str]:
     function, then a class, then each HDL kind in a fixed order, so a
     reader can predict which definition a bare name resolves to.
     """
-    from ..languages.definitions import HDL_KINDS, MECHANISM_KIND_ORDER
+    from ..languages.definitions import MECHANISM_KIND_ORDER, MECHANISM_KINDS
 
     text = str(symbol or "").strip()
     if ":" in text and "::" not in text:
         kind, _, name = text.partition(":")
         kind, name = kind.strip().lower(), name.strip()
-        if kind in ("function", "class", "method") or kind in HDL_KINDS:
+        if kind in MECHANISM_KINDS and name:
             return (kind,), name
     if "." in text:
         return ("method", "class"), text

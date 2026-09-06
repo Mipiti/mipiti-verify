@@ -83,6 +83,17 @@ HDL_KINDS = (
     "interface", "package", "program",
 )
 
+# Every construct kind a mechanism may name explicitly (``file::kind:name``).
+# The one vocabulary in this package: the disable adapters, the verifier's
+# kind resolution and the hook strategy all read it, and the type-design
+# checker asserts it equals the catalogue's ``MECHANISM_KINDS``. ``struct``
+# and ``impl`` locate as ``class`` (``TYPE_KIND_ALIASES``); a kind the
+# language layer cannot isolate or disable yields ``None`` / ``error``,
+# never a wrong span.
+MECHANISM_KINDS = ("function", "method", "class", "struct", "impl") + HDL_KINDS
+
+TYPE_KIND_ALIASES = {"struct": "class", "impl": "class"}
+
 # The order a bare ``file::name`` mechanism is tried in when no kind is given.
 MECHANISM_KIND_ORDER = (
     "function", "class", "module", "entity", "task", "property", "sequence",
@@ -132,6 +143,7 @@ def locate(content: str, kind: str, name: str, *, language: str = "") -> Optiona
     """
     if not content or not name or not kind:
         return None
+    kind = TYPE_KIND_ALIASES.get(kind, kind)
     lines = _lines(content)
     text = "\n".join(lines)
 

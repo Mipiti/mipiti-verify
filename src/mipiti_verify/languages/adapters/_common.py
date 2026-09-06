@@ -25,12 +25,7 @@ OUTCOME_ERROR = "error"
 
 DISABLED_MESSAGE = "mipiti: mechanism disabled"
 
-# Reference kinds a mechanism may name explicitly, as ``file::kind:name``.
-KINDS = (
-    "function", "method", "class", "struct", "impl", "module", "task",
-    "always", "initial", "property", "sequence", "assert", "entity",
-    "architecture", "process", "procedure",
-)
+from ..definitions import MECHANISM_KINDS as KINDS  # noqa: E402  (the one vocabulary)
 
 
 class DisableError(Exception):

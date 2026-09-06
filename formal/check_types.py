@@ -427,6 +427,51 @@ def check_t5() -> Tuple[int, List[str]]:
 # Main
 # ---------------------------------------------------------------------------
 
+def check_t6(catalogue) -> Tuple[int, List[str]]:
+    """T6: one mechanism-kind vocabulary.
+
+    The verifier's ``MECHANISM_KINDS`` equals the catalogue's, as a set; the
+    catalogue's declared ``mechanism`` pattern accepts ``<file>::<kind>:<name>``
+    for every kind and refuses one outside the vocabulary; and every kind
+    the verifier accepts explicitly is one the disable adapters and the
+    locator also read from the same tuple (there is no second list).
+    """
+    import re
+
+    from mipiti_verify.languages import definitions as D
+    from mipiti_verify.languages.adapters import _common as C
+    from mipiti_verify.verifiers.tests import mechanism_kinds
+
+    violations: List[str] = []
+    count = 0
+    ours, theirs = set(D.MECHANISM_KINDS), set(catalogue.MECHANISM_KINDS)
+    count += 1
+    if ours != theirs:
+        violations.append(f"T6 vocabulary differs: verifier-only={sorted(ours - theirs)} "
+                          f"catalogue-only={sorted(theirs - ours)}")
+    count += 1
+    if C.KINDS is not D.MECHANISM_KINDS:
+        violations.append("T6 adapters declare their own kind list")
+    spec = next(t for t in catalogue.ASSERTION_TYPES if t.name == "test_attested")
+    param = next(p for p in spec.params if p.name == "mechanism")
+    pattern = getattr(param, "pattern", "")
+    for kind in D.MECHANISM_KINDS:
+        count += 2
+        if not re.match(pattern, f"src/a.sv::{kind}:name_1"):
+            violations.append(f"T6 catalogue pattern refuses kind {kind!r}")
+        kinds, name = mechanism_kinds(f"{kind}:name_1")
+        if kinds != (kind,) or name != "name_1":
+            violations.append(f"T6 verifier does not resolve kind {kind!r} explicitly")
+    count += 1
+    if re.match(pattern, "src/a.sv::widget:name_1"):
+        violations.append("T6 catalogue pattern accepts a kind outside the vocabulary")
+    for alias, target in D.TYPE_KIND_ALIASES.items():
+        count += 1
+        if alias not in D.MECHANISM_KINDS or target not in D.MECHANISM_KINDS:
+            violations.append(f"T6 alias {alias!r}->{target!r} names a kind outside the vocabulary")
+    return count, violations
+
+
 def _report(label: str, count: int, violations: List[str]) -> bool:
     print(f"{label} ({count} checks): ", end="")
     if violations:
@@ -451,7 +496,8 @@ def main() -> int:
     if catalogue is None:
         print("\nT1 catalogue coverage:      NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
         print("T2 param spec agreement:    NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
-        not_established += ["T1", "T2"]
+        print("T6 mechanism-kind vocabulary: NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
+        not_established += ["T1", "T2", "T6"]
     else:
         print(f"\nCatalogue: {len(catalogue.ASSERTION_TYPES)} types; registry: {len(VERIFIER_REGISTRY)} verifiers")
         c, v = check_t1(catalogue)
@@ -460,6 +506,13 @@ def main() -> int:
         c, v = check_t2(catalogue)
         all_pass &= _report("T2 param spec agreement", c, v)
         established.append("T2")
+        if hasattr(catalogue, "MECHANISM_KINDS"):
+            c, v = check_t6(catalogue)
+            all_pass &= _report("T6 mechanism-kind vocabulary", c, v)
+            established.append("T6")
+        else:
+            print("T6 mechanism-kind vocabulary: NOT ESTABLISHED (catalogue predates MECHANISM_KINDS)")
+            not_established.append("T6")
 
     c, v = check_t3()
     all_pass &= _report("T3 templates", c, v)
@@ -477,7 +530,7 @@ def main() -> int:
         return 1
     if not_established:
         print(f"TYPE PROPERTIES {', '.join(established)} VERIFIED; "
-              f"{', '.join(not_established)} NOT ESTABLISHED (catalogue not installed)")
+              f"{', '.join(not_established)} NOT ESTABLISHED (catalogue not installed, or predates the property)")
         print(f"{'=' * 70}")
         return 0
     print("ALL TYPE PROPERTIES VERIFIED")

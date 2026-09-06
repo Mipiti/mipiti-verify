@@ -125,7 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<file>::<kind>:<name>` (`rtl/alu.sv::module:alu`,
   `rtl/fsm.sv::always:seq_logic`); a bare name is tried as a function, then a
   class, then each HDL kind in a fixed order. Reach is computed against the
-  span the file's language resolves.
+  span the file's language resolves. The kinds are one vocabulary
+  (`languages.definitions.MECHANISM_KINDS`, equal to the catalogue's), read by
+  the locator, the disable adapters and the verifier alike; `struct` and
+  `impl` locate as `class`.
 - `attest-tests --coverage` reads LCOV (`.info` / `.lcov`, including
   `verilator_coverage --write-info` output), Cobertura XML and JaCoCo XML in
   addition to coverage.py JSON, detected from content, and accepts a
