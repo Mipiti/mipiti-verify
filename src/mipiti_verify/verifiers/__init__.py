@@ -212,11 +212,40 @@ class Verifier(Protocol):
 # Registry populated by submodule imports
 VERIFIER_REGISTRY: dict[str, Verifier] = {}
 
+# What a type's evidence IS, stated in one place for every registered type.
+#
+# ``presence``   the verdict rests on something present in the tree: a file,
+#                a symbol, a declaration, a pattern, a pinned dependency. It
+#                establishes that the mechanism is there, not that it acts.
+# ``behavioral`` the verdict rests on the code having been exercised: a test
+#                that exists for it, or a signed statement that a named test
+#                ran and passed at this commit.
+#
+# Every registered type carries exactly one class; the formal check
+# ``formal/check_types.py`` refuses a registration that does not.
+EVIDENCE_PRESENCE = "presence"
+EVIDENCE_BEHAVIORAL = "behavioral"
+EVIDENCE_CLASSES = frozenset({EVIDENCE_PRESENCE, EVIDENCE_BEHAVIORAL})
+
+_BEHAVIORAL_TYPES = frozenset({"test_attested", "test_exists"})
+
+EVIDENCE_CLASS: dict[str, str] = {}
+
+
+def evidence_class(assertion_type: str) -> str:
+    """The evidence class of a registered type, or ``""`` when unregistered."""
+    if not VERIFIER_REGISTRY:
+        _load_all()
+    return EVIDENCE_CLASS.get(assertion_type, "")
+
 
 def register(assertion_type: str):
     """Decorator to register a verifier for an assertion type."""
     def decorator(cls):
         VERIFIER_REGISTRY[assertion_type] = cls()
+        EVIDENCE_CLASS[assertion_type] = (
+            EVIDENCE_BEHAVIORAL if assertion_type in _BEHAVIORAL_TYPES else EVIDENCE_PRESENCE
+        )
         return cls
     return decorator
 

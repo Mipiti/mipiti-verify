@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Formal checks over every verifier, every assertion type, the composition
+  of test-evidence records, and every runner adapter
+  (`formal/check_verifiers.py`, `formal/check_types.py`,
+  `formal/check_evidence_records.py`, `formal/check_adapters.py`), each exhaustive over its space and
+  cross-checked against an independent oracle: a structural verifier passes
+  only when its condition holds and fails closed otherwise; a type is stated
+  consistently across the catalogue, its verifier's parameter reads, its
+  tier-2 template and its evidence class; a mutated source file is restored
+  byte-for-byte, changed only within the named definition, compile-checked
+  before the test runs, and refused when the working tree is dirty; a
+  `test_attested` pass comes only from a test-result record at the commit,
+  and the reach and dependence facts only from a record that was actually
+  run at that commit for that mechanism. Each
+  runs as an ordinary test, so CI runs them on every push. The verifier
+  registry now states each type's evidence class (`presence` or
+  `behavioral`) via `EVIDENCE_CLASS` / `evidence_class()`.
 - Test-result attestations carry each test's definition: `attest-tests`
   locates every recorded test in the checkout and records its `file` and a
   `definition_sha256` over the definition block (or the file, marked
