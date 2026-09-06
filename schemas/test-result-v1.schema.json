@@ -125,9 +125,21 @@
           "definition_scope": {
             "type": "string",
             "enum": [
+              "symbol",
+              "block",
               "file"
             ],
-            "description": "Optional. Present, as \"file\", when definition_sha256 covers the whole file because the test's own definition could not be isolated."
+            "description": "Optional. What definition_sha256 covers. \"symbol\": exactly the named definition, isolated by a parser or by an exact keyword-pair block match. \"block\": a block starting at the first line that matched the name; a same-named definition later in the file is not covered. \"file\": the whole file, because the definition could not be isolated."
+          },
+          "parser": {
+            "type": "string",
+            "enum": [
+              "ast",
+              "tree-sitter",
+              "keyword",
+              "lines"
+            ],
+            "description": "Optional. What isolated the definition span: Python's ast, a tree-sitter grammar, the HDL keyword-pair scanner, or the brace / indentation line heuristic. Absent when definition_scope is \"file\"."
           },
           "reached": {
             "type": "array",
@@ -151,7 +163,31 @@
                 }
               }
             },
-            "description": "Optional. Files and lines this test executed, from a coverage report with contexts (`attest-tests --coverage`). An empty array is a fact: the run had coverage and the test touched nothing tracked. Absent means the run recorded no coverage."
+            "description": "Optional. Files and lines this test executed, from a coverage report that attributes lines to tests (coverage.py contexts, or one report per test; `attest-tests --coverage`). An empty array is a fact: the run had coverage and the test touched nothing tracked. Absent means nothing was attributed to this test; an aggregate report records suite_reached instead."
+          },
+          "suite_reached": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "file",
+                "lines"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Repository-relative path."
+                },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            },
+            "description": "Optional. Files and lines the whole run executed, from an aggregate coverage report (LCOV, Cobertura, JaCoCo, coverage.py without contexts). Informational: it says what the suite reached, not what this test reached, so it never establishes reach on its own."
           },
           "fails_without": {
             "type": "array",

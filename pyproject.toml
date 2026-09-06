@@ -49,7 +49,12 @@ packages = ["src/mipiti_verify"]
 [project.optional-dependencies]
 openai = ["openai>=1"]
 anthropic = ["anthropic>=0.40"]
-all = ["mipiti-verify[openai,anthropic]"]
+# Parser-exact definition location for languages other than Python (JS/TS,
+# Go, Rust, Java, Kotlin, C/C++, C#, Ruby, PHP, Swift, Verilog/SystemVerilog,
+# VHDL). Without it every language still resolves through the block
+# fallbacks; the attestation records which strategy isolated each span.
+ast = ["tree-sitter-language-pack>=0.7"]
+all = ["mipiti-verify[openai,anthropic,ast]"]
 dev = [
     "pytest>=8",
     "pytest-mock>=3",

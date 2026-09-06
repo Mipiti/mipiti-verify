@@ -131,7 +131,9 @@ def normalised_definition(block: str) -> str:
 
 
 def definition_sha256(block: str) -> str:
-    return hashlib.sha256(normalised_definition(block).encode("utf-8")).hexdigest()
+    from .languages.definitions import hash_of
+
+    return hash_of(block)
 
 
 def _relative_posix(project_root: Path, path: Path) -> str:
@@ -167,18 +169,43 @@ def _module_file(project_root: Path, dotted: str) -> Optional[Path]:
     return None
 
 
-def definition_hash_for(
-    project_root: Path, rel_file: str, name: str, owner: str = "",
-) -> Optional[tuple[str, str]]:
-    """``(sha256, scope)`` for ``name`` in ``rel_file``, or ``None``.
+class DefinitionRecord(tuple):
+    """``(sha256, scope, parser)`` of a located definition.
 
-    ``scope`` is ``"definition"`` when the block could be isolated -- inside
-    ``owner`` when a class is named -- and ``"file"`` when only the file
-    could be found, in which case the hash covers the whole file. The hash
-    is taken over the untruncated block: the reviewer's copy is bounded,
-    the evidence is not.
+    ``scope`` is ``symbol`` (a parser or an exact keyword-pair block isolated
+    the named definition), ``block`` (a block starting at the first line that
+    matched the name) or ``file`` (the whole file; ``parser`` is then empty).
     """
-    from .definition_extract import extract_definition_untruncated
+
+    __slots__ = ()
+
+    def __new__(cls, sha256: str, scope: str, parser: str = ""):
+        return super().__new__(cls, (sha256, scope, parser))
+
+    @property
+    def sha256(self) -> str:
+        return self[0]
+
+    @property
+    def scope(self) -> str:
+        return self[1]
+
+    @property
+    def parser(self) -> str:
+        return self[2]
+
+
+def locate_definition_record(
+    project_root: Path, rel_file: str, name: str, owner: str = "",
+) -> Optional[DefinitionRecord]:
+    """Where and how ``name`` is defined in ``rel_file``, or ``None``.
+
+    The language is taken from the file's extension. An empty ``name``
+    hashes the file. The hash is taken over the untruncated block: the
+    reviewer's copy is bounded, the evidence is not.
+    """
+    from .definition_extract import locate_definition
+    from .languages.definitions import language_of
 
     path = _resolve_in_root(project_root, rel_file)
     if path is None:
@@ -187,11 +214,29 @@ def definition_hash_for(
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    qualified = f"{owner}.{name}" if owner else name
-    block = extract_definition_untruncated(content, "function", qualified) if name else None
-    if block is not None:
-        return definition_sha256(block), "definition"
-    return definition_sha256(content), "file"
+    if name:
+        qualified = f"{owner}.{name}" if owner else name
+        kind = "method" if owner else "function"
+        found = locate_definition(content, kind, qualified, language=language_of(rel_file))
+        if found is not None:
+            return DefinitionRecord(definition_sha256(found.text), found.scope, found.parser)
+    return DefinitionRecord(definition_sha256(content), "file", "")
+
+
+def definition_hash_for(
+    project_root: Path, rel_file: str, name: str, owner: str = "",
+) -> Optional[tuple[str, str]]:
+    """``(sha256, scope)`` for ``name`` in ``rel_file``, or ``None``.
+
+    ``scope`` is ``"definition"`` when the block could be isolated -- inside
+    ``owner`` when a class is named -- and ``"file"`` when only the file
+    could be found, in which case the hash covers the whole file. See
+    ``locate_definition_record`` for the finer scope and the parser.
+    """
+    record = locate_definition_record(project_root, rel_file, name, owner)
+    if record is None:
+        return None
+    return record.sha256, ("file" if record.scope == "file" else "definition")
 
 
 def _locate_one(project_root: Path, entry: dict) -> None:
@@ -222,40 +267,43 @@ def _locate_one(project_root: Path, entry: dict) -> None:
             # The class must be defined in that file for the method to be
             # the definition; otherwise the file is only a location.
             from .definition_extract import definition_line_span
+            from .languages.definitions import language_of
 
             content = path.read_text(encoding="utf-8", errors="replace")
-            if definition_line_span(content, "class", owner) is None:
+            if definition_line_span(content, "class", owner, language=language_of(rel)) is None:
                 # The dotted name's last segment was read as a class and the
                 # file defines none by that name, so this file is not where
                 # the test lives; it is not even a fallback location.
                 continue
-        found = definition_hash_for(project_root, rel, name, owner)
-        if found is None:
+        record = locate_definition_record(project_root, rel, name, owner)
+        if record is None:
             continue
-        digest, scope = found
-        if scope == "definition":
+        if record.scope != "file":
             entry["file"] = rel
-            entry["definition_sha256"] = digest
+            entry["definition_sha256"] = record.sha256
+            entry["definition_scope"] = record.scope
+            entry["parser"] = record.parser
             return
         fallback = fallback or (path, "")
     if fallback is not None:
         path, _ = fallback
-        found = definition_hash_for(project_root, _relative_posix(project_root, path), "")
-        if found is not None:
+        record = locate_definition_record(project_root, _relative_posix(project_root, path), "")
+        if record is not None:
             entry["file"] = _relative_posix(project_root, path)
-            entry["definition_sha256"] = found[0]
+            entry["definition_sha256"] = record.sha256
             entry["definition_scope"] = "file"
+            entry.pop("parser", None)
 
 
 def locate_test_definitions(project_root: Path, tests: list) -> None:
     """Record, per test, where it is defined and a hash of that definition.
 
-    Adds ``file`` (repository-relative) and ``definition_sha256`` to each
-    entry that resolves; ``definition_scope: "file"`` marks an entry whose
-    function could not be isolated and whose hash covers the file instead.
-    An entry that cannot be resolved is left without the fields: absence
-    means "not resolved", which a reader treats as unknown, never as a
-    match. Nothing here raises.
+    Adds ``file`` (repository-relative), ``definition_sha256``,
+    ``definition_scope`` (``symbol`` / ``block`` / ``file``) and, unless the
+    scope is the file, ``parser`` (what isolated the span) to each entry
+    that resolves. An entry that cannot be resolved is left without the
+    fields: absence means "not resolved", which a reader treats as unknown,
+    never as a match. Nothing here raises.
     """
     for entry in tests or []:
         if not isinstance(entry, dict):
@@ -266,95 +314,98 @@ def locate_test_definitions(project_root: Path, tests: list) -> None:
             entry.pop("file", None)
             entry.pop("definition_sha256", None)
             entry.pop("definition_scope", None)
+            entry.pop("parser", None)
 
 
 # ---------------------------------------------------------------------------
 # Coverage contexts -- what each test reached
 # ---------------------------------------------------------------------------
 
-def _context_test(context: str) -> tuple[str, str]:
-    """``(test file, base test name)`` a coverage context names.
+def _key_names_entry(key: str, entry: dict) -> bool:
+    """Whether a coverage attribution key names the recorded test.
 
-    pytest-cov contexts look like ``tests/test_x.py::test_name|run`` (a
-    class in between for methods); the phase suffix is not part of the
-    identity, and neither is a parametrize id.
+    Keys come in two shapes. A coverage.py context,
+    ``tests/test_x.py::TestCase::test_name[case]|run`` (the phase suffix
+    is already stripped), names the test by file and leaf; the file must
+    be the one the test was located in, unless the test was not located.
+    A per-test report's file stem names it by id, with ``::`` spelled
+    ``__``, or by bare name.
     """
-    ctx = str(context or "").rsplit("|", 1)[0]
-    if "::" not in ctx:
-        return "", ""
-    path, _, rest = ctx.partition("::")
-    leaf = rest.rsplit("::", 1)[-1]
-    return path.replace("\\", "/"), base_test_name(leaf)
+    name = base_test_name(entry.get("name"))
+    if not name:
+        return False
+    known_file = str(entry.get("file") or "").replace("\\", "/")
+    classname = str(entry.get("classname") or "")
+    test_id = str(entry.get("id") or "")
+    key = str(key or "").replace("\\", "/")
+    if "::" in key:
+        head, _, rest = key.partition("::")
+        if base_test_name(rest.rsplit("::", 1)[-1]) != name:
+            return False
+        if not head or head == classname or head == test_id.partition("::")[0]:
+            return True
+        return not known_file or head == known_file
+    raw_name = str(entry.get("name") or "")
+    accepted = {test_id, raw_name, name}
+    for prefix in (classname, known_file):
+        if prefix:
+            accepted.add(f"{prefix}::{raw_name}")
+            accepted.add(f"{prefix}::{name}")
+    accepted |= {a.replace("::", "__") for a in accepted}
+    return key in accepted
 
 
-def merge_coverage(summary: dict, coverage_json: object, project_root: Path) -> None:
-    """Add ``reached: [{file, lines}]`` to each recorded test.
+def merge_coverage(summary: dict, coverage: object, project_root: Path) -> None:
+    """Record what each test reached, from a coverage report.
 
-    ``coverage_json`` is a coverage.py JSON export produced with contexts
-    (``coverage json --show-contexts``). A test that no context names gets
-    an explicitly empty list: the run had coverage, and the test touched
-    nothing tracked -- which is a fact, unlike the absence of the field.
+    ``coverage`` is a report path (any format ``coverage_readers`` reads, or
+    a directory of one report per test), an already-read ``CoverageReport``,
+    or a parsed coverage.py JSON export.
+
+    A report that attributes lines to tests gives each recorded test
+    ``reached: [{file, lines}]``; a test nothing names gets an explicitly
+    empty list, which is a fact (the run had coverage and the test touched
+    nothing tracked), unlike the absence of the field. An aggregate report
+    gives each test ``suite_reached`` instead and no ``reached``: reach is
+    a claim about one test, and a suite-wide report cannot make it.
     """
-    if not isinstance(coverage_json, dict) or not isinstance(coverage_json.get("files"), dict):
-        raise AttestationError(
-            "Coverage report is not a coverage.py JSON export: expected a "
-            "top-level 'files' object. Produce it with "
-            "'coverage json --show-contexts'."
-        )
-    root = project_root.resolve()
-    # (test file, test name) -> {source file -> lines}
-    index: dict[tuple[str, str], dict[str, set[int]]] = {}
-    saw_contexts = False
-    for raw_path, data in coverage_json["files"].items():
-        if not isinstance(data, dict):
-            continue
-        contexts = data.get("contexts")
-        if not isinstance(contexts, dict):
-            continue
-        path = Path(str(raw_path))
-        if path.is_absolute():
-            try:
-                rel = path.resolve().relative_to(root).as_posix()
-            except ValueError:
-                continue
+    from .coverage_readers import CoverageReadError, CoverageReport, read_coverage, read_coveragepy
+
+    try:
+        if isinstance(coverage, CoverageReport):
+            report = coverage
+        elif isinstance(coverage, (str, Path)):
+            report = read_coverage(coverage, project_root)
         else:
-            rel = path.as_posix()
-        for line_str, names in contexts.items():
-            try:
-                line = int(line_str)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(names, list):
-                continue
-            for ctx in names:
-                saw_contexts = True
-                key = _context_test(ctx)
-                if not key[1]:
+            report = read_coveragepy(coverage, project_root)
+    except CoverageReadError as e:
+        raise AttestationError(str(e)) from e
+
+    tests = [t for t in (summary.get("tests") or []) if isinstance(t, dict)]
+    if report.attributed:
+        for entry in tests:
+            entry.pop("suite_reached", None)
+            reached: dict[str, set[int]] = {}
+            for key, per_file in report.per_test.items():
+                if not _key_names_entry(key, entry):
                     continue
-                index.setdefault(key, {}).setdefault(rel, set()).add(line)
-    if not saw_contexts:
-        raise AttestationError(
-            "Coverage report carries no contexts, so nothing can be attributed "
-            "to a test. Run the tests with '--cov-context=test' (pytest-cov) "
-            "or 'coverage run --context=test', then 'coverage json "
-            "--show-contexts'."
-        )
-    for entry in summary.get("tests") or []:
-        if not isinstance(entry, dict):
-            continue
-        name = base_test_name(entry.get("name"))
-        known_file = str(entry.get("file") or "")
-        reached: dict[str, set[int]] = {}
-        for (ctx_file, ctx_name), per_file in index.items():
-            if ctx_name != name:
-                continue
-            if known_file and ctx_file and ctx_file != known_file:
-                continue
-            for src, lines in per_file.items():
-                reached.setdefault(src, set()).update(lines)
-        entry["reached"] = [
-            {"file": src, "lines": sorted(lines)} for src, lines in sorted(reached.items())
+                for src, lines in per_file.items():
+                    reached.setdefault(src, set()).update(lines)
+            entry["reached"] = _reach_list(reached)
+        return
+    suite = _reach_list(report.suite)
+    for entry in tests:
+        entry.pop("reached", None)
+        entry["suite_reached"] = [
+            {"file": item["file"], "lines": list(item["lines"])} for item in suite
         ]
+
+
+def _reach_list(per_file: dict[str, set[int]]) -> list[dict]:
+    return [
+        {"file": src, "lines": sorted(lines)}
+        for src, lines in sorted(per_file.items()) if src
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The predicate schema gains the optional per-test fields `file`,
   `definition_sha256`, `definition_scope`, `reached`, `fails_without` and the
   optional `kind`. No version bump; absence means "not recorded".
+- Definition location for every supported language. `attest-tests` cuts a
+  test's definition with Python's `ast`, with tree-sitter for JavaScript,
+  TypeScript, Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP, Swift, Verilog,
+  SystemVerilog and VHDL when the new optional extra `mipiti-verify[ast]`
+  (`tree-sitter-language-pack`, also in `[all]`) is installed, with a
+  keyword-pair block scanner for the HDLs when it is not, and with the brace
+  / indentation block otherwise. Each test entry now always records
+  `definition_scope` (`symbol`, `block` or `file`) and, unless the scope is
+  the file, `parser` (`ast`, `tree-sitter`, `keyword`, `lines`), so a reader
+  knows what the hash covers and how the span was found.
+- The `mechanism` of a `test_attested` assertion may name its kind:
+  `<file>::<kind>:<name>` (`rtl/alu.sv::module:alu`,
+  `rtl/fsm.sv::always:seq_logic`); a bare name is tried as a function, then a
+  class, then each HDL kind in a fixed order. Reach is computed against the
+  span the file's language resolves.
+- `attest-tests --coverage` reads LCOV (`.info` / `.lcov`, including
+  `verilator_coverage --write-info` output), Cobertura XML and JaCoCo XML in
+  addition to coverage.py JSON, detected from content, and accepts a
+  directory of one report per test (`<test id>.<ext>`, `::` spelled `__`).
+  A report that attributes lines to tests records `reached` per test; an
+  aggregate report (any format, or coverage.py without contexts) is no longer
+  refused: it records `suite_reached` per test and leaves `reached` absent,
+  because a suite-wide report cannot say what one test executed.
+- The predicate schema gains the optional per-test `parser` and
+  `suite_reached`; `definition_scope` accepts `symbol` and `block`.
 - Action inputs `coverage-report` and `dependence-pairs`.
 - `attest-dependence --total-timeout` (default 1800s, also
   `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would

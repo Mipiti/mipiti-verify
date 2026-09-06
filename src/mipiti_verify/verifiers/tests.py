@@ -297,10 +297,37 @@ def parse_mechanism(value: object) -> tuple[str, str]:
     return file, symbol
 
 
+def mechanism_kinds(symbol: str) -> tuple[tuple[str, ...], str]:
+    """``(kinds to try, name)`` for the symbol half of a mechanism reference.
+
+    ``kind:name`` (``module:alu``, ``always:seq_logic``) names the kind
+    outright. ``Class.method`` is a method. A bare name is tried as a
+    function, then a class, then each HDL kind in a fixed order, so a
+    reader can predict which definition a bare name resolves to.
+    """
+    from ..languages.definitions import HDL_KINDS, MECHANISM_KIND_ORDER
+
+    text = str(symbol or "").strip()
+    if ":" in text and "::" not in text:
+        kind, _, name = text.partition(":")
+        kind, name = kind.strip().lower(), name.strip()
+        if kind in ("function", "class", "method") or kind in HDL_KINDS:
+            return (kind,), name
+    if "." in text:
+        return ("method", "class"), text
+    return MECHANISM_KIND_ORDER, text
+
+
 def mechanism_line_span(project_root: Path, file: str, symbol: str) -> tuple[int, int] | None:
-    """Where the named mechanism is defined in the checkout, or ``None``."""
+    """Where the named mechanism is defined in the checkout, or ``None``.
+
+    Resolved with the language the file's extension names, so the span is
+    the parser's where one is installed and the block fallback's otherwise;
+    reach is then "any attested line of that file inside the span".
+    """
     from . import PathTraversalError, safe_resolve_path
     from ..definition_extract import definition_line_span
+    from ..languages.definitions import language_of
 
     try:
         path = safe_resolve_path(project_root, file)
@@ -312,8 +339,12 @@ def mechanism_line_span(project_root: Path, file: str, symbol: str) -> tuple[int
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    for kind in ("function", "class"):
-        span = definition_line_span(content, kind, symbol)
+    kinds, name = mechanism_kinds(symbol)
+    if not name:
+        return None
+    language = language_of(file)
+    for kind in kinds:
+        span = definition_line_span(content, kind, name, language=language)
         if span is not None:
             return span
     return None

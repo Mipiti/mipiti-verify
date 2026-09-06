@@ -167,7 +167,8 @@ class TestDefinitionLocation:
             "def test_unrelated_arithmetic():\n    assert 1 + 1 == 2"
         )
         assert entry["definition_sha256"] == expected
-        assert "definition_scope" not in entry
+        assert entry["definition_scope"] == "symbol"
+        assert entry["parser"] == "ast"
 
     def test_method_hash_covers_the_method_inside_its_class(self, project):
         summary = _summary(project)
@@ -280,9 +281,13 @@ class TestCoverageMerge:
         assert _entry(summary, "test_unrelated_arithmetic")["reached"] == [
             {"file": "app/guard.py", "lines": [4]}]
 
-    def test_a_report_without_contexts_is_refused(self, project):
-        with pytest.raises(AttestationError, match="no contexts"):
-            _summary(project, coverage={"files": {"app/guard.py": {"executed_lines": [4]}}})
+    def test_a_report_without_contexts_records_suite_reach_only(self, project):
+        # An aggregate report says what the suite executed, not what this
+        # test did: it is recorded as suite_reached, and reach stays unknown.
+        summary = _summary(project, coverage={"files": {"app/guard.py": {"executed_lines": [4]}}})
+        entry = _entry(summary, "test_unrelated_arithmetic")
+        assert "reached" not in entry
+        assert entry["suite_reached"] == [{"file": "app/guard.py", "lines": [4]}]
 
     def test_not_a_coverage_export_is_refused(self, project):
         with pytest.raises(AttestationError, match="'files'"):
