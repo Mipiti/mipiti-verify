@@ -722,6 +722,7 @@ class Runner:
     def run(self, model_id: str) -> dict[str, Any]:
         """Execute full verification pipeline. Returns summary report."""
         self._resolve_component_path(model_id)
+        self._repo_bound_assertions = 0
         details: list[dict[str, Any]] = []
 
         # --- Tier 1 ---
@@ -821,6 +822,7 @@ class Runner:
             "developer_key": self._developer_key,
             "details": details,
             "suff_details": suff_all,
+            "repo_bound_assertions": getattr(self, "_repo_bound_assertions", 0),
         }
 
     def _run_tier(
@@ -872,6 +874,14 @@ class Runner:
                 controls[ctrl_id] = kept_scope
             else:
                 del controls[ctrl_id]
+        # Everything that survived the repo-scope filter is evidence bound
+        # to this repository, before any changed-files or component
+        # narrowing; the report carries the count so a caller can tell a
+        # model with no evidence here from one whose evidence was scoped out.
+        self._repo_bound_assertions = max(
+            getattr(self, "_repo_bound_assertions", 0),
+            sum(len(v) for v in controls.values()),
+        )
         if not controls:
             if self.verbose:
                 console.print(
@@ -1415,6 +1425,51 @@ def _declared_not_found(reasoning: str) -> bool:
     ever discard a verdict that says in the protocol what it means.
     """
     return bool(_NOT_FOUND_DECLARATION.search(reasoning or ""))
+
+
+def repo_slug(value: str) -> str:
+    """``owner/name`` for a repository named as a slug, an HTTPS URL or an
+    SSH remote (``.git`` and trailing slashes dropped, lower-cased), or
+    ``""`` for an empty value. Used to compare the repository a model says
+    it describes with the one the verifier is running in."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    for prefix in ("git@github.com:", "git@gitlab.com:", "https://github.com/", "https://gitlab.com/",
+                   "http://github.com/", "http://gitlab.com/", "ssh://git@github.com/", "ssh://git@gitlab.com/"):
+        if v.lower().startswith(prefix):
+            v = v[len(prefix):]
+            break
+    else:
+        if "://" in v:
+            v = v.split("://", 1)[1].split("/", 1)[1] if "/" in v.split("://", 1)[1] else ""
+    v = v.strip("/").removesuffix(".git").strip("/")
+    return v.lower()
+
+
+BINDING_OTHER_REPO = "other_repo"
+BINDING_BOUND = "bound"
+BINDING_UNBOUND = "unbound"
+
+
+def model_binding(provenance_repo: str, this_repo: str, bound_assertions: int) -> str:
+    """Whether a model belongs to the repository the verifier runs in.
+
+    A model whose description provenance names another repository is
+    ``other_repo``: nothing in it can be verified here and its coverage is
+    not this repository's concern. One that names this repository, or has
+    at least one assertion bound to it, is ``bound``: its coverage gaps are
+    reported in full, including controls with no evidence at all. One with
+    neither is ``unbound``: there is nothing to verify and no claim that
+    this repository implements it, so its gaps are summarised in one line
+    rather than one warning per control."""
+    prov = repo_slug(provenance_repo)
+    here = repo_slug(this_repo)
+    if prov and here and prov != here:
+        return BINDING_OTHER_REPO
+    if (prov and prov == here) or bound_assertions > 0:
+        return BINDING_BOUND
+    return BINDING_UNBOUND
 
 
 def _auto_detect_repo(project_root: Path) -> str:

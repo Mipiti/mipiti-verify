@@ -816,7 +816,7 @@ class TestVerifierFacts:
                                         kind="dependence"), "tests-dependence.json")
         r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
         assert r.passed and r.depends is None
-        assert "fails without mechanism: unknown" in r.details
+        assert "fails without mechanism: not established (not run: dependence budget exhausted)" in r.details
 
     def test_depends_is_unknown_without_a_record(self, project, monkeypatch):
         _no_ci(monkeypatch)

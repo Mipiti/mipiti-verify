@@ -25,12 +25,7 @@ OUTCOME_ERROR = "error"
 
 DISABLED_MESSAGE = "mipiti: mechanism disabled"
 
-# Reference kinds a mechanism may name explicitly, as ``file::kind:name``.
-KINDS = (
-    "function", "method", "class", "struct", "impl", "module", "task",
-    "always", "initial", "property", "sequence", "assert", "entity",
-    "architecture", "process", "procedure",
-)
+from ..definitions import MECHANISM_KINDS as KINDS  # noqa: E402  (the one vocabulary)
 
 
 class DisableError(Exception):
@@ -308,8 +303,10 @@ def mutated_file(
     dirty = git_has_changes(project_root, rel_file)
     if dirty is None:
         raise DisableError(
-            f"{rel_file} is not in a git checkout, so a mutation could not be "
-            f"proven restored; commit the file first")
+            f"{rel_file} is not in a git checkout (or git is not installed), so a "
+            f"source mutation could not be proven restored. Source mutation needs a "
+            f"clean git checkout; outside one, use --strategy hook for compiled code "
+            f"(Python and JavaScript are disabled at runtime and need no checkout)")
     if dirty:
         raise DisableError(
             f"{rel_file} has uncommitted changes; a mutation is only applied "

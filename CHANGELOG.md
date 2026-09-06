@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A dependence pair that recorded no outcome now says why in the verifier's
+  details (`fails without mechanism: not established (<reason>)`), and the
+  refusal outside a git checkout names the alternatives (`--strategy hook`;
+  runtime disabling for Python and JavaScript). The README states the git
+  requirement of source mutation.
+- `run --all` reports on the models bound to the repository it runs in. A
+  model whose description provenance names another repository is skipped
+  with one notice. One that names this repository has every coverage gap
+  reported, evidence or not. One that names none, and has no assertion
+  bound to this repository, gets a single line saying so instead of one
+  warning per control; the report carries `repo_bound_assertions`.
+- `MIPITI_ATTESTATION_DIR` names where attestations are written and read
+  (default `.mipiti/attestations` under the project root). The action sets
+  it to a directory of its own when the checkout is not writable by the
+  container's user, so no `chmod` of the workspace is needed.
+- `formal/check_adapters.py` without the parser extra: the properties that
+  need a parser (mutation confinement, the drive for the compile and
+  clean-tree gates, the parser-versus-fallback comparison) are reported
+  not established instead of failing or aborting; the runtime's refusal to
+  mutate what it cannot isolate is unchanged.
+
 ### Added
 
 - A source mutation runs only on a definition the language layer isolates
@@ -125,7 +148,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<file>::<kind>:<name>` (`rtl/alu.sv::module:alu`,
   `rtl/fsm.sv::always:seq_logic`); a bare name is tried as a function, then a
   class, then each HDL kind in a fixed order. Reach is computed against the
-  span the file's language resolves.
+  span the file's language resolves. The kinds are one vocabulary
+  (`languages.definitions.MECHANISM_KINDS`, equal to the catalogue's), read by
+  the locator, the disable adapters and the verifier alike; `struct` and
+  `impl` locate as `class`.
 - `attest-tests --coverage` reads LCOV (`.info` / `.lcov`, including
   `verilator_coverage --write-info` output), Cobertura XML and JaCoCo XML in
   addition to coverage.py JSON, detected from content, and accepts a

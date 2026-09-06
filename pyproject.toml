@@ -65,7 +65,7 @@ dev = [
     # readers (tests/test_properties_*.py).
     "hypothesis>=6",
     # The assertion catalogue, for the type-design checker (formal/check_types.py).
-    "mipiti-mcp>=0.74",
+    "mipiti-mcp>=0.75",
 ]
 
 [tool.pytest.ini_options]

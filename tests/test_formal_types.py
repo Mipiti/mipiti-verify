@@ -26,14 +26,24 @@ def _catalogue_available() -> bool:
     return (ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py").is_file()
 
 
+def _catalogue_declares_kinds() -> bool:
+    """Whether the installed catalogue carries ``MECHANISM_KINDS`` (T6's input)."""
+    spec = importlib.util.find_spec("mipiti_mcp")
+    candidates = [Path(p) / "assertion_types.py" for p in (spec.submodule_search_locations or [])] if spec else []
+    candidates.append(ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py")
+    return any(c.is_file() and "MECHANISM_KINDS" in c.read_text(encoding="utf-8") for c in candidates)
+
+
 def test_every_type_property_is_verified():
     result = subprocess.run(
         [sys.executable, str(CHECKER)], cwd=ROOT, capture_output=True, text=True, timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    if _catalogue_available():
+    if _catalogue_available() and _catalogue_declares_kinds():
         assert "ALL TYPE PROPERTIES VERIFIED" in result.stdout, result.stdout
+    elif _catalogue_available():
+        assert "TYPE PROPERTIES T1, T2, T3, T4, T5 VERIFIED; T6 NOT ESTABLISHED" in result.stdout, result.stdout
     else:
-        assert "TYPE PROPERTIES T3, T4, T5 VERIFIED; T1, T2 NOT ESTABLISHED" in result.stdout, result.stdout
+        assert "TYPE PROPERTIES T3, T4, T5 VERIFIED; T1, T2, T6 NOT ESTABLISHED" in result.stdout, result.stdout
     for prop in ("T3 templates", "T4 fail-closed + injection clauses", "T5 evidence class"):
         assert f"{prop} (" in result.stdout and "FAILED" not in result.stdout, result.stdout
