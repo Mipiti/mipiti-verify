@@ -402,6 +402,124 @@ Coverage formats accepted by `--coverage`: coverage.py JSON (`coverage json`; wi
 
 **Suite mode: dependence from a whole-suite run.** A simulator or a Makefile harness often has no way to run one test, and its pass/fail is a JUnit report rather than an exit status. `attest-dependence --suite-cmd "<command>" --suite-junit <report>` covers that route with any runner (the runner supplies the disable strategy; the command runs the tests): pairs are grouped by mechanism, and for each distinct mechanism the mechanism is disabled (same compile/lint gate, same byte-exact restore), the suite command runs once, and the report it wrote gives every nominated test naming that mechanism its outcome: `passed`, `failed`, or `error` from the report as they are (an errored test did not pass, so it counts as dependence); a test the report skipped is `error` with reason `skipped under mutation`; a test absent from the report is `error` with reason `not in report`; a command that wrote no report is `error` with reason `no report` for every pair on that mechanism, as is a failed gate. `--timeout` applies per suite run and `--total-timeout` across mechanisms; a mechanism that would start after the budget records its pairs as not run. The result is the same `kind: "dependence"` attestation, so verification reads it unchanged. A stale report is removed before each run so an old one can never be read as this run's.
 
+**Strategy B: hook-instrumented build (`--strategy hook`).** The mutation strategy above recompiles once per mechanism. A compiled codebase that would rather build once can place a *tripwire* inside each mechanism instead, and `attest-dependence --strategy hook` (also `attest-reach --strategy hook`) builds once with the tripwires compiled in, then runs each nominated test with its mechanism named. The contract, stated exactly:
+
+- The tripwire goes **inside the mechanism's own body**, and nowhere else: never in a test helper, a fixture, `TestMain`, a constructor the tests share, or a module initialiser. It is gated out of production builds by a build flag (Go build tag `mipiti_hooks`, Rust feature `mipiti_hooks`, C/C++ `MIPITI_HOOKS`, Swift `MIPITI_HOOKS`, Verilog `` `MIPITI_HOOKS ``, a VHDL generic); Java and Kotlin have no build-time gate, so their check is compiled always and is inert unless the variable is set.
+- It reads `MIPITI_DISABLE_MECHANISM` (a plusarg or generic for HDL) and, **only when the value equals its own mechanism id**, aborts with a message that carries `mipiti-hook <file>::<symbol> at <file>:<line>`, where `<file>:<line>` is the tripwire's own position. Any other value, including unset, is a no-op.
+- The verifier runs the go runner as `go test -c -tags mipiti_hooks` (one test binary per package, built once), cargo as `cargo test --no-run --features mipiti_hooks`, and the command runner as `--build-cmd` once (with `-DMIPITI_HOOKS`, `+define+MIPITI_HOOKS`, or whatever the build takes) then `--run-cmd` per pair with `{test}` and `{mechanism}` substituted and the variable set. No source is rewritten and the tree need not be clean. pytest, jest, vitest and mocha refuse `--strategy hook` with a reason: they disable at runtime already.
+
+Why the placement rule: a tripwire in a helper every test calls fires for every test, and one placed next to the mechanism rather than in it fires for tests that never reached the mechanism. Either would credit dependence the tests do not have. Two checks make a misplaced tripwire visible instead of credited, and both are recorded in the attestation:
+
+1. **Location proof.** A failing run is credited as dependence only when its output carries the marker for *this* mechanism and the marker's `<file>:<line>` falls inside the mechanism's exactly located definition (the same `symbol` scope the mutation strategy requires). A test that failed without the marker records `error` with reason `test failed without the hook firing` (it could be any failure); a marker outside the span or in another file records `error` with reason `hook fired outside the mechanism`, one for another mechanism `a hook for a different mechanism fired`. The location is recorded on the `fails_without` entry as `hook_location`.
+2. **Control run.** Before any pair, every nominated test runs once with `MIPITI_DISABLE_MECHANISM=mipiti-control-<random>`. Every test must pass. Any failure records `error` with reason `hook fires unconditionally (control run failed)` for every pair and the run stops. The run is recorded at the predicate level as `control_run: {status, mechanism, tests}`, and the record carries `strategy: "hook"`.
+
+Helper snippets, one per language (these are the whole helper; there is no library to install):
+
+```go
+// hooks_on.go
+//go:build mipiti_hooks
+
+package guard
+
+import ("fmt"; "os"; "runtime")
+
+// Tripwire aborts when MIPITI_DISABLE_MECHANISM names this mechanism.
+func Tripwire(id string) {
+	if os.Getenv("MIPITI_DISABLE_MECHANISM") != id {
+		return
+	}
+	_, file, line, _ := runtime.Caller(1)
+	panic(fmt.Sprintf("mipiti-hook %s at %s:%d", id, file, line))
+}
+
+// hooks_off.go
+//go:build !mipiti_hooks
+
+package guard
+
+func Tripwire(string) {}
+
+// in the mechanism:
+func RequireToken(t string) bool {
+	Tripwire("internal/auth/guard.go::RequireToken")
+	...
+}
+```
+
+```rust
+#[cfg(feature = "mipiti_hooks")]
+macro_rules! mipiti_tripwire {
+    ($id:expr) => {
+        if std::env::var("MIPITI_DISABLE_MECHANISM").as_deref() == Ok($id) {
+            panic!("mipiti-hook {} at {}:{}", $id, file!(), line!());
+        }
+    };
+}
+#[cfg(not(feature = "mipiti_hooks"))]
+macro_rules! mipiti_tripwire { ($id:expr) => {}; }
+
+pub fn require_token(t: &str) -> bool {
+    mipiti_tripwire!("src/guard.rs::require_token");
+    ...
+}
+```
+
+```c
+/* mipiti_hooks.h */
+#ifdef MIPITI_HOOKS
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define MIPITI_TRIPWIRE(id) do { const char *v = getenv("MIPITI_DISABLE_MECHANISM"); \
+    if (v && strcmp(v, (id)) == 0) { fprintf(stderr, "mipiti-hook %s at %s:%d\n", (id), __FILE__, __LINE__); abort(); } } while (0)
+#else
+#define MIPITI_TRIPWIRE(id) do {} while (0)
+#endif
+
+int require_token(const char *t) {
+    MIPITI_TRIPWIRE("src/guard.c::require_token");
+    ...
+}
+```
+
+```java
+// No build-time gate in Java or Kotlin: compiled always, inert unless the variable is set.
+final class MipitiHooks {
+    static void tripwire(String id) {
+        if (!id.equals(System.getenv("MIPITI_DISABLE_MECHANISM"))) return;
+        StackTraceElement at = new Throwable().getStackTrace()[1];
+        throw new IllegalStateException("mipiti-hook " + id + " at " + at.getFileName() + ":" + at.getLineNumber());
+    }
+}
+```
+
+```swift
+@inline(__always) func mipitiTripwire(_ id: String, file: StaticString = #file, line: UInt = #line) {
+    #if MIPITI_HOOKS
+    if ProcessInfo.processInfo.environment["MIPITI_DISABLE_MECHANISM"] == id {
+        fatalError("mipiti-hook \(id) at \(file):\(line)")
+    }
+    #endif
+}
+```
+
+```verilog
+// inside the module, compiled with +define+MIPITI_HOOKS; the run passes +MIPITI_DISABLE_MECHANISM=<id>
+`ifdef MIPITI_HOOKS
+  string mipiti_target;
+  initial if ($value$plusargs("MIPITI_DISABLE_MECHANISM=%s", mipiti_target) && mipiti_target == "rtl/alu.sv::module:alu")
+    $fatal(1, "mipiti-hook rtl/alu.sv::module:alu at %s:%0d", `__FILE__, `__LINE__);
+`endif
+```
+
+```vhdl
+-- a generic on the entity, set by the simulator (-gMIPITI_DISABLE_MECHANISM=<id>); inside the architecture:
+assert MIPITI_DISABLE_MECHANISM /= "rtl/alu.vhd::architecture:rtl"
+  report "mipiti-hook rtl/alu.vhd::architecture:rtl at rtl/alu.vhd:" & integer'image(42) severity failure;
+```
+
+For a Java file the marker's `<file>` is the bare source file name; the location proof accepts a marker whose path ends with the mechanism's file. Reach under `--strategy hook` runs each test alone under coverage against the same build with the variable unset.
+
 **Suite mode: reach from a whole-suite run.** `attest-reach --suite-cmd "<command>" --coverage-file <report>` runs the suite ONCE under coverage and reads the report (any accepted format). Every nominated test records the lines the suite executed in its mechanism's file as `suite_reached`, and the record carries `reach_scope: "suite"`; each entry's `status` is the command's exit (`passed` on 0), a command that could not run or wrote no report is `error` with the reason for every pair. This is stated exactly for what it is: per-test reach is undefined for a harness that cannot run one test alone, so suite mode records suite reach as information and never credits reach. Only per-test `attest-reach` establishes the fact.
 
 ```bash
@@ -466,6 +584,8 @@ mipiti-verify attest-reach --run-cmd 'make -C sim run TEST={test}' \
 | `coverage-file` | No | `""` | Report the coverage command writes, relative to `project-root`, for the `command` runner; with `suite-cmd`, the report the suite run writes |
 | `suite-cmd` | No | `""` | Suite mode, for a harness that cannot select one test. `dependence-pairs`: command that runs the whole suite and writes a JUnit report; run once per mechanism with it disabled (needs `suite-junit`). `reach-pairs`: the command runs once under coverage and must write `coverage-file`; suite-level reach is recorded as `suite_reached` (`reach_scope: suite`) and never establishes per-test reach |
 | `suite-junit` | No | `""` | The JUnit report `suite-cmd` writes, relative to `project-root` |
+| `strategy` | No | `mutation` | `mutation` or `hook` for `dependence-pairs` / `reach-pairs`; `hook` builds once with the repository's build-flagged tripwires compiled in (see Strategy B) |
+| `build-cmd` | No | `""` | The build with the hooks compiled in, for the `command` runner under strategy `hook` |
 
 ### Action Output
 

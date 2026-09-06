@@ -116,6 +116,14 @@ inputs:
     description: "Suite mode for dependence-pairs: the JUnit report suite-cmd writes, relative to project-root."
     required: false
     default: ""
+  strategy:
+    description: "How a compiled mechanism is disabled for dependence-pairs and reach-pairs: 'mutation' (default; rewrite the body, recompile per mechanism) or 'hook' (build once with the repository's build-flagged tripwires compiled in, name the mechanism per run; credited only with the location proof and a passing control run)."
+    required: false
+    default: ""
+  build-cmd:
+    description: "For the 'command' runner under strategy 'hook': the build with the hooks compiled in, run once."
+    required: false
+    default: ""
 
 outputs:
   content-hash:
@@ -153,3 +161,5 @@ runs:
     INPUT_COVERAGE_FILE: ${{ inputs.coverage-file }}
     INPUT_SUITE_CMD: ${{ inputs.suite-cmd }}
     INPUT_SUITE_JUNIT: ${{ inputs.suite-junit }}
+    INPUT_STRATEGY: ${{ inputs.strategy }}
+    INPUT_BUILD_CMD: ${{ inputs.build-cmd }}

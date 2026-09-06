@@ -27,10 +27,15 @@ def split_test_id(test_id: str) -> tuple[str, str]:
     return pkg, "/".join(parts)
 
 
+HOOK_TAG = "mipiti_hooks"
+ENV_MECHANISM = "MIPITI_DISABLE_MECHANISM"
+
+
 class GoAdapter(RunnerAdapter):
     name = "go"
     languages = ("go",)
     mutation_languages = ("go",)
+    supports_hooks = True
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:
@@ -67,6 +72,71 @@ class GoAdapter(RunnerAdapter):
         if returncode == 1:
             return Outcome(OUTCOME_FAILED, 1)
         return Outcome(OUTCOME_ERROR, returncode, f"go test exit status {returncode}: {tail(text, 4)}")
+
+    # -- hook-instrumented build: one test binary per package ------------
+
+    def _package_dir(self, test_id: str) -> Path:
+        """The package directory a test lives in. A ``pkg::Test`` id names
+        it; a bare name is found by the ``_test.go`` file that defines it."""
+        module_dir, _, _ = self._module()
+        pkg, _pattern = split_test_id(test_id)
+        if pkg != "./...":
+            return (module_dir / pkg).resolve()
+        leaf = test_id.strip().split("/", 1)[0]
+        pattern = re.compile(rf"^func\s+{re.escape(leaf)}\s*\(", re.M)
+        for path in sorted(module_dir.rglob("*_test.go")):
+            try:
+                if pattern.search(path.read_text(encoding="utf-8", errors="replace")):
+                    return path.parent
+            except OSError:
+                continue
+        raise AdapterError(f"no _test.go file under the module defines {leaf}")
+
+    def hook_build(self, tests: list[str], *, timeout: int, work_dir: Path) -> None:
+        self._hook_bins: dict[Path, Path] = {}
+        module_dir, _, _ = self._module()
+        for test in tests:
+            pkg_dir = self._package_dir(test)
+            if pkg_dir in self._hook_bins:
+                continue
+            binary = Path(work_dir) / f"hooks-{len(self._hook_bins)}.test"
+            argv = ["go", "test", "-c", "-tags", HOOK_TAG, "-cover", "-coverpkg=./...",
+                    "-o", str(binary), "./" + pkg_dir.relative_to(module_dir).as_posix()
+                    if pkg_dir != module_dir else "."]
+            outcome = self._execute(argv, env=None, timeout=timeout, cwd=module_dir)
+            if outcome.status != OUTCOME_PASSED or not binary.is_file():
+                raise AdapterError(f"go test -c -tags {HOOK_TAG} failed: {outcome.note or tail(self.last_output, 6)}")
+            self._hook_bins[pkg_dir] = binary
+
+    def _hook_argv(self, test_id: str) -> tuple[list[str], Path]:
+        bins = getattr(self, "_hook_bins", None) or {}
+        pkg_dir = self._package_dir(test_id)
+        binary = bins.get(pkg_dir)
+        if binary is None:
+            raise AdapterError(f"no hook build for the package of {test_id}; hook_build runs first")
+        _pkg, pattern = split_test_id(test_id)
+        return [str(binary), "-test.run", pattern, "-test.count=1"], pkg_dir
+
+    def hook_run(self, test_id: str, mechanism: str, *, timeout: int) -> Outcome:
+        argv, pkg_dir = self._hook_argv(test_id)
+        env = {ENV_MECHANISM: mechanism} if mechanism else {ENV_MECHANISM: ""}
+        return self._execute(argv, env=env, timeout=timeout, cwd=pkg_dir)
+
+    def hook_run_with_coverage(self, test_id: str, *, timeout: int, work_dir: Path) -> Path:
+        _module_dir, module_path, module_rel = self._module()
+        argv, pkg_dir = self._hook_argv(test_id)
+        profile = Path(work_dir) / "cover.out"
+        outcome = self._execute(argv + [f"-test.coverprofile={profile}"], env={ENV_MECHANISM: ""},
+                                timeout=timeout, cwd=pkg_dir)
+        if outcome.status == OUTCOME_ERROR:
+            raise AdapterError(outcome.note or "the hook build could not run under coverage")
+        if not profile.is_file():
+            raise AdapterError("the hook build wrote no coverage profile")
+        report = Path(work_dir) / "lcov.info"
+        report.write_text(
+            go_coverprofile_to_lcov(profile.read_text(encoding="utf-8"), module_path, module_dir=module_rel),
+            encoding="utf-8")
+        return report
 
     def run_with_coverage(self, test_id: str, *, timeout: int, work_dir: Path) -> Path:
         module_dir, module_path, module_rel = self._module()

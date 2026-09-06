@@ -19,10 +19,44 @@ def test_name(test_id: str) -> str:
     return text
 
 
+HOOK_FEATURE = "mipiti_hooks"
+ENV_MECHANISM = "MIPITI_DISABLE_MECHANISM"
+
+
 class CargoAdapter(RunnerAdapter):
     name = "cargo"
     languages = ("rust",)
     mutation_languages = ("rust",)
+    supports_hooks = True
+
+    def hook_build(self, tests: list[str], *, timeout: int, work_dir: Path) -> None:
+        outcome = self._execute(["cargo", "test", "--no-run", "--features", HOOK_FEATURE],
+                                env=None, timeout=timeout)
+        if outcome.status == OUTCOME_ERROR:
+            raise AdapterError(f"cargo test --no-run --features {HOOK_FEATURE} failed: "
+                               f"{outcome.note or tail(self.last_output, 6)}")
+
+    def hook_run(self, test_id: str, mechanism: str, *, timeout: int) -> Outcome:
+        # The feature is already built; cargo reuses it and runs the test.
+        argv = ["cargo", "test", "--quiet", "--features", HOOK_FEATURE, test_name(test_id), "--", "--exact"]
+        return self._execute(argv, env={ENV_MECHANISM: mechanism}, timeout=timeout)
+
+    def hook_run_with_coverage(self, test_id: str, *, timeout: int, work_dir: Path) -> Path:
+        if which("cargo") is None:
+            raise AdapterError("cargo is not installed")
+        code, _, _, note = run_command(["cargo", "llvm-cov", "--version"], cwd=self.project_root,
+                                       timeout=60, runner=self.runner)
+        if note or code != 0:
+            raise AdapterError("cargo-llvm-cov is not installed (cargo install cargo-llvm-cov)")
+        report = Path(work_dir) / "lcov.info"
+        argv = ["cargo", "llvm-cov", "test", "--quiet", "--features", HOOK_FEATURE, "--lcov",
+                "--output-path", str(report), test_name(test_id), "--", "--exact"]
+        outcome = self._execute(argv, env={ENV_MECHANISM: ""}, timeout=timeout)
+        if outcome.status == OUTCOME_ERROR:
+            raise AdapterError(outcome.note or "cargo llvm-cov could not run")
+        if not report.is_file():
+            raise AdapterError("cargo llvm-cov wrote no report")
+        return report
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:

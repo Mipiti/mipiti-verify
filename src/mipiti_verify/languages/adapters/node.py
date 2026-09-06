@@ -107,6 +107,8 @@ def _stub_js(mech: Mechanism) -> str:
 class _NodeAdapter(RunnerAdapter):
     languages = ("javascript", "typescript")
     mutation_languages = ()
+    hook_refusal = ("jest, vitest and mocha disable a mechanism at runtime through a "
+                    "mocking setup file; omit --strategy hook")
 
     def _resolved_mechanism_path(self, mech: Mechanism) -> str:
         path = (self.project_root / mech.file).resolve()

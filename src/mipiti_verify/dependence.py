@@ -127,6 +127,7 @@ def adapter_for(
     run_cmd: str = "",
     coverage_cmd: str = "",
     coverage_file: str = "",
+    build_cmd: str = "",
     runner: Optional[Callable[..., subprocess.CompletedProcess]] = None,
 ) -> RunnerAdapter:
     """The adapter the pairs run through: the named one, the generic
@@ -137,7 +138,7 @@ def adapter_for(
     prefer = next(iter(languages)) if len(languages) == 1 else ""
     return detect_adapter(
         project_root, runner_name, run_cmd=run_cmd, coverage_cmd=coverage_cmd,
-        coverage_file=coverage_file, prefer_language=prefer, runner=runner,
+        coverage_file=coverage_file, build_cmd=build_cmd, prefer_language=prefer, runner=runner,
     )
 
 

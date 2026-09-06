@@ -510,6 +510,7 @@ def build_statement(
     coverage: Optional[dict] = None,
     environment: Optional[dict] = None,
     kind: str = "",
+    predicate_extra: Optional[dict] = None,
     reach_scope: str = "",
 ) -> dict:
     """Assemble the in-toto statement for one test run.
@@ -540,6 +541,10 @@ def build_statement(
     }
     if kind:
         predicate["kind"] = kind
+    if predicate_extra:
+        # Record-level facts a kind carries beyond the per-test entries
+        # (``strategy`` and ``control_run`` on a hook-built dependence run).
+        predicate.update(predicate_extra)
     if reach_scope:
         predicate["reach_scope"] = reach_scope
     if coverage:

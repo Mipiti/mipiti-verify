@@ -29,6 +29,12 @@ code, driven through the same entry point the command uses:
       every accepted format (coverage.py JSON with and without contexts,
       LCOV, Cobertura, JaCoCo, a per-test directory), reads back as the
       same line sets from both readers
+  A9  the hook strategy credits dependence only with the location proof:
+      a marker for the mechanism inside its span credits ``failed`` with
+      the location recorded; one outside the span, in another file, for
+      another mechanism, or absent from a failing run refuses with the
+      documented reason; and a failing control run records ``error`` for
+      every pair with no pair run
   A8  a mutation runs only on an exactly located span: with the parser
       made unavailable, every fixture whose fallback location is a
       ``block`` (or nothing) is refused with the documented reason and
@@ -749,6 +755,85 @@ def check_a8() -> Tuple[int, List[str]]:
     return checked, violations
 
 
+# ---------------------------------------------------------------------------
+# A9  the hook strategy credits only with the location proof
+# ---------------------------------------------------------------------------
+
+def check_a9() -> Tuple[int, List[str]]:
+    from mipiti_verify.hook import (
+        REASON_CONTROL_FAILED, REASON_NO_MARKER, REASON_OTHER_HOOK, REASON_OUTSIDE,
+        classify_hook_run, run_hook_dependence,
+    )
+    from mipiti_verify.languages.adapters import Outcome
+
+    violations: List[str] = []
+    checked = 0
+    root = Path(tempfile.mkdtemp(prefix="mipiti-formal-a9-"))
+    try:
+        for language, mechanism, _span, _extras, (kind, name) in MUTATION_CASES:
+            file, source = FIXTURES[language]
+            lang = D.language_of(file)
+            if lang in ("verilog", "systemverilog", "vhdl"):
+                continue
+            path = root / file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+            located = D.locate(source, kind, name, language=lang)
+            if located is None or located.scope != D.SCOPE_SYMBOL:
+                continue
+            start, end = located.start_line, located.end_line
+            inside = (start + end) // 2
+            cases = [
+                (f"panic: mipiti-hook {mechanism} at {file}:{inside}", OUTCOME_FAILED, "", f"{file}:{inside}"),
+                (f"panic: mipiti-hook {mechanism} at {root / file}:{inside}", OUTCOME_FAILED, "", None),
+                (f"panic: mipiti-hook {mechanism} at {file}:{end + 5}", OUTCOME_ERROR, REASON_OUTSIDE, None),
+                (f"panic: mipiti-hook {mechanism} at other/{file}:{inside}", OUTCOME_ERROR, REASON_OUTSIDE, None),
+                (f"panic: mipiti-hook {file}::Elsewhere at {file}:{inside}", OUTCOME_ERROR, REASON_OTHER_HOOK, None),
+                ("--- FAIL: TestX\nFAIL", OUTCOME_ERROR, REASON_NO_MARKER, None),
+            ]
+            for output, want_status, want_reason, want_location in cases:
+                checked += 1
+                status, reason, location = classify_hook_run(OUTCOME_FAILED, "", output, root, mechanism)
+                if status != want_status or (want_reason and not reason.startswith(want_reason)):
+                    violations.append(f"A9: {mechanism}: {output!r} -> {status!r} ({reason!r}), documented {want_status!r} ({want_reason!r})")
+                elif want_location is not None and location != want_location:
+                    violations.append(f"A9: {mechanism}: location {location!r}, documented {want_location!r}")
+                elif want_status == OUTCOME_FAILED and not location:
+                    violations.append(f"A9: {mechanism}: credited without a recorded hook_location")
+            checked += 1
+            status, _, _ = classify_hook_run(OUTCOME_PASSED, "", f"mipiti-hook {mechanism} at {file}:{inside}", root, mechanism)
+            if status != OUTCOME_PASSED:
+                violations.append(f"A9: {mechanism}: a passing run classified {status!r}")
+
+        class _Unconditional:
+            name = "fake"
+            supports_hooks = True
+            hook_refusal = ""
+            last_output = ""
+
+            def __init__(self):
+                self.runs: List[str] = []
+
+            def hook_build(self, tests, *, timeout, work_dir):
+                pass
+
+            def hook_run(self, test_id, mechanism, *, timeout):
+                self.runs.append(mechanism)
+                return Outcome(OUTCOME_FAILED, 1)
+
+        adapter = _Unconditional()
+        summary = run_hook_dependence(root, [("t1", "a.go::F"), ("t2", "a.go::F"), ("t3", "b.go::G")], adapter=adapter)
+        checked += 1
+        reasons = [t["fails_without"][0].get("reason") for t in summary["tests"]]
+        if reasons != [REASON_CONTROL_FAILED] * 3 or summary["control_run"]["status"] != OUTCOME_FAILED:
+            violations.append(f"A9: control-run failure did not fan out: {reasons}")
+        if any(not m.startswith("mipiti-control-") for m in adapter.runs):
+            violations.append("A9: a pair ran after the control run failed")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return checked, violations
+
+
 def main() -> int:
     print("=" * 70)
     print("RUNNER ADAPTERS AND LANGUAGE LAYER")
@@ -789,6 +874,9 @@ def main() -> int:
 
     c, v = check_a8()
     all_pass &= _report("A8 mutation only on an exactly located span", c, v)
+
+    c, v = check_a9()
+    all_pass &= _report("A9 hook strategy credits only with the location proof", c, v)
 
     print(f"\n{'=' * 70}")
     if not all_pass:

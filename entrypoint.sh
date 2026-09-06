@@ -72,6 +72,12 @@ run_options() {
   if [ -n "${INPUT_COVERAGE_FILE:-}" ]; then
     RUN_ARGS+=("--coverage-file" "$INPUT_COVERAGE_FILE")
   fi
+  if [ -n "${INPUT_STRATEGY:-}" ]; then
+    RUN_ARGS+=("--strategy" "$INPUT_STRATEGY")
+  fi
+  if [ -n "${INPUT_BUILD_CMD:-}" ]; then
+    RUN_ARGS+=("--build-cmd" "$INPUT_BUILD_CMD")
+  fi
   if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
     RUN_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
   fi

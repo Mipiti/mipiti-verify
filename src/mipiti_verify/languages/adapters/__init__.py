@@ -52,14 +52,24 @@ class RunnerAdapter:
     #: Languages whose mechanisms this adapter disables by source mutation.
     mutation_languages: tuple[str, ...] = ()
 
+    #: Whether the adapter can build once with hooks on and run tests
+    #: against that build (``--strategy hook``); the refusal names why not.
+    supports_hooks = False
+    hook_refusal = "hook builds are supported by the go, cargo and command runners"
+
     def __init__(self, project_root: Path, *, runner: Optional[Runner] = None,
-                 run_cmd: str = "", coverage_cmd: str = "", coverage_file: str = "") -> None:
+                 run_cmd: str = "", coverage_cmd: str = "", coverage_file: str = "",
+                 build_cmd: str = "") -> None:
         self.project_root = Path(project_root)
         self.runner = runner
         self.run_cmd = run_cmd
         self.coverage_cmd = coverage_cmd
         self.coverage_file = coverage_file
+        self.build_cmd = build_cmd
         self.last_outcome: Optional[Outcome] = None
+        #: The combined output of the last command ``_execute`` ran, for a
+        #: caller that reads a marker out of it (the hook strategy).
+        self.last_output = ""
 
     # -- detection ---------------------------------------------------------
 
@@ -87,7 +97,27 @@ class RunnerAdapter:
         # Kept for callers that need the outcome of a run whose return value
         # is something else (a coverage run returns its report).
         self.last_outcome = outcome
+        self.last_output = (out or "") + (err or "")
         return outcome
+
+    # -- hook-instrumented builds -----------------------------------------
+
+    def hook_build(self, tests: list[str], *, timeout: int, work_dir: Path) -> None:
+        """Build once with the tripwire hooks compiled in, for the tests
+        named. Raises ``AdapterError`` when the adapter has no hook route
+        or the build fails."""
+        raise AdapterError(self.hook_refusal)
+
+    def hook_run(self, test_id: str, mechanism: str, *, timeout: int) -> Outcome:
+        """Run one test against the hook build with the mechanism named in
+        the environment (empty ``mechanism`` runs it with nothing named).
+        The output is left in ``last_output`` for the marker check."""
+        raise AdapterError(self.hook_refusal)
+
+    def hook_run_with_coverage(self, test_id: str, *, timeout: int, work_dir: Path) -> Path:
+        """Run one test against the hook build under coverage, no
+        mechanism named; the report the readers accept."""
+        raise AdapterError(self.hook_refusal)
 
     def classify(self, returncode: int, stdout: str, stderr: str) -> Outcome:
         """Default mapping: 0 passed, 1 failed, anything else error."""
@@ -177,7 +207,7 @@ def adapter_names() -> list[str]:
 
 
 def detect_adapter(project_root: Path, override: str = "", *, run_cmd: str = "",
-                   coverage_cmd: str = "", coverage_file: str = "",
+                   coverage_cmd: str = "", coverage_file: str = "", build_cmd: str = "",
                    prefer_language: str = "", runner: Optional[Runner] = None) -> RunnerAdapter:
     """The adapter for the project.
 
@@ -188,7 +218,8 @@ def detect_adapter(project_root: Path, override: str = "", *, run_cmd: str = "",
     all is treated as pytest, the historical default.
     """
     root = Path(project_root)
-    kwargs = dict(runner=runner, run_cmd=run_cmd, coverage_cmd=coverage_cmd, coverage_file=coverage_file)
+    kwargs = dict(runner=runner, run_cmd=run_cmd, coverage_cmd=coverage_cmd, coverage_file=coverage_file,
+                  build_cmd=build_cmd)
     adapters = _all_adapters()
     if override:
         for cls in adapters:

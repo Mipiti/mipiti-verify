@@ -214,6 +214,10 @@
                 "reason": {
                   "type": "string",
                   "description": "Optional. Present when the pair was not run (for example the run's total budget was spent first). A reader treats such an entry as no outcome, never as dependence or its absence."
+                },
+                "hook_location": {
+                  "type": "string",
+                  "description": "Optional; only under strategy \"hook\". The <file>:<line> the tripwire reported when it fired. A failed status carries a location inside the mechanism's definition (the location proof); an error status may carry one outside it, which is why the pair was not credited."
                 }
               }
             },
@@ -269,6 +273,51 @@
         "reach"
       ],
       "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. \"reach\" marks a record produced by `mipiti-verify attest-reach`: each test entry carries the per-test coverage (reached) of a run of that test alone, the mechanism it was run for, and a reason when the pair was not run. Neither kind evidences that a test ran and passed."
+    },
+    "strategy": {
+      "type": "string",
+      "enum": [
+        "mutation",
+        "hook"
+      ],
+      "description": "Optional; on dependence and reach records. How a compiled mechanism was disabled: \"mutation\" (the body rewritten and recompiled per mechanism) or \"hook\" (built once with the repository's build-flagged tripwires compiled in; each run names its mechanism in the environment). Absent means mutation, or a runtime disable (Python, JavaScript)."
+    },
+    "control_run": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "mechanism": {
+          "type": "string",
+          "description": "The value no hook should answer to that the control run named."
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "description": "Optional; only on a dependence record under strategy \"hook\". Every nominated test run once against the hook build with a value no hook answers to. \"passed\" means every test passed, so a later failure is attributable to the mechanism named; \"failed\" means a hook fires regardless of the value, every pair is error, and the run stopped. null when the hook build itself failed."
     },
     "reach_scope": {
       "type": "string",

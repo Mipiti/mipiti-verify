@@ -549,6 +549,20 @@ def _attest_run_options(command):
                      help=("Report the coverage command writes, relative to the project "
                            "root (LCOV, Cobertura, JaCoCo or coverage.py JSON), for the "
                            "command runner.")),
+        click.option("--strategy", type=click.Choice(["mutation", "hook"], case_sensitive=False),
+                     default="mutation", show_default=True, envvar="MIPITI_STRATEGY",
+                     help=("How a compiled mechanism is disabled. 'mutation' rewrites its "
+                           "body and recompiles per mechanism. 'hook' builds once with the "
+                           "customer's tripwires compiled in (go: -tags mipiti_hooks; cargo: "
+                           "--features mipiti_hooks; command: --build-cmd) and names the "
+                           "mechanism in MIPITI_DISABLE_MECHANISM per run; dependence is "
+                           "credited only with the location proof and after a passing "
+                           "control run. Refused for runtime-disabling runners (pytest, "
+                           "jest, vitest, mocha).")),
+        click.option("--build-cmd", default="", envvar="MIPITI_BUILD_CMD",
+                     help=("For the command runner under --strategy hook: the build with the "
+                           "hooks compiled in (e.g. 'make build CFLAGS=-DMIPITI_HOOKS', "
+                           "'make sim-build DEFINES=+define+MIPITI_HOOKS'), run once.")),
         click.option("--timeout", default=300, type=int, show_default=True,
                      help="Seconds allowed per pair"),
         click.option("--total-timeout", default=1800, type=int, show_default=True,
@@ -610,14 +624,14 @@ def _collect_pairs(pair_specs: tuple, model_id, api_key, base_url, repo, root) -
     return pairs
 
 
-def _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file):
+def _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file, build_cmd=""):
     from .dependence import adapter_for
     from .languages.adapters import AdapterError
 
     try:
         return adapter_for(
             root, pairs, runner_name=runner_name, run_cmd=run_cmd,
-            coverage_cmd=coverage_cmd, coverage_file=coverage_file)
+            coverage_cmd=coverage_cmd, coverage_file=coverage_file, build_cmd=build_cmd)
     except AdapterError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
@@ -681,9 +695,10 @@ def _echo_provenance(provenance: str) -> None:
 def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | None,
                       base_url: str | None, repo: str, project_root: str,
                       commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
-                      coverage_file: str, timeout: int, total_timeout: int,
-                      key_path: str, key_passphrase: str, sigstore_tuf_url: str,
-                      sigstore_trust_config: str, suite_cmd: str, suite_junit: str) -> None:
+                      coverage_file: str, strategy: str, build_cmd: str, timeout: int,
+                      total_timeout: int, key_path: str, key_passphrase: str,
+                      sigstore_tuf_url: str, sigstore_trust_config: str, suite_cmd: str,
+                      suite_junit: str) -> None:
     """Record whether each test fails once its mechanism is disabled.
 
     THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
@@ -727,21 +742,43 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
 
     from .attestation import AttestationError, build_statement
     from .dependence import run_dependence, run_suite_dependence
+    from .hook import STRATEGY_HOOK, run_hook_dependence
 
     if bool(suite_cmd.strip()) != bool(suite_junit.strip()):
         click.echo("Error: --suite-cmd and --suite-junit go together.", err=True)
+        raise SystemExit(1)
+    hooks = strategy.lower() == STRATEGY_HOOK
+    if hooks and suite_cmd.strip():
+        click.echo("Error: --strategy hook runs each test alone; it has no suite mode.", err=True)
         raise SystemExit(1)
 
     root = _Path(project_root)
     pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
     resolved_commit = _resolved_commit(commit, root)
-    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file)
+    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file,
+                               build_cmd)
 
     def _progress(test: str, mechanism: str, status: str) -> None:
         click.echo(f"  {test} without {mechanism}: {status}")
 
+    predicate_extra: dict = {}
     try:
-        if suite_cmd.strip():
+        if hooks:
+            if not adapter.supports_hooks:
+                click.echo(f"Error: {adapter.hook_refusal}.", err=True)
+                raise SystemExit(1)
+            click.echo(
+                f"Building once with hooks on through the {adapter.name} runner, then a control "
+                f"run and {len(pairs)} pair(s) (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_hook_dependence(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
+            predicate_extra = {"strategy": summary.pop("strategy"),
+                               "control_run": summary.pop("control_run")}
+            control = predicate_extra["control_run"]
+            if control is not None:
+                click.echo(f"Control run: {control['status']} ({len(control['tests'])} test(s))")
+        elif suite_cmd.strip():
             from .dependence import group_by_mechanism
 
             click.echo(
@@ -773,9 +810,11 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
         commit=resolved_commit,
         summary=summary,
         invocation=["mipiti-verify", "attest-dependence", "--runner", adapter.name]
-        + (["--suite"] if suite_cmd.strip() else []),
+        + (["--suite"] if suite_cmd.strip() else [])
+        + (["--strategy", "hook"] if hooks else []),
         selected_pattern="",
         kind="dependence",
+        predicate_extra=predicate_extra,
     )
     out_path, provenance = _write_run_attestation(
         root, statement, suffix="dependence", model_id=model_id, key_path=key_path,
@@ -805,7 +844,7 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
 def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
                  base_url: str | None, repo: str, project_root: str,
                  commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
-                 coverage_file: str, timeout: int, total_timeout: int,
+                 coverage_file: str, strategy: str, build_cmd: str, timeout: int, total_timeout: int,
                  key_path: str, key_passphrase: str, sigstore_tuf_url: str,
                  sigstore_trust_config: str, suite_cmd: str) -> None:
     """Record which lines of its mechanism's file each test executes.
@@ -852,7 +891,12 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
     root = _Path(project_root)
     pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
     resolved_commit = _resolved_commit(commit, root)
-    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file)
+    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file,
+                               build_cmd)
+    hooks = strategy.lower() == "hook"
+    if hooks and not adapter.supports_hooks:
+        click.echo(f"Error: {adapter.hook_refusal}.", err=True)
+        raise SystemExit(1)
 
     def _progress(test: str, mechanism: str, status: str) -> None:
         click.echo(f"  {test} for {mechanism}: {status}")
@@ -866,6 +910,16 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
             summary = run_suite_reach(
                 root, pairs, suite_cmd=suite_cmd, coverage_file=coverage_file,
                 adapter=adapter, timeout=timeout, progress=_progress)
+        elif hooks:
+            from .hook import run_hook_reach
+
+            click.echo(
+                f"Building once with hooks on through the {adapter.name} runner, then "
+                f"{len(pairs)} test(s) alone under coverage (up to {timeout}s each, "
+                f"{total_timeout}s in all)...")
+            summary = run_hook_reach(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
         else:
             click.echo(
                 f"Running {len(pairs)} test(s) alone under coverage through the "
@@ -890,10 +944,12 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
         commit=resolved_commit,
         summary=summary,
         invocation=["mipiti-verify", "attest-reach", "--runner", adapter.name]
-        + (["--suite"] if suite else []),
+        + (["--suite"] if suite else [])
+        + (["--strategy", "hook"] if hooks else []),
         selected_pattern="",
         kind=KIND_REACH,
         reach_scope=REACH_SCOPE_SUITE if suite else REACH_SCOPE_TEST,
+        predicate_extra={"strategy": summary.pop("strategy")} if summary.get("strategy") else None,
     )
     out_path, provenance = _write_run_attestation(
         root, statement, suffix="reach", model_id=model_id, key_path=key_path,

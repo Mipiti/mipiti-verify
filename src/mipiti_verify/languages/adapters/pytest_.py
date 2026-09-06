@@ -43,6 +43,8 @@ def test_selector(test: str) -> list[str]:
 class PytestAdapter(RunnerAdapter):
     name = "pytest"
     languages = ("python",)
+    hook_refusal = ("the pytest runner disables a Python mechanism at runtime through its "
+                    "plugin; omit --strategy hook")
     mutation_languages = ("verilog", "systemverilog", "vhdl")
 
     @classmethod

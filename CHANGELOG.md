@@ -178,6 +178,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are.
 - Action inputs `reach-pairs`, `runner`, `run-cmd`, `coverage-cmd` and
   `coverage-file`; `dependence-pairs` is no longer Python-only.
+- `--strategy hook` on `attest-dependence` and `attest-reach` (default stays
+  `mutation`): a second dependence strategy for compiled codebases that
+  build once. The repository places a tripwire inside each mechanism's own
+  body, gated out of production by a build flag (Go tag / Rust feature
+  `mipiti_hooks`, C/C++ and Swift `MIPITI_HOOKS`, Verilog `` `MIPITI_HOOKS ``,
+  a VHDL generic; Java/Kotlin compiled always, inert), that aborts with
+  `mipiti-hook <file>::<symbol> at <file>:<line>` only when
+  `MIPITI_DISABLE_MECHANISM` equals its own id. The go runner builds one
+  test binary per package with `go test -c -tags mipiti_hooks`, cargo with
+  `cargo test --no-run --features mipiti_hooks`, the command runner with a
+  new `--build-cmd`, then each pair runs with its mechanism named; no
+  source is rewritten and the tree need not be clean. Two mandatory checks
+  are recorded: the location proof (dependence is credited only when the
+  marker for this mechanism lies inside its exactly located definition,
+  recorded as `fails_without[].hook_location`; a failure without the marker
+  or with one outside the span is `error` with the reason) and a control
+  run (every nominated test once with a value no hook answers to, recorded
+  as `control_run`; any failure records `error` for every pair and stops).
+  The record carries `strategy: "hook"`. pytest, jest, vitest and mocha
+  refuse the strategy with a reason pointing at their runtime disable.
+  Action inputs `strategy` and `build-cmd`.
 - `attest-dependence --suite-cmd "<command>" --suite-junit <report>`:
   dependence from a whole-suite run, for simulators and any harness that
   cannot select one test. Pairs are grouped by mechanism; each mechanism is
