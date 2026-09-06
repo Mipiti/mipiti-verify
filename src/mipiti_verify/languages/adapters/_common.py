@@ -38,6 +38,52 @@ class DisableError(Exception):
     and the message is its recorded reason."""
 
 
+# A mutation rewrites exactly the definition the mechanism names, so the
+# language layer must have isolated that definition: a span it reports as
+# ``block`` (the line heuristic, which cannot tell two same-named
+# definitions apart) may cover a different definition, and a mutation of
+# the wrong block can still compile, which would attribute a test's outcome
+# to the wrong mechanism. Such a span is refused with this reason.
+REASON_NOT_ISOLATED = (
+    "definition not isolated exactly (install mipiti-verify[ast] or nominate a unique symbol)"
+)
+
+
+def located_exactly(content: str, kinds: tuple, name: str, language: str) -> Optional[bool]:
+    """Whether the language layer isolates ``name`` as exactly one
+    definition of one of ``kinds`` (``scope == "symbol"``). ``False`` when
+    it only finds a block; ``None`` when it finds nothing at all."""
+    from ..definitions import SCOPE_SYMBOL, locate
+
+    seen_block = False
+    for kind in kinds:
+        found = locate(content, kind, name, language=language)
+        if found is None:
+            continue
+        if found.scope == SCOPE_SYMBOL:
+            return True
+        seen_block = True
+    return False if seen_block else None
+
+
+def require_exact(content: str, kinds: tuple, name: str, language: str, mutate,
+                  exact: Optional[bool] = None) -> str:
+    """``mutate()`` only when the definition is isolated exactly.
+
+    ``exact`` may be supplied by a caller that established it another
+    way; otherwise ``located_exactly`` decides. When the language layer
+    finds nothing, ``mutate()`` still runs so the reason recorded is its
+    own ("not defined in the file"); should it find something to rewrite
+    anyway, that rewrite is refused too, since no exact span backs it.
+    """
+    if exact is None:
+        exact = located_exactly(content, kinds, name, language)
+    if exact is True:
+        return mutate()
+    mutate()
+    raise DisableError(REASON_NOT_ISOLATED)
+
+
 @dataclass
 class Outcome:
     """What one run of one test produced."""
@@ -150,27 +196,55 @@ def run_command(
     timeout: int,
     runner: Optional[Runner] = None,
 ) -> tuple[int, str, str, str]:
-    """``(returncode, stdout, stderr, note)``; a run that could not happen
-    returns ``-1`` and a note saying why."""
+    """``(returncode, output, "", note)``; a run that could not happen
+    returns ``-1`` and a note saying why.
+
+    The command's stdout and stderr are streamed, interleaved, into a
+    temporary file rather than buffered in memory, and only the last
+    ``OUTPUT_TAIL_BYTES`` are read back, so memory stays bounded whatever
+    the harness prints. The combined text is returned in the ``stdout``
+    slot; the ``stderr`` slot is empty. A ``runner`` that hands back text
+    of its own (a recording stand-in) is read as before.
+    """
     call = runner or subprocess.run
     merged = dict(os.environ)
     if env:
         merged.update({k: str(v) for k, v in env.items()})
+    fd, sink = tempfile.mkstemp(prefix="mipiti-run-", suffix=".log")
     try:
-        completed = call(
-            argv, cwd=str(cwd), env=merged, capture_output=True, text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return -1, "", "", f"timed out after {timeout}s"
-    except OSError as e:
-        return -1, "", "", f"could not start {argv[0]}: {e}"
-    return (
-        int(completed.returncode),
-        str(getattr(completed, "stdout", "") or ""),
-        str(getattr(completed, "stderr", "") or ""),
-        "",
-    )
+        with os.fdopen(fd, "w+b") as fh:
+            try:
+                completed = call(
+                    argv, cwd=str(cwd), env=merged, stdout=fh, stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return -1, "", "", f"timed out after {timeout}s"
+            except OSError as e:
+                return -1, "", "", f"could not start {argv[0]}: {e}"
+            fh.flush()
+            output = _tail_bytes(fh, OUTPUT_TAIL_BYTES)
+    finally:
+        try:
+            os.unlink(sink)
+        except OSError:
+            pass
+    if not output:
+        # A stand-in runner returns its text on the completed process.
+        own = str(getattr(completed, "stdout", "") or "") + str(getattr(completed, "stderr", "") or "")
+        output = own[-OUTPUT_TAIL_BYTES:]
+    return int(completed.returncode), output, "", ""
+
+
+# How much of a command's output is kept for a reason string.
+OUTPUT_TAIL_BYTES = 64 * 1024
+
+
+def _tail_bytes(fh, limit: int) -> str:
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    fh.seek(max(0, size - limit))
+    return fh.read().decode("utf-8", errors="replace")
 
 
 def which(name: str) -> Optional[str]:

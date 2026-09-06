@@ -34,7 +34,7 @@ class CargoAdapter(RunnerAdapter):
     def classify(self, returncode: int, stdout: str, stderr: str) -> Outcome:
         text = stdout + stderr
         if "could not compile" in text or re.search(r"^error(\[E\d+\])?:", text, re.M):
-            return Outcome(OUTCOME_ERROR, returncode, f"cargo could not compile: {tail(stderr, 4)}")
+            return Outcome(OUTCOME_ERROR, returncode, f"cargo could not compile: {tail(stderr or stdout, 4)}")
         ran = [int(n) for n in re.findall(r"running (\d+) tests?", text)]
         if ran and sum(ran) == 0:
             return Outcome(OUTCOME_ERROR, returncode, "cargo test selected no tests")

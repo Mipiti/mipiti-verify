@@ -280,6 +280,30 @@ class TestMutation:
         with pytest.raises(DisableError):
             mutate_source(GO, parse_mechanism("a.rb::x"), "ruby")
 
+    @pytest.mark.parametrize("file,src,mechanism", [
+        ("a.go", GO, "a.go::Guard"), ("a.go", GO, "a.go::Limiter"), ("a.rs", RUST, "a.rs::guard"),
+        ("A.java", JAVA, "A.java::class:A"), ("a.kt", KOTLIN, "a.kt::A.other"), ("a.c", C, "a.c::guard"),
+        ("a.cpp", CPP, "a.cpp::Guard.check"), ("a.cs", CSHARP, "a.cs::Other"),
+        ("a.swift", SWIFT, "a.swift::guardToken"),
+    ])
+    def test_a_block_scope_span_is_refused_not_mutated(self, file, src, mechanism):
+        """Without the parser the line heuristic can only offer a block,
+        which may be a different definition: the mutation is refused with
+        the reason, never applied to a guess."""
+        from mipiti_verify.languages.adapters._common import REASON_NOT_ISOLATED
+
+        with _parser_off():
+            with pytest.raises(DisableError, match="not isolated exactly"):
+                mutate_source(src, parse_mechanism(mechanism))
+        assert "install mipiti-verify\\[ast\\]" in REASON_NOT_ISOLATED.replace("[", "\\[").replace("]", "\\]")
+
+    def test_the_hdl_keyword_scanner_is_exact_so_hdl_still_mutates_without_the_parser(self):
+        with _parser_off():
+            assert "$fatal" in mutate_verilog(SV, parse_mechanism("g.sv::clamp"))
+            assert "process" not in mutate_vhdl(VHDL, parse_mechanism("g.vhd::process:upd"))
+            with pytest.raises(DisableError, match="not defined"):
+                mutate_verilog(SV, parse_mechanism("g.sv::module:nope"))
+
     def test_braces_in_strings_and_comments_do_not_end_the_body(self):
         src = 'func Guard(t string) bool {\n\t// } not the end\n\ts := "}"\n\treturn s != ""\n}\nfunc Other() {}\n'
         out = mutate_source(src, parse_mechanism("a.go::Guard"))
@@ -489,6 +513,32 @@ class TestHdlMutation:
 # ---------------------------------------------------------------------------
 # Restore, refusal, compile gate
 # ---------------------------------------------------------------------------
+
+class TestRunCommand:
+    def test_output_is_streamed_and_only_the_tail_is_kept(self, tmp_path):
+        import sys
+
+        from mipiti_verify.languages.adapters._common import OUTPUT_TAIL_BYTES, run_command
+
+        code, out, err, note = run_command(
+            [sys.executable, "-c", "import sys; sys.stdout.write('a' * 300000 + 'END\\n'); "
+                                   "sys.stderr.write('E' * 100)"],
+            cwd=tmp_path, timeout=60)
+        assert (code, err, note) == (0, "", "")
+        assert len(out.encode("utf-8")) <= OUTPUT_TAIL_BYTES
+        assert "END\n" in out and out.endswith("E" * 100)  # the tail, both streams interleaved
+        assert not list(tmp_path.glob("mipiti-run-*"))
+
+    def test_stderr_is_interleaved_into_the_output(self, tmp_path):
+        import sys
+
+        from mipiti_verify.languages.adapters._common import run_command
+
+        code, out, err, note = run_command(
+            [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
+            cwd=tmp_path, timeout=60)
+        assert code == 3 and "boom" in out and err == "" and note == ""
+
 
 class TestMutatedFile:
     def test_restored_byte_for_byte_even_when_the_block_raises(self, repo):

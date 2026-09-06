@@ -29,6 +29,12 @@ code, driven through the same entry point the command uses:
       every accepted format (coverage.py JSON with and without contexts,
       LCOV, Cobertura, JaCoCo, a per-test directory), reads back as the
       same line sets from both readers
+  A8  a mutation runs only on an exactly located span: with the parser
+      made unavailable, every fixture whose fallback location is a
+      ``block`` (or nothing) is refused with the documented reason and
+      the file is untouched; every fixture the fallback still isolates
+      as ``symbol`` (the HDL keyword scanner) is mutated as with the
+      parser
   A7  outcome mapping is total and closed: for every adapter and every
       exit status in a representative set, the outcome is one of
       ``passed`` / ``failed`` / ``error``, and it is the one the adapter's
@@ -65,7 +71,7 @@ from mipiti_verify.languages.adapters import (  # noqa: E402
     OUTCOME_ERROR, OUTCOME_FAILED, OUTCOME_PASSED, DisableError, _all_adapters,
     detect_adapter, parse_mechanism,
 )
-from mipiti_verify.languages.adapters._common import mutated_file  # noqa: E402
+from mipiti_verify.languages.adapters._common import REASON_NOT_ISOLATED, mutated_file  # noqa: E402
 from mipiti_verify.languages.adapters.hdl import mutate_verilog, mutate_vhdl  # noqa: E402
 from mipiti_verify.languages.adapters.mutation import mutate_source  # noqa: E402
 from mipiti_verify.languages.adapters import checks as checks_mod  # noqa: E402
@@ -708,6 +714,41 @@ def _report(label: str, count: int, violations: List[str]) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# A8  a mutation runs only on an exactly located span
+# ---------------------------------------------------------------------------
+
+def check_a8() -> Tuple[int, List[str]]:
+    violations: List[str] = []
+    checked = 0
+    for language, mechanism, _span, _extras, (kind, name) in MUTATION_CASES:
+        file, source = FIXTURES[language]
+        lang = D.language_of(file)
+        with_parser = _mutate(language, source, mechanism)
+        with _ParserOff():
+            located = D.locate(source, kind, name, language=lang)
+            exact = located is not None and located.scope == D.SCOPE_SYMBOL
+            try:
+                without = _mutate(language, source, mechanism)
+                refused = None
+            except DisableError as e:
+                without = source
+                refused = str(e)
+        checked += 1
+        if exact:
+            if refused is not None:
+                violations.append(f"A8: {mechanism}: isolated as symbol by the fallback, yet refused: {refused}")
+            elif without != with_parser:
+                violations.append(f"A8: {mechanism}: the fallback-backed mutation differs from the parser-backed one")
+        else:
+            scope = located.scope if located is not None else "none"
+            if refused is None:
+                violations.append(f"A8: {mechanism}: fallback scope {scope!r}, yet the file was mutated")
+            elif REASON_NOT_ISOLATED not in refused:
+                violations.append(f"A8: {mechanism}: refused without the documented reason: {refused}")
+    return checked, violations
+
+
 def main() -> int:
     print("=" * 70)
     print("RUNNER ADAPTERS AND LANGUAGE LAYER")
@@ -745,6 +786,9 @@ def main() -> int:
 
     c, v = check_a7()
     all_pass &= _report("A7 outcome mapping total and closed", c, v)
+
+    c, v = check_a8()
+    all_pass &= _report("A8 mutation only on an exactly located span", c, v)
 
     print(f"\n{'=' * 70}")
     if not all_pass:

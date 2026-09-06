@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A source mutation runs only on a definition the language layer isolates
+  exactly (`scope: symbol`, from a parser or the HDL keyword scanner). A
+  span the line heuristic can only offer as a `block` may be a different
+  definition, and a mutation of the wrong block can still compile, so the
+  pair is `error` with reason `definition not isolated exactly (install
+  mipiti-verify[ast] or nominate a unique symbol)`. Formal property A8 in
+  `formal/check_adapters.py`.
+
+- Command output (test runs, suite runs, coverage runs, compile checks) is
+  streamed to a temporary file and only its last 64 KiB read back for a
+  reason string, so memory stays bounded whatever a harness prints.
+
+- The end-to-end runner tests that wrap a toolchain in `sh -c` skip on a
+  runner without a POSIX shell.
+
 - Property-based checks (`hypothesis`, in the `dev` extra) over the
   definition locators and the coverage readers: `locate` never raises on
   arbitrary text and every span it returns is the file's own lines

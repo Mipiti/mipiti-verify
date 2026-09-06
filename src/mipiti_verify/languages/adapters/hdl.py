@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from ._common import DISABLED_MESSAGE, DisableError, Mechanism
+from ._common import DISABLED_MESSAGE, DisableError, Mechanism, require_exact
 
 VERILOG_FATAL = f'$fatal(1, "{DISABLED_MESSAGE}");'
 VHDL_FAIL = f'assert false report "{DISABLED_MESSAGE}" severity failure;'
@@ -533,7 +533,34 @@ def _verilog_assert(content: str, masked: str, label: str) -> Optional[str]:
     return _remove(content, m.start(), end)
 
 
+# The kinds the language layer is asked to isolate for a mechanism, per
+# construct keyword: a mutation runs only on an exactly located span.
+_V_LOCATE_KINDS = {
+    "module": ("module",), "function": ("function",), "task": ("task",),
+    "always": ("always",), "initial": ("initial",), "property": ("property",),
+    "sequence": ("sequence",), "assert": ("assert",),
+}
+_V_ANY_KINDS = ("module", "function", "task", "property", "sequence", "always", "initial", "assert")
+_VHDL_LOCATE_KINDS = {
+    "architecture": ("architecture",), "process": ("process",),
+    "function": ("function",), "procedure": ("procedure",),
+}
+_VHDL_ANY_KINDS = ("architecture", "process", "function", "procedure")
+
+
 def mutate_verilog(content: str, mechanism: Mechanism) -> str:
+    """``content`` with the construct disabled; refused unless the language
+    layer isolates it exactly (a block-scope span may be a different
+    definition, and a mutation of the wrong block can still elaborate)."""
+    language = mechanism.language or "systemverilog"
+    kinds = _V_LOCATE_KINDS.get(mechanism.kind, _V_ANY_KINDS if not mechanism.kind else ())
+    if not kinds:
+        raise DisableError(f"{mechanism.kind} is not a Verilog construct this adapter can disable")
+    return require_exact(content, kinds, mechanism.name, language,
+                         lambda: _mutate_verilog(content, mechanism))
+
+
+def _mutate_verilog(content: str, mechanism: Mechanism) -> str:
     masked = mask_verilog(content)
     name = mechanism.name
     kind = mechanism.kind
@@ -701,6 +728,18 @@ def _vhdl_routine(content: str, masked: str, name: str) -> str:
 
 
 def mutate_vhdl(content: str, mechanism: Mechanism) -> str:
+    """``content`` with the construct disabled; refused unless the language
+    layer isolates it exactly."""
+    if mechanism.kind == "entity":
+        raise DisableError("an entity is disabled through its architecture; name the architecture")
+    kinds = _VHDL_LOCATE_KINDS.get(mechanism.kind, _VHDL_ANY_KINDS if not mechanism.kind else ())
+    if not kinds:
+        raise DisableError(f"{mechanism.kind} is not a VHDL construct this adapter can disable")
+    return require_exact(content, kinds, mechanism.name, "vhdl",
+                         lambda: _mutate_vhdl(content, mechanism))
+
+
+def _mutate_vhdl(content: str, mechanism: Mechanism) -> str:
     masked = mask_vhdl(content)
     name = mechanism.name
     kind = mechanism.kind

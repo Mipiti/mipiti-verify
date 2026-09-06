@@ -32,6 +32,6 @@ def test_every_adapter_property_is_verified():
     else:
         assert "ADAPTER PROPERTIES VERIFIED EXCEPT" in result.stdout, result.stdout
         assert "NOT ESTABLISHED (tree-sitter-language-pack not installed)" in result.stdout, result.stdout
-    for prop in ("A1 ", "A2 ", "A3 ", "A4 ", "A5 ", "A6 ", "A7 "):
+    for prop in ("A1 ", "A2 ", "A3 ", "A4 ", "A5 ", "A6 ", "A7 ", "A8 "):
         assert prop in result.stdout, result.stdout
     assert "FAILED" not in result.stdout, result.stdout

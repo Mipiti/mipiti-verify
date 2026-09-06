@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from ._common import DISABLED_MESSAGE, DisableError, Mechanism
+from ._common import DISABLED_MESSAGE, DisableError, Mechanism, located_exactly, require_exact
 
 ABORT_BODY = {
     "go": f'{{ panic("{DISABLED_MESSAGE}") }}',
@@ -447,17 +447,45 @@ def _with_stdlib(content: str, language: str) -> str:
 def mutate_source(content: str, mechanism: Mechanism, language: str = "") -> str:
     """``content`` with the mechanism's body replaced by the language's
     aborting body. Raises ``DisableError`` when the definition cannot be
-    located or delimited."""
+    located or delimited, and when the language layer does not isolate
+    it exactly (``scope == "symbol"``): a block-scope span may cover a
+    different definition, and a mutation of the wrong block can still
+    compile, which would attribute a test's outcome to the wrong
+    mechanism."""
     language = language or mechanism.language
     body = ABORT_BODY.get(language)
     if body is None:
         raise DisableError(f"no source mutation is defined for {language or 'this language'}")
     kind = mechanism.kind or ""
     owner, leaf = mechanism.owner, mechanism.leaf
-
     if language == "go" and not kind and not owner and _find_definition_line(content, leaf, "function") < 0 \
             and _go_method_bodies(content, leaf):
         kind = "struct"
+    exact: Optional[bool] = None
+    if kind in _TYPE_KEYWORDS or (not kind and not owner and _looks_like_type(content, leaf)):
+        kinds: tuple = ("class",)
+        if language == "go":
+            # A Go type's methods may live in a file that does not declare
+            # the type: every method with that receiver must be isolated
+            # exactly on its own, and at least one must exist.
+            methods = re.findall(
+                rf"^\s*func\s*\([^)]*\b{re.escape(leaf)}\s*\)\s*([A-Za-z_]\w*)\s*\(", content, re.M)
+            if methods:
+                exact = all(located_exactly(content, ("method",), f"{leaf}.{m}", "go") is True
+                            for m in methods)
+    elif owner:
+        kinds = ("method",)
+    else:
+        kinds = ("function",)
+    return require_exact(
+        content, kinds, mechanism.name, language,
+        lambda: _mutate_source(content, mechanism, language, body, kind),
+        exact=exact,
+    )
+
+
+def _mutate_source(content: str, mechanism: Mechanism, language: str, body: str, kind: str) -> str:
+    owner, leaf = mechanism.owner, mechanism.leaf
     if kind in _TYPE_KEYWORDS or (not kind and not owner and _looks_like_type(content, leaf)):
         if language == "go":
             ranges = _go_method_bodies(content, leaf)

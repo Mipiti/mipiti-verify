@@ -44,6 +44,9 @@ def _reasons(summary: dict) -> dict[str, str]:
     return {t["id"]: t["fails_without"][0].get("reason", "") for t in summary["tests"]}
 
 
+# The command-runner tests wrap their toolchain in ``sh -c``; a runner
+# without a POSIX shell skips them rather than failing on the wrapper.
+needs_sh = pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX shell (sh) on this runner")
 needs_go = pytest.mark.skipif(shutil.which("go") is None, reason="go is not installed")
 needs_cc = pytest.mark.skipif(shutil.which("cc") is None, reason="cc is not installed")
 needs_javac = pytest.mark.skipif(shutil.which("javac") is None or shutil.which("java") is None,
@@ -146,6 +149,7 @@ class TestPytestReach:
         assert not unrelated or 3 not in unrelated[0]["lines"]
 
 
+@needs_sh
 @needs_cc
 class TestC:
     FILES = {
@@ -172,6 +176,7 @@ class TestC:
         assert (tmp_path / "guard.c").read_text() == self.FILES["guard.c"]
 
 
+@needs_sh
 @needs_javac
 class TestJava:
     FILES = {
@@ -197,6 +202,7 @@ class TestJava:
         assert (tmp_path / "Guard.java").read_text() == self.FILES["Guard.java"]
 
 
+@needs_sh
 @needs_swiftc
 class TestSwift:
     FILES = {
@@ -220,6 +226,7 @@ class TestSwift:
         assert (tmp_path / "Guard.swift").read_text() == self.FILES["Guard.swift"]
 
 
+@needs_sh
 @needs_iverilog
 class TestIcarus:
     FILES = {
@@ -246,6 +253,7 @@ class TestIcarus:
         assert (tmp_path / "guard.v").read_text() == self.FILES["guard.v"]
 
 
+@needs_sh
 @needs_iverilog
 class TestIcarusNonAnsi:
     """A non-ANSI module: the stub re-emits the body port declarations, so
