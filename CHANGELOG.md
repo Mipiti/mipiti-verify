@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Property-based checks (`hypothesis`, in the `dev` extra) over the
+  definition locators and the coverage readers: `locate` never raises on
+  arbitrary text and every span it returns is the file's own lines
+  carrying the name; `hash_of` ignores line endings and trailing blanks and
+  nothing else; the HDL keyword scanner never raises and its blocks nest;
+  `read_coverage` returns a report or its own error on any bytes, with only
+  positive line numbers under normalised repository-relative paths;
+  `parse_junit` returns a summary or its own error. Three findings fixed
+  along the way: a deeply nested Python file no longer escapes as
+  `MemoryError` from the parser, a coverage path with a `..` segment is
+  folded (and dropped when it climbs out of the root) instead of kept
+  verbatim, and a negative line number in a coverage.py export is ignored
+  like a zero.
+
 - `attest-reach --suite-cmd "<command>" --coverage-file <report>` (action:
   `suite-cmd` with `reach-pairs`): reach for a harness that cannot run one
   test alone. The suite runs once under coverage and every nominated test

@@ -24,6 +24,7 @@ format, and its executed lines become that test's ``per_test`` entry.
 from __future__ import annotations
 
 import json
+import posixpath
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,16 +75,18 @@ class CoverageReport:
 def _relative(raw: str, project_root: Optional[Path], candidates: tuple[str, ...] = ()) -> str:
     """``raw`` as a repository-relative POSIX path when it can be placed
     under ``project_root`` (directly, or under one of ``candidates``);
-    otherwise as given."""
+    otherwise as given, normalised. A relative path that climbs out of the
+    root (a ``..`` segment left after normalisation) names nothing in the
+    repository and is dropped (``""``)."""
     text = str(raw or "").replace("\\", "/").strip()
     if not text:
         return ""
     if project_root is None:
-        return text
+        return _normalised(text)
     try:
         root = project_root.resolve()
     except OSError:
-        return text
+        return _normalised(text)
     path = Path(text)
     if path.is_absolute():
         try:
@@ -91,11 +94,11 @@ def _relative(raw: str, project_root: Optional[Path], candidates: tuple[str, ...
         except (ValueError, OSError):
             return text
     if (root / text).exists():
-        return Path(text).as_posix()
+        return _normalised(text)
     for prefix in candidates:
         joined = Path(prefix.replace("\\", "/")) / text
         if (root / joined).exists():
-            return joined.as_posix()
+            return _normalised(joined.as_posix())
         if Path(prefix).is_absolute():
             try:
                 rel = (Path(prefix) / text).resolve().relative_to(root).as_posix()
@@ -103,7 +106,20 @@ def _relative(raw: str, project_root: Optional[Path], candidates: tuple[str, ...
                 continue
             if (root / rel).exists():
                 return rel
-    return Path(text).as_posix()
+    return _normalised(text)
+
+
+def _normalised(text: str) -> str:
+    """A relative POSIX path with ``.`` and ``..`` segments folded, or
+    ``""`` when nothing is left or the path climbs above its root. An
+    absolute path is returned as it is: it is not relative to anything."""
+    if Path(text).is_absolute():
+        norm = posixpath.normpath(text)
+        return "" if norm == "/" else norm
+    norm = posixpath.normpath(text)
+    if norm in (".", "..") or norm.startswith("../"):
+        return ""
+    return norm
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +257,15 @@ def _read_cobertura(root, project_root: Optional[Path]) -> CoverageReport:
 def _read_jacoco(root, project_root: Optional[Path]) -> CoverageReport:
     report = CoverageReport(format="jacoco")
     for package in root.iter("package"):
-        prefix = (package.get("name") or "").replace("\\", "/").strip("/")
+        prefix = (package.get("name") or "").strip().replace("\\", "/").strip("/")
         for source in package.iter("sourcefile"):
-            name = source.get("name") or ""
+            name = (source.get("name") or "").strip()
             if not name:
                 continue
             joined = f"{prefix}/{name}" if prefix else name
             rel = _relative(joined, project_root, _JAVA_SOURCE_ROOTS)
+            if not rel:
+                continue
             lines = report.suite.setdefault(rel, set())
             for ln in source.iter("line"):
                 number = _int(ln.get("nr"))
@@ -279,7 +297,10 @@ def _read_directory(directory: Path, project_root: Optional[Path]) -> CoverageRe
 
 
 def _int(value: object) -> int:
+    """``value`` as a positive integer, or ``0``: a line number or a hit
+    count below 1 records nothing."""
     try:
-        return int(str(value).strip())
+        number = int(str(value).strip())
     except (TypeError, ValueError):
         return 0
+    return number if number > 0 else 0

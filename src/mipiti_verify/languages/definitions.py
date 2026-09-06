@@ -169,7 +169,9 @@ def _python_span(content: str, kind: str, name: str) -> tuple[bool, Optional[tup
     """``(parsed, span)``: whether the source parsed as Python, and the span."""
     try:
         tree = ast.parse(content)
-    except (SyntaxError, ValueError, RecursionError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        # ``MemoryError`` is the parser's own stack overflowing on deeply
+        # nested source; the file is then not something ``ast`` can read.
         return False, None
     if kind in ("function", "method"):
         wanted: tuple = (ast.FunctionDef, ast.AsyncFunctionDef)

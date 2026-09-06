@@ -6,3 +6,4 @@ build/
 .venv/
 .env
 .venv-test/
+.hypothesis/
