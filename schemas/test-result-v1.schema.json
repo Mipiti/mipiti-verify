@@ -265,9 +265,10 @@
     "kind": {
       "type": "string",
       "enum": [
-        "dependence"
+        "dependence",
+        "reach"
       ],
-      "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. A dependence record never evidences that a test ran and passed."
+      "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. \"reach\" marks a record produced by `mipiti-verify attest-reach`: each test entry carries the per-test coverage (reached) of a run of that test alone, the mechanism it was run for, and a reason when the pair was not run. Neither kind evidences that a test ran and passed."
     }
   }
 }

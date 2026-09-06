@@ -28,6 +28,9 @@ from ..attestation import (
 # The second statement shape carried under the test-result predicate type:
 # each test entry records how the test fared with a mechanism disabled.
 KIND_DEPENDENCE = "dependence"
+KIND_REACH = "reach"
+# Records that state a fact about a test rather than that it ran and passed.
+FACT_KINDS = frozenset({KIND_DEPENDENCE, KIND_REACH})
 
 
 def load_verified_statements(
@@ -136,12 +139,16 @@ class TestAttestedVerifier:
         dependence = [
             st for st, _ in statements if statement_kind(st) == KIND_DEPENDENCE
         ]
+        # A reach record likewise: per-test coverage produced by running the
+        # test alone, consulted for the reach fact, never for the pass.
+        reach = [st for st, _ in statements if statement_kind(st) == KIND_REACH]
         for statement, provenance in statements:
-            if statement_kind(statement) == KIND_DEPENDENCE:
+            if statement_kind(statement) in FACT_KINDS:
                 continue
             result = self._check(
                 statement, test_name, commit, provenance, params.get("env"),
                 params=params, project_root=project_root, dependence=dependence,
+                reach=reach,
             )
             if result.passed:
                 return result
@@ -158,7 +165,8 @@ class TestAttestedVerifier:
     def _check(self, statement: dict, test_name: str, commit: str,
                provenance: str, required_env: object = None, *,
                params: object = None, project_root: Path | None = None,
-               dependence: list | None = None) -> VerifierResult:
+               dependence: list | None = None,
+               reach: list | None = None) -> VerifierResult:
         predicate = statement.get("predicate") or {}
         totals = predicate.get("totals") or {}
         selected = predicate.get("selected") or {}
@@ -268,7 +276,7 @@ class TestAttestedVerifier:
         facts = _evidence_facts(
             matched[0], test_name,
             params if isinstance(params, dict) else {},
-            project_root, dependence or [], commit,
+            project_root, dependence or [], commit, reach=reach or [],
         )
         return VerifierResult(
             passed=True,
@@ -438,9 +446,30 @@ def _depends_on_mechanism(dependence: list, test_name: str, commit: str,
     return None
 
 
+def _reach_entry(reach: list, test_name: str, commit: str, mechanism: str) -> dict | None:
+    """The reach record's entry for this test at this commit, when one names
+    the same mechanism (or no mechanism, for a record produced per test
+    without one) and was actually run (no ``reason``)."""
+    for statement in reach or []:
+        predicate = statement.get("predicate") or {}
+        if not commit or str(predicate.get("commit") or "") != commit:
+            continue
+        for entry in predicate.get("tests") or []:
+            if not _names_test(entry, test_name):
+                continue
+            if entry.get("reason"):
+                continue
+            named = str(entry.get("mechanism") or "").strip()
+            if named and named != mechanism:
+                continue
+            if isinstance(entry.get("reached"), list):
+                return entry
+    return None
+
+
 def _evidence_facts(entry: dict, test_name: str, params: dict,
                     project_root: Path | None, dependence: list,
-                    commit: str) -> dict:
+                    commit: str, reach: list | None = None) -> dict:
     """The facts a passing test-result record establishes about its evidence."""
     facts: dict = {}
     digest = str(entry.get("definition_sha256") or "")
@@ -451,6 +480,12 @@ def _evidence_facts(entry: dict, test_name: str, params: dict,
     if not file:
         return facts
     reached = _reached_mechanism(entry, project_root, file, symbol)
+    if reached is None:
+        # The test-result record carried no per-test coverage; a reach record
+        # for the same test and commit (``attest-reach``) may.
+        reach_entry = _reach_entry(reach or [], test_name, commit, mechanism)
+        if reach_entry is not None:
+            reached = _reached_mechanism(reach_entry, project_root, file, symbol)
     if reached is not None:
         facts["reached"] = reached
     depends = _depends_on_mechanism(dependence, test_name, commit, mechanism)

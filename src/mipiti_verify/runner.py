@@ -116,7 +116,7 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     from .definition_extract import MAX_DEFINITION_CHARS, extract_definition
     from .verifiers import PathTraversalError, safe_resolve_path
     from .verifiers.tests import (
-        KIND_DEPENDENCE, TestAttestedVerifier, _names_test,
+        FACT_KINDS, TestAttestedVerifier, _names_test,
         definition_matches_checkout, mechanism_line_span, parse_mechanism,
         statement_kind,
     )
@@ -124,7 +124,7 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     test_name = str(params.get("test") or params.get("pattern") or "").strip()
     entry: dict | None = None
     for statement in _verified_statements_for_commit(project_root):
-        if statement_kind(statement) == KIND_DEPENDENCE:
+        if statement_kind(statement) in FACT_KINDS:
             continue
         for candidate in (statement.get("predicate") or {}).get("tests") or []:
             if _names_test(candidate, test_name):

@@ -611,6 +611,71 @@ def _attest_dependence(project, status, *, commit=COMMIT, key_path="", test=TEST
     _write(project, statement, "tests-dependence.json", key_path)
 
 
+def _attest_reach(project, reached, *, commit=COMMIT, key_path="", test=TEST, mechanism=MECHANISM,
+                  reason=""):
+    """A reach record as ``attest-reach`` writes it: the test run alone, its
+    per-test coverage of the mechanism's file, the mechanism it ran for."""
+    entry = {"id": test, "name": test, "status": "passed", "mechanism": mechanism}
+    if reason:
+        entry.update({"status": "error", "reason": reason})
+    else:
+        entry["reached"] = reached
+    summary = {
+        "totals": {"total": 1, "passed": 0 if reason else 1, "failed": 0, "skipped": 0,
+                   "errors": 1 if reason else 0},
+        "tests": [entry],
+    }
+    statement = build_statement(commit=commit, summary=summary, invocation=[], kind="reach")
+    _write(project, statement, "tests-reach.json", key_path)
+
+
+class TestReachRecords:
+    """A reach record supplies the reach fact when the test-result record has
+    no per-test coverage; it never supplies the pass."""
+
+    def test_reach_record_fills_reached_when_test_result_has_none(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.passed and r.reached is True
+
+    def test_reach_record_can_say_no(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [1]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.passed and r.reached is False
+
+    def test_test_result_coverage_wins_over_reach_record(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project, coverage=_coverage_for(project, [5, 6], f"tests/test_guard.py::{TEST}|run"))
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [1]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.reached is True
+
+    def test_unrun_reach_pair_is_unknown(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [], reason="not run: reach budget exhausted")
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.passed and r.reached is None
+
+    def test_reach_record_for_another_mechanism_is_ignored(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}],
+                      mechanism="app/other.py::thing")
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.reached is None
+
+    def test_reach_record_alone_never_evidences_a_pass(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert not r.passed
+
+
 class TestVerifierFacts:
     def test_evidence_hash_is_the_attested_definition_hash(self, project, keypair, monkeypatch):
         key_path, public = keypair
