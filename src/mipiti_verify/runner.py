@@ -113,11 +113,12 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     handed over as before.
     """
     from .attestation import base_test_name
-    from .definition_extract import extract_definition
+    from .definition_extract import MAX_DEFINITION_CHARS, extract_definition
     from .verifiers import PathTraversalError, safe_resolve_path
     from .verifiers.tests import (
         KIND_DEPENDENCE, TestAttestedVerifier, _names_test,
-        definition_matches_checkout, parse_mechanism, statement_kind,
+        definition_matches_checkout, mechanism_line_span, parse_mechanism,
+        statement_kind,
     )
 
     test_name = str(params.get("test") or params.get("pattern") or "").strip()
@@ -168,13 +169,17 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     mechanism = str(params.get("mechanism") or "").strip()
     mech_file, symbol = parse_mechanism(mechanism)
     if mech_file:
+        # Resolved the way the reach fact is: the symbol's kind (a bare
+        # name, ``Class.method``, or ``kind:name`` such as ``module:alu``)
+        # in the language the file's extension names, so an HDL mechanism
+        # shows the judge its definition too.
         content = _read(mech_file)
         block = None
         if content:
-            for kind in ("function", "class"):
-                block = extract_definition(content, kind, symbol)
-                if block is not None:
-                    break
+            span = mechanism_line_span(project_root, mech_file, symbol)
+            if span is not None:
+                start, end = span
+                block = "\n".join(content.splitlines()[start - 1:end])[:MAX_DEFINITION_CHARS]
         sections.append(
             f"--- Mechanism {mech_file}::{symbol} ---\n"
             + (block if block is not None else "(definition not found in the checkout)")

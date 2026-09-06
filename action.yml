@@ -85,7 +85,27 @@ inputs:
     required: false
     default: ""
   dependence-pairs:
-    description: "Space-separated test=file::symbol pairs (e.g. 'tests/test_auth.py::test_token_required=app/auth.py::require_token'). When set, the action runs 'attest-dependence' before verifying: each named test is run once with its mechanism replaced by a stub, and the outcome is signed into a dependence attestation. This is the one input that RUNS TESTS; it is opt-in and Python-only. Leave unset to keep the action read-only."
+    description: "Space-separated test=file::symbol pairs (e.g. 'tests/test_auth.py::test_token_required=app/auth.py::require_token'). When set, the action runs 'attest-dependence' before verifying: each named test is run once with its mechanism disabled through the project's runner (a stub for Python, a mocking setup file for jest/vitest/mocha, a compile-checked source mutation restored afterwards for Go, Rust, JVM, .NET, C/C++, Swift and HDL), and the outcome is signed into a dependence attestation. This input RUNS TESTS; it is opt-in. Leave unset to keep the action read-only."
+    required: false
+    default: ""
+  reach-pairs:
+    description: "Space-separated test=file::symbol pairs. When set, the action runs 'attest-reach' before verifying: each named test is run alone under the language's coverage tool through the project's runner, and the lines it executed in the mechanism's file are signed into a reach attestation, which is what the 'reached' fact of a test_attested assertion is computed from for runners other than pytest-with-coverage.py. This input RUNS TESTS; it is opt-in."
+    required: false
+    default: ""
+  runner:
+    description: "Runner adapter for dependence-pairs and reach-pairs: pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit or command. Default: detected from the project's files. The 'command' runner takes run-cmd."
+    required: false
+    default: ""
+  run-cmd:
+    description: "For the 'command' runner: the command that runs one test, with {test} substituted (e.g. 'make sim TEST={test}'); exit 0 is passed, 1 failed, anything else error. Setting it selects the command runner."
+    required: false
+    default: ""
+  coverage-cmd:
+    description: "For the 'command' runner with reach-pairs: the command that runs one test under coverage ({test} substituted). Defaults to run-cmd."
+    required: false
+    default: ""
+  coverage-file:
+    description: "For the 'command' runner with reach-pairs: the report the coverage command writes, relative to project-root (LCOV, Cobertura, JaCoCo or coverage.py JSON)."
     required: false
     default: ""
 
@@ -118,3 +138,8 @@ runs:
     INPUT_ATTESTATION_ENV: ${{ inputs.attestation-env }}
     INPUT_COVERAGE_REPORT: ${{ inputs.coverage-report }}
     INPUT_DEPENDENCE_PAIRS: ${{ inputs.dependence-pairs }}
+    INPUT_REACH_PAIRS: ${{ inputs.reach-pairs }}
+    INPUT_RUNNER: ${{ inputs.runner }}
+    INPUT_RUN_CMD: ${{ inputs.run-cmd }}
+    INPUT_COVERAGE_CMD: ${{ inputs.coverage-cmd }}
+    INPUT_COVERAGE_FILE: ${{ inputs.coverage-file }}

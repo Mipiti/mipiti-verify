@@ -64,6 +64,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The predicate schema gains the optional per-test `parser` and
   `suite_reached`; `definition_scope` accepts `symbol` and `block`.
 - Action inputs `coverage-report` and `dependence-pairs`.
+- Runner adapters (`languages/adapters/`) behind `attest-dependence` and the
+  new `attest-reach`: pytest (also cocotb suites driven by pytest), jest,
+  vitest, mocha, `go test -run`, `cargo test`, Maven (`-Dtest=`), Gradle
+  (`--tests`), `dotnet test --filter`, rspec, phpunit, and a command runner
+  (`--run-cmd "make sim TEST={test}"`, `--coverage-cmd`, `--coverage-file`)
+  for simulators and custom harnesses. Detected from the project's files,
+  the mechanisms' language breaking a polyglot tie; `--runner` overrides.
+  Every adapter selects exactly one test, maps the runner's exit status so a
+  run that selected nothing, failed to build, could not start or timed out is
+  `error` with a reason (never `failed`), and runs the test under the
+  language's coverage tool.
+- Dependence for every supported language. A JavaScript or TypeScript
+  mechanism is disabled by a setup file registered for the run (jest
+  `--setupFilesAfterEnv`, a temporary vitest config extending the project's
+  with a `setupFiles` entry, mocha `--require`) that mocks the module by its
+  resolved path and replaces the export (`default`, a function, or
+  `Class.method` on the prototype) with a function that throws. Go, Rust,
+  Java, Kotlin, C, C++, C#, Swift, Verilog, SystemVerilog and VHDL mechanisms
+  are disabled by source mutation: the definition's body is replaced by one
+  that aborts (a Verilog `module` by a stub with the same ANSI header whose
+  outputs are driven to `x`, a `function`/`task` by `$fatal`, a labelled
+  block, `property`, `sequence` or `assert` removed; a VHDL `architecture`
+  emptied, a `process` removed, a `function`/`procedure` by `assert false`),
+  the tree is compile- or lint-checked first with the language's toolchain,
+  the file is refused when it has uncommitted changes, and the original
+  bytes are restored afterwards and verified by hash. A compile failure, a
+  refused file or a mechanism that cannot be disabled records `error` with
+  the reason in `fails_without[].reason`, which the verifier reads as
+  unknown.
+- `attest-reach`: runs each nominated test alone under coverage through the
+  runner adapter and signs the lines it executed in the mechanism's file
+  into a `predicate.kind = "reach"` attestation (`-reach` suffix), in the
+  same per-test `reached: [{file, lines}]` shape `attest-tests --coverage`
+  records. Only the mechanism's file is kept. Same pair sources
+  (`--pair`, `--from-model`), same `--timeout` / `--total-timeout` budget
+  (unrun pairs recorded as `error` with a reason), same signing ladder as
+  `attest-dependence`. Go `-coverprofile`, SimpleCov `.resultset.json` and
+  Clover XML are converted to LCOV; JaCoCo and Cobertura are read as they
+  are.
+- Action inputs `reach-pairs`, `runner`, `run-cmd`, `coverage-cmd` and
+  `coverage-file`; `dependence-pairs` is no longer Python-only.
 - `attest-dependence --total-timeout` (default 1800s, also
   `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would
   start after the budget is spent is recorded as not run, with a `reason`,

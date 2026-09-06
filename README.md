@@ -79,15 +79,16 @@ Independently verifies ECDSA document signatures on exported HTML reports and JS
 
 **Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
 
-### `attest-tests` / `attest-dependence` — Record test evidence in the test job
+### `attest-tests` / `attest-dependence` / `attest-reach` — Record test evidence in the test job
 
 ```bash
-pytest --junitxml=report.xml --cov --cov-context=test && coverage json --show-contexts -o coverage.json
+pytest --junitxml=report.xml
 mipiti-verify attest-tests --junit report.xml --coverage coverage.json
 mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
+mipiti-verify attest-reach --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
 ```
 
-`attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` is the one opt-in command that **runs tests**: each named test once with its mechanism disabled, recording whether it fails without it. Both belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested).
+`attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` and `attest-reach` are the two opt-in commands that **run tests**: each named test once, with its mechanism disabled (does the test fail without it?) or alone under coverage (which lines of the mechanism's file does it execute?). Both go through the project's runner adapter (pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit, or a `--run-cmd` for simulators) and belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested) and [Runners](#runners).
 
 ## Audit Envelope Contract
 
@@ -262,6 +263,12 @@ jobs:
           # needs attestation-signing-key.
           junit-report: report.xml
 
+          # Optional, opt-in, and the only inputs that run tests: dependence
+          # and reach for the pairs named, through the project's runner.
+          # dependence-pairs: tests/test_auth.py::test_token_required=app/auth.py::require_token
+          # reach-pairs: tests/test_auth.py::test_token_required=app/auth.py::require_token
+          # runner: go                 # override the detected runner; 'command' with run-cmd for simulators
+
           # Optional, for assertions that require the run to have used a
           # particular configuration. A suite can pass with the control it
           # exercises switched off, and a file in the repository shows what is
@@ -336,7 +343,8 @@ A `test_attested` assertion is checked against a statement your CI signed about 
 
 - *Definition.* `attest-tests` locates each test in the checkout (pytest `classname` → module → file, or the JUnit `file` attribute for other runners) and records `file` and `definition_sha256`, a hash over the definition block from its decorators to the end of its body, whitespace-normalised. A parametrized id (`test_x[case-1]`) resolves to the function; a method's hash covers the method. Each entry says what the hash covers (`definition_scope`: `symbol`, `block` or `file`) and what isolated it (`parser`); see [Languages](#languages) for how each language is cut and what the fallback can and cannot tell apart. A test that cannot be located carries neither field. The `test_attested` result reports the hash as `evidence_hash`, so a tier-2 acceptance is bound to the definition it was given, and a changed definition is re-judged rather than carried forward.
 - *Reach.* `attest-tests --coverage <report>` reads a coverage report (coverage.py JSON, LCOV, Cobertura XML, JaCoCo XML, or a directory of one report per test; see [Languages](#languages)) and records, per test, `reached: [{file, lines}]` when the report attributes lines to that test, or `suite_reached` when it only says what the whole run executed. When the assertion names a `mechanism`, the result reports `reached: true|false`: whether the test executed a line of that mechanism's definition. An empty `reached` is a fact (the run had coverage and the test touched nothing); `suite_reached` and a run without `--coverage` leave it unknown.
-- *Dependence.* `mipiti-verify attest-dependence` runs each `(test, mechanism)` pair once with the mechanism replaced by a stub that returns `None` (a class becomes a stub class whose methods return `None`) and signs the outcome into a second attestation with `predicate.kind = "dependence"`. The result reports `depends: true|false`: a test that fails without the mechanism depends on it; one that still passes does not. **This command runs tests.** It is opt-in, lives in the job that already runs your tests next to `attest-tests`, and is the only command in this package that executes anything; `run` still executes nothing. Pairs come from `--pair <test>=<file>::<symbol>` (repeatable) or `--from-model <id>` (every `test_attested` assertion of the model that names a `mechanism`, fetched with the same credentials `run` uses). Python only: the mechanism is disabled through a pytest plugin loaded for that run. The mechanism's module is imported at pytest configuration time, before any test runs, so a module with import-time side effects (connections, threads, global state) runs them then; nominate mechanisms that live in modules that are safe to import. Two clocks bound the command: `--timeout` per pair (default 300s) and `--total-timeout` for the whole run (default 1800s, also `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`). A pair that would start after the total budget is spent is recorded as not run (`status: error` with a `reason`), so the attestation still names every requested pair and the verifier reports `depends` as unknown for it, never as an outcome.
+- *Dependence.* `mipiti-verify attest-dependence` runs each `(test, mechanism)` pair once with the mechanism disabled and signs the outcome into a second attestation with `predicate.kind = "dependence"`. The result reports `depends: true|false`: a test that fails without the mechanism depends on it; one that still passes does not. **This command runs tests.** It is opt-in and lives in the job that already runs your tests next to `attest-tests`; `run` still executes nothing. Pairs come from `--pair <test>=<file>::<symbol>` (repeatable) or `--from-model <id>` (every `test_attested` assertion of the model that names a `mechanism`, fetched with the same credentials `run` uses). How the mechanism is disabled depends on the runner (see [Runners](#runners)): a pytest plugin stubs a Python symbol at import time (the module is imported at pytest configuration time, so nominate mechanisms in modules that are safe to import); jest, vitest and mocha load a setup file that mocks the module and replaces the export with a function that throws; every other language has the definition's body replaced in the source by one that aborts, compile-checked first and restored byte-for-byte afterwards. The fact is defined identically everywhere: the test's outcome is anything but `passed` with the mechanism disabled *and* the mutated tree compiled. A mutated tree that does not compile, a file with uncommitted changes, a runner that selected no test, or a mechanism that cannot be disabled records `status: error` with a `reason`, which the verifier reads as unknown, never as an outcome. Two clocks bound the command: `--timeout` per pair (default 300s) and `--total-timeout` for the whole run (default 1800s, also `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`). A pair that would start after the total budget is spent is recorded as not run (`status: error` with a `reason`), so the attestation still names every requested pair.
+- *Reach, per test, for any runner.* `mipiti-verify attest-reach` runs each nominated test **alone** under the language's coverage tool through the same runner adapter and signs the lines it executed in the mechanism's file into a third attestation with `predicate.kind = "reach"`, in the same per-test `reached: [{file, lines}]` shape `attest-tests --coverage` records. Running one test at a time is what makes it a claim about that test rather than the suite, which is why an aggregate report never yields `reached` on its own. Only the mechanism's file is recorded. Same pair sources, same two clocks, same signing as `attest-dependence`; a runner whose coverage tool is missing or produced no report records `status: error` with the `reason`.
 
 **The `mechanism` param.** A `test_attested` assertion may name the mechanism the test is meant to exercise as `mechanism: "<file>::<symbol>"` (`Class.method` for a method; `<kind>:<name>` to name the kind outright, e.g. `rtl/alu.sv::module:alu` or `rtl/fsm.sv::always:seq_logic`). It is what reach and dependence are computed against, and what the tier-2 reviewer is shown next to the test.
 
@@ -371,6 +379,49 @@ Coverage formats accepted by `--coverage`: coverage.py JSON (`coverage json`; wi
           dependence-pairs: "tests/test_auth.py::test_token_required=app/auth.py::require_token"
 ```
 
+#### Runners
+
+`attest-dependence` and `attest-reach` execute tests through a runner adapter, detected from the project's files; `--runner <name>` (action input `runner`) overrides it, and `--run-cmd` selects the command runner. In a polyglot checkout the language of the mechanisms breaks the tie; a checkout with no marker at all is treated as pytest.
+
+| Runner | Detected by | Selects one test with | Needs installed | Coverage for `attest-reach` | Disables a mechanism by |
+|---|---|---|---|---|---|
+| `pytest` (also cocotb suites driven by pytest) | `pytest.ini`, `setup.cfg`, `tox.ini`, `conftest.py`, or `pyproject.toml` with pytest config / a `tests/` tree | node id, or `-k <name>` | `pytest`; `coverage` for reach | `coverage run` + `coverage json --show-contexts` | import-time stub (plugin) for Python; source mutation for Verilog / SystemVerilog / VHDL |
+| `jest` | `package.json` with a `jest` dependency or key, `jest.config.*` | `--runTestsByPath <file> -t '^<name>$'` | `jest` (local `node_modules/.bin` or `npx --no-install`) | `--coverage --coverageReporters=lcov` | setup file via `--setupFilesAfterEnv` that `jest.mock`s the module path |
+| `vitest` | `package.json` with `vitest`, `vitest.config.*` | `vitest run <file> -t '^<name>$'` | `vitest`; `@vitest/coverage-v8` or `-istanbul` for reach | `--coverage.enabled --coverage.reporter=lcov` | temporary config that extends the project's with a `setupFiles` entry whose `vi.mock` replaces the export |
+| `mocha` | `package.json` with `mocha`, `.mocharc.*` | `mocha <file> -g '^<name>$'` | `mocha`; `c8` or `nyc` for reach | `c8 --reporter=lcov` (else `nyc`) | `--require` file that patches the CommonJS export object in place |
+| `go` | `go.mod` (root or one level down) | `go test -run '^<Test>$' <pkg>` (`pkg::TestName` selects the package) | `go` | `-coverprofile` + `-coverpkg=./...`, converted to LCOV | source mutation, `go build ./...` check |
+| `cargo` | `Cargo.toml` | `cargo test <path> -- --exact` | `cargo`; `cargo-llvm-cov` for reach | `cargo llvm-cov test --lcov` | source mutation, `cargo check --tests` |
+| `maven` | `pom.xml` | `-Dtest=Class#method` (`Class::method`) | `mvn` | JaCoCo (`jacoco-maven-plugin` must be in the pom) → `target/site/jacoco/jacoco.xml` | source mutation, `mvn -DskipTests compile` |
+| `gradle` | `build.gradle`, `build.gradle.kts` | `test --tests Class.method` | `gradle` or `./gradlew` | JaCoCo (`jacoco` plugin applied, XML report enabled) | source mutation, `compileJava` / `compileKotlin` |
+| `dotnet` | `*.sln`, `*.csproj` | `dotnet test --filter FullyQualifiedName~Class.Method` | `dotnet` | `--collect "XPlat Code Coverage"` (coverlet, Cobertura) | source mutation, `dotnet build` |
+| `rspec` | `.rspec`, or `Gemfile` + `spec/` | `rspec <file> -e <name>` (`bundle exec` with a Gemfile) | `rspec`; `simplecov` for reach | SimpleCov `.resultset.json`, converted to LCOV | not supported (recorded as `error`) |
+| `phpunit` | `phpunit.xml*` | `phpunit --filter <name> <file>` | `phpunit` (`vendor/bin` first); xdebug or pcov for reach | `--coverage-clover`, converted to LCOV | not supported (recorded as `error`) |
+| `command` | `--run-cmd` given | the command with `{test}` substituted; exit 0 passed, 1 failed, anything else `error` (wrap a harness so a failing test exits 1: `... || exit 1`) | whatever the command needs | `--coverage-cmd` (defaults to `--run-cmd`) then `--coverage-file <report>`: LCOV, Cobertura, JaCoCo or coverage.py JSON | source mutation in any language below |
+
+**Source mutation.** For Go, Rust, Java, Kotlin, C, C++, C#, Swift, Verilog, SystemVerilog and VHDL the mechanism is disabled by rewriting its definition in place for the duration of the one run: a function or method body becomes one that aborts (`panic`, `panic!`, `throw`, `abort()` with `#include <stdlib.h>` added when missing, `fatalError`); a class, struct or `impl` has every method body replaced; a Verilog `module` becomes a stub with the same ANSI header whose outputs are driven to `x` (a non-ANSI port list is refused with the reason); a `function` / `task` body becomes `$fatal`; a labelled `always` / `initial` block, a `property` or `sequence` (with every assertion that instantiates it) or a labelled `assert` is removed; a VHDL `architecture` body is emptied, a labelled `process` removed, a `function` / `procedure` body replaced by `assert false ... severity failure`. Name the kind when a bare name would be ambiguous: `rtl/alu.sv::module:alu`, `rtl/fsm.sv::always:seq_logic`, `rtl/alu.sv::assert:a_no_overflow`, `rtl/top.vhd::process:p_clk`. Three invariants hold for every mutation: the file must be committed with no uncommitted changes (otherwise the pair is `error`, so a run can never leave a change behind the tree did not already have); the mutated tree is compile- or lint-checked before the test runs (`go build`, `cargo check`, `mvn compile` / `gradle compileJava` / `javac`, `kotlinc`, `cc -fsyntax-only`, `dotnet build`, `swift build` / `swiftc -typecheck`, `verilator --lint-only` / `slang --lint-only` / `iverilog -t null`, `ghdl -a` / `nvc -a`, whichever is present), and a failing check is `error` with the tool's output as the reason, never `failed`; and the original bytes are written back afterwards and verified by hash, whatever happened in between.
+
+**Examples.**
+
+```bash
+# Go: go test -run selects the test; go build checks the mutated tree; reach through -coverprofile
+mipiti-verify attest-dependence --pair 'internal/auth::TestRequiresToken=internal/auth/guard.go::RequireToken'
+mipiti-verify attest-reach      --pair 'internal/auth::TestRequiresToken=internal/auth/guard.go::RequireToken'
+
+# jest: file::test name; the export is mocked for the run
+mipiti-verify attest-dependence --pair 'src/auth.test.ts::rejects a missing token=src/auth.ts::requireToken'
+mipiti-verify attest-reach      --pair 'src/auth.test.ts::rejects a missing token=src/auth.ts::Auth.check'
+
+# cocotb driven by a Makefile: the command runner, the RTL mutated and linted with whichever of verilator / slang / iverilog is installed
+mipiti-verify attest-dependence --run-cmd 'make -C sim sim TESTCASE={test}' \
+  --pair 'test_alu_overflow=rtl/alu.sv::module:alu'
+
+# Verilator harness: coverage written by the run and converted to LCOV, then read for the one test
+mipiti-verify attest-reach --run-cmd 'make -C sim run TEST={test}' \
+  --coverage-cmd 'make -C sim run TEST={test} COVERAGE=1 && verilator_coverage --write-info sim/coverage.info sim/coverage.dat' \
+  --coverage-file sim/coverage.info \
+  --pair 'test_alu_overflow=rtl/alu.sv::always:alu_ff'
+```
+
 ### Action Inputs
 
 | Input | Required | Default | Description |
@@ -395,7 +446,12 @@ Coverage formats accepted by `--coverage`: coverage.py JSON (`coverage json`; wi
 | `attestation-env` | No | `""` | Environment variable names the attestation records |
 | `attestation-signing-key` | No | `""` | ECDSA P-256 key (PEM) to sign attestations on CI without a workload identity |
 | `coverage-report` | No | `""` | coverage.py JSON export with contexts, relative to `project-root`; passed to `attest-tests --coverage` so each test records what it reached |
-| `dependence-pairs` | No | `""` | Space-separated `test=file::symbol` pairs. When set, the action runs `attest-dependence` before verifying. **Runs those tests** with the mechanism disabled; opt-in |
+| `dependence-pairs` | No | `""` | Space-separated `test=file::symbol` pairs. When set, the action runs `attest-dependence` before verifying. **Runs those tests** with the mechanism disabled through the project's runner; opt-in |
+| `reach-pairs` | No | `""` | Space-separated `test=file::symbol` pairs. When set, the action runs `attest-reach` before verifying: each test alone under coverage. **Runs those tests**; opt-in |
+| `runner` | No | `""` | Runner adapter for the two inputs above (`pytest`, `jest`, `vitest`, `mocha`, `go`, `cargo`, `maven`, `gradle`, `dotnet`, `rspec`, `phpunit`, `command`); default detected from the project's files |
+| `run-cmd` | No | `""` | Command that runs one test (`{test}` substituted) for the `command` runner; setting it selects that runner |
+| `coverage-cmd` | No | `""` | Command that runs one test under coverage for the `command` runner (defaults to `run-cmd`) |
+| `coverage-file` | No | `""` | Report the coverage command writes, relative to `project-root`, for the `command` runner |
 
 ### Action Output
 

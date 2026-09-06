@@ -55,24 +55,50 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
   done
 fi
 
-# Dependence is the one opt-in step that runs tests: each named test once,
-# with its mechanism disabled, in this job. Nothing below this block executes
+# Dependence and reach are the two opt-in steps that run tests: each named
+# test once, with its mechanism disabled (dependence) or alone under
+# coverage (reach), in this job. Nothing below these blocks executes
 # project code.
-if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
-  DEP_ARGS=("attest-dependence" "--project-root" "$INPUT_PROJECT_ROOT")
-  for pair in $INPUT_DEPENDENCE_PAIRS; do
-    DEP_ARGS+=("--pair" "$pair")
-  done
+run_options() {
+  if [ -n "${INPUT_RUNNER:-}" ]; then
+    RUN_ARGS+=("--runner" "$INPUT_RUNNER")
+  fi
+  if [ -n "${INPUT_RUN_CMD:-}" ]; then
+    RUN_ARGS+=("--run-cmd" "$INPUT_RUN_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_CMD:-}" ]; then
+    RUN_ARGS+=("--coverage-cmd" "$INPUT_COVERAGE_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_FILE:-}" ]; then
+    RUN_ARGS+=("--coverage-file" "$INPUT_COVERAGE_FILE")
+  fi
   if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
-    DEP_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+    RUN_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
   fi
   if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
-    DEP_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+    RUN_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
   fi
   if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
-    DEP_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+    RUN_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
   fi
-  mipiti-verify "${DEP_ARGS[@]}"
+}
+
+if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-dependence" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_DEPENDENCE_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
+fi
+
+if [ -n "${INPUT_REACH_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-reach" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_REACH_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
 fi
 
 ARGS=("run")
