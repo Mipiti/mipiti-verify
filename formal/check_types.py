@@ -104,7 +104,6 @@ OPTIONAL_READ_ALLOWANCE: dict[str, dict[str, str]] = {
     },
     "test_attested": {
         "pattern": "accepted alias for 'test' from the earlier test-file form",
-        "mechanism": "optional '<file>::<symbol>' reference that the reach and dependence facts are computed against",
     },
 }
 

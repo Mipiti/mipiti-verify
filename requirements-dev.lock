@@ -737,9 +737,9 @@ mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
     # via markdown-it-py
-mipiti-mcp==0.74.0 \
-    --hash=sha256:4cb9f0bf5eae46515857cf7e4538e6ddf5c0de65a889b006d79e927fcb1a99ea \
-    --hash=sha256:d3ae8d93376ec37538b816ebe8c7ecf322b409286c29d8d93ed835bcf2ab4dbf
+mipiti-mcp==0.75.0 \
+    --hash=sha256:39a1dd45422f8bc499090956937cb60c4dc8b9ccc0bdea55c422ef47211aab27 \
+    --hash=sha256:7162447b72263187b446417d9420d54daa60c469e3303e36820ca2ba6a2ec0d4
     # via mipiti-verify (pyproject.toml)
 more-itertools==11.1.0 \
     --hash=sha256:48e8f4d9e7e5878571ecf6f2b4e57634f93cd474cc8cfbd2376f2d11b396e30d \
