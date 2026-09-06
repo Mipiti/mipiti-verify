@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `MIPITI_ATTESTATION_DIR` names where attestations are written and read
+  (default `.mipiti/attestations` under the project root). The action sets
+  it to a directory of its own when the checkout is not writable by the
+  container's user, so no `chmod` of the workspace is needed.
 - `formal/check_adapters.py` without the parser extra: the properties that
   need a parser (mutation confinement, the drive for the compile and
   clean-tree gates, the parser-versus-fallback comparison) are reported

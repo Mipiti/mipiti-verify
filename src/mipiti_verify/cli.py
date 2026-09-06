@@ -426,7 +426,7 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     from pathlib import Path as _Path
 
     from .attestation import (
-        ATTESTATION_DIR, AttestationError, build_statement, collect_environment,
+        AttestationError, attestation_dir, build_statement, collect_environment,
         head_commit, locate_test_definitions, merge_coverage, parse_junit,
         sign_statement,
     )
@@ -484,7 +484,7 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
         trust_config_path=sigstore_trust_config,
     )
 
-    out_dir = root / ATTESTATION_DIR
+    out_dir = attestation_dir(root)
     out_dir.mkdir(parents=True, exist_ok=True)
     # Keyed on the report as well as the commit: several suites in one run
     # share a commit, and keying on the commit alone let each overwrite the
@@ -653,7 +653,7 @@ def _write_run_attestation(root, statement, *, suffix: str, model_id, key_path,
                            key_passphrase, sigstore_tuf_url, sigstore_trust_config):
     import re as _re
 
-    from .attestation import ATTESTATION_DIR, sign_statement
+    from .attestation import attestation_dir, sign_statement
     from .runner import _auto_detect_oidc
 
     attestation, provenance = sign_statement(
@@ -664,7 +664,7 @@ def _write_run_attestation(root, statement, *, suffix: str, model_id, key_path,
         tuf_url=sigstore_tuf_url,
         trust_config_path=sigstore_trust_config,
     )
-    out_dir = root / ATTESTATION_DIR
+    out_dir = attestation_dir(root)
     out_dir.mkdir(parents=True, exist_ok=True)
     slug = _re.sub(r"[^A-Za-z0-9._-]", "-", model_id or "pairs")[:48]
     commit = statement["predicate"]["commit"]

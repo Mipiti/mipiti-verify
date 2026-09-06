@@ -29,6 +29,23 @@ PAYLOAD_TYPE = "application/vnd.in-toto+json"
 # root. A convention rather than a parameter so an assertion never has to name
 # a path, and so a repository can carry several suites' attestations at once.
 ATTESTATION_DIR = ".mipiti/attestations"
+ATTESTATION_DIR_ENV = "MIPITI_ATTESTATION_DIR"
+
+
+def attestation_dir(project_root: Path) -> Path:
+    """Where attestations are written and read for ``project_root``.
+
+    ``.mipiti/attestations`` under the project root, unless
+    ``MIPITI_ATTESTATION_DIR`` names another directory (absolute, or relative
+    to the project root). The action sets it when the checkout is not
+    writable by the container's user, which is the common shape of a
+    container action: the workspace belongs to the runner's uid.
+    """
+    override = os.environ.get(ATTESTATION_DIR_ENV, "").strip()
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.is_absolute() else project_root / candidate
+    return project_root / ATTESTATION_DIR
 
 # Provenance classes, strongest first. The artifact is identical across CI
 # providers; only the signing identity differs, which is the axis the platform
@@ -843,7 +860,7 @@ def load_attestations(project_root: Path) -> list[str]:
     verifier treats it as a failure with a wiring pointer; it never falls back
     to running anything.
     """
-    directory = project_root / ATTESTATION_DIR
+    directory = attestation_dir(project_root)
     if not directory.is_dir():
         return []
     out = []

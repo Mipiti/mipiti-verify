@@ -8,6 +8,19 @@ set -euo pipefail
 # writable home so the cache (and any HOME-based state) works.
 export HOME=/home/verifier
 
+# Attestations are written under the project root by default. The checkout
+# belongs to the runner's uid, which the `verifier` user often cannot write
+# to; when that directory cannot be created, write and read attestations
+# from the container's own home instead. Both the attest and the verify
+# step of one job read the same variable, so nothing else needs to change.
+if [ -z "${MIPITI_ATTESTATION_DIR:-}" ]; then
+  if ! mkdir -p "${INPUT_PROJECT_ROOT:-.}/.mipiti/attestations" 2>/dev/null; then
+    export MIPITI_ATTESTATION_DIR=/home/verifier/attestations
+    mkdir -p "$MIPITI_ATTESTATION_DIR"
+    echo "::notice::.mipiti/attestations is not writable in this checkout; attestations are kept in $MIPITI_ATTESTATION_DIR for this job"
+  fi
+fi
+
 # A test result becomes evidence by being recorded from the report your own
 # test step produced. Done here so using the action is a single step: the
 # alternative would be installing the CLI separately just to run one command.
