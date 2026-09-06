@@ -669,12 +669,21 @@ def _echo_provenance(provenance: str) -> None:
 
 @main.command(name="attest-dependence")
 @_attest_run_options
+@click.option("--suite-cmd", default="", envvar="MIPITI_SUITE_CMD",
+              help=("Suite mode: a command that runs the whole suite and writes a JUnit "
+                    "report, for harnesses that cannot select one test (simulators, "
+                    "Makefiles). Run once per distinct mechanism with that mechanism "
+                    "disabled; each nominated test takes its outcome from the report. "
+                    "Needs --suite-junit. Works with any --runner (the runner supplies "
+                    "the disable strategy, the command runs the tests)."))
+@click.option("--suite-junit", default="", envvar="MIPITI_SUITE_JUNIT",
+              help="Suite mode: the JUnit report --suite-cmd writes, relative to the project root")
 def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | None,
                       base_url: str | None, repo: str, project_root: str,
                       commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
                       coverage_file: str, timeout: int, total_timeout: int,
                       key_path: str, key_passphrase: str, sigstore_tuf_url: str,
-                      sigstore_trust_config: str) -> None:
+                      sigstore_trust_config: str, suite_cmd: str, suite_junit: str) -> None:
     """Record whether each test fails once its mechanism is disabled.
 
     THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
@@ -702,6 +711,14 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     (connections, threads, global state) runs them then. Nominate mechanisms
     that live in modules that are safe to import.
 
+    Suite mode (--suite-cmd "<command>" --suite-junit <report>) is for a
+    harness that runs everything at once: pairs are grouped by mechanism,
+    each mechanism is disabled in turn (same gate, same restore), the suite
+    command runs once and the JUnit report it wrote gives every nominated
+    test its outcome. A test the report skipped or lacks records 'error'
+    with the reason. --timeout then applies per suite run and
+    --total-timeout across mechanisms.
+
     Two clocks bound the run: --timeout per pair and --total-timeout for the
     whole command. A pair that would start after the total budget is spent is
     recorded as not run, so the attestation still names every pair.
@@ -709,7 +726,11 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     from pathlib import Path as _Path
 
     from .attestation import AttestationError, build_statement
-    from .dependence import run_dependence
+    from .dependence import run_dependence, run_suite_dependence
+
+    if bool(suite_cmd.strip()) != bool(suite_junit.strip()):
+        click.echo("Error: --suite-cmd and --suite-junit go together.", err=True)
+        raise SystemExit(1)
 
     root = _Path(project_root)
     pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
@@ -719,13 +740,24 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     def _progress(test: str, mechanism: str, status: str) -> None:
         click.echo(f"  {test} without {mechanism}: {status}")
 
-    click.echo(
-        f"Running {len(pairs)} pair(s) with the mechanism disabled through the "
-        f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
     try:
-        summary = run_dependence(
-            root, pairs, timeout=timeout, total_timeout=total_timeout,
-            progress=_progress, adapter=adapter)
+        if suite_cmd.strip():
+            from .dependence import group_by_mechanism
+
+            click.echo(
+                f"Running the suite once per mechanism ({len(group_by_mechanism(pairs))} "
+                f"mechanism(s), {len(pairs)} pair(s)) with the mechanism disabled through "
+                f"the {adapter.name} runner (up to {timeout}s per run, {total_timeout}s in all)...")
+            summary = run_suite_dependence(
+                root, pairs, suite_cmd=suite_cmd, suite_junit=suite_junit, adapter=adapter,
+                timeout=timeout, total_timeout=total_timeout, progress=_progress)
+        else:
+            click.echo(
+                f"Running {len(pairs)} pair(s) with the mechanism disabled through the "
+                f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_dependence(
+                root, pairs, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress, adapter=adapter)
     except AttestationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
@@ -740,7 +772,8 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     statement = build_statement(
         commit=resolved_commit,
         summary=summary,
-        invocation=["mipiti-verify", "attest-dependence", "--runner", adapter.name],
+        invocation=["mipiti-verify", "attest-dependence", "--runner", adapter.name]
+        + (["--suite"] if suite_cmd.strip() else []),
         selected_pattern="",
         kind="dependence",
     )

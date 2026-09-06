@@ -88,7 +88,7 @@ mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=a
 mipiti-verify attest-reach --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
 ```
 
-`attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` and `attest-reach` are the two opt-in commands that **run tests**: each named test once, with its mechanism disabled (does the test fail without it?) or alone under coverage (which lines of the mechanism's file does it execute?). Both go through the project's runner adapter (pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit, or a `--run-cmd` for simulators) and belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested) and [Runners](#runners).
+`attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` and `attest-reach` are the two opt-in commands that **run tests**: each named test once, with its mechanism disabled (does the test fail without it?) or alone under coverage (which lines of the mechanism's file does it execute?). Both go through the project's runner adapter (pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit, or a `--run-cmd` for simulators; `--suite-cmd` + `--suite-junit` for a harness that runs everything at once) and belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested) and [Runners](#runners).
 
 ## Audit Envelope Contract
 
@@ -400,6 +400,16 @@ Coverage formats accepted by `--coverage`: coverage.py JSON (`coverage json`; wi
 
 **Source mutation.** For Go, Rust, Java, Kotlin, C, C++, C#, Swift, Verilog, SystemVerilog and VHDL the mechanism is disabled by rewriting its definition in place for the duration of the one run: a function or method body becomes one that aborts (`panic`, `panic!`, `throw`, `abort()` with `#include <stdlib.h>` added when missing, `fatalError`); a class, struct or `impl` has every method body replaced; a Verilog `module` becomes a stub with the same ANSI header whose outputs are driven to `x` (a non-ANSI port list is refused with the reason); a `function` / `task` body becomes `$fatal`; a labelled `always` / `initial` block, a `property` or `sequence` (with every assertion that instantiates it) or a labelled `assert` is removed; a VHDL `architecture` body is emptied, a labelled `process` removed, a `function` / `procedure` body replaced by `assert false ... severity failure`. Name the kind when a bare name would be ambiguous: `rtl/alu.sv::module:alu`, `rtl/fsm.sv::always:seq_logic`, `rtl/alu.sv::assert:a_no_overflow`, `rtl/top.vhd::process:p_clk`. Three invariants hold for every mutation: the file must be committed with no uncommitted changes (otherwise the pair is `error`, so a run can never leave a change behind the tree did not already have); the mutated tree is compile- or lint-checked before the test runs (`go build`, `cargo check`, `mvn compile` / `gradle compileJava` / `javac`, `kotlinc`, `cc -fsyntax-only`, `dotnet build`, `swift build` / `swiftc -typecheck`, `verilator --lint-only` / `slang --lint-only` / `iverilog -t null`, `ghdl -a` / `nvc -a`, whichever is present), and a failing check is `error` with the tool's output as the reason, never `failed`; and the original bytes are written back afterwards and verified by hash, whatever happened in between.
 
+**Suite mode: dependence from a whole-suite run.** A simulator or a Makefile harness often has no way to run one test, and its pass/fail is a JUnit report rather than an exit status. `attest-dependence --suite-cmd "<command>" --suite-junit <report>` covers that route with any runner (the runner supplies the disable strategy; the command runs the tests): pairs are grouped by mechanism, and for each distinct mechanism the mechanism is disabled (same compile/lint gate, same byte-exact restore), the suite command runs once, and the report it wrote gives every nominated test naming that mechanism its outcome: `passed`, `failed`, or `error` from the report as they are (an errored test did not pass, so it counts as dependence); a test the report skipped is `error` with reason `skipped under mutation`; a test absent from the report is `error` with reason `not in report`; a command that wrote no report is `error` with reason `no report` for every pair on that mechanism, as is a failed gate. `--timeout` applies per suite run and `--total-timeout` across mechanisms; a mechanism that would start after the budget records its pairs as not run. The result is the same `kind: "dependence"` attestation, so verification reads it unchanged. A stale report is removed before each run so an old one can never be read as this run's.
+
+```bash
+# Verilator or Icarus harness whose Makefile runs every testbench and writes JUnit:
+# one make per mechanism, the RTL mutated and linted first
+mipiti-verify attest-dependence --suite-cmd "make sim JUNIT=out.xml" --suite-junit out.xml \
+  --pair 'tb_alu_overflow=rtl/alu.sv::module:alu' \
+  --pair 'tb_fsm_reset=rtl/fsm.sv::always:seq_logic'
+```
+
 **Examples.**
 
 ```bash
@@ -452,6 +462,8 @@ mipiti-verify attest-reach --run-cmd 'make -C sim run TEST={test}' \
 | `run-cmd` | No | `""` | Command that runs one test (`{test}` substituted) for the `command` runner; setting it selects that runner |
 | `coverage-cmd` | No | `""` | Command that runs one test under coverage for the `command` runner (defaults to `run-cmd`) |
 | `coverage-file` | No | `""` | Report the coverage command writes, relative to `project-root`, for the `command` runner |
+| `suite-cmd` | No | `""` | Suite mode for `dependence-pairs`: command that runs the whole suite and writes a JUnit report; run once per mechanism with it disabled. Needs `suite-junit` |
+| `suite-junit` | No | `""` | The JUnit report `suite-cmd` writes, relative to `project-root` |
 
 ### Action Output
 

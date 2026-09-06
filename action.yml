@@ -108,6 +108,14 @@ inputs:
     description: "For the 'command' runner with reach-pairs: the report the coverage command writes, relative to project-root (LCOV, Cobertura, JaCoCo or coverage.py JSON)."
     required: false
     default: ""
+  suite-cmd:
+    description: "Suite mode for dependence-pairs: a command that runs the whole suite and writes a JUnit report, for harnesses that cannot select one test. Run once per distinct mechanism with that mechanism disabled; each nominated test takes its outcome from the report. Needs suite-junit."
+    required: false
+    default: ""
+  suite-junit:
+    description: "Suite mode for dependence-pairs: the JUnit report suite-cmd writes, relative to project-root."
+    required: false
+    default: ""
 
 outputs:
   content-hash:
@@ -143,3 +151,5 @@ runs:
     INPUT_RUN_CMD: ${{ inputs.run-cmd }}
     INPUT_COVERAGE_CMD: ${{ inputs.coverage-cmd }}
     INPUT_COVERAGE_FILE: ${{ inputs.coverage-file }}
+    INPUT_SUITE_CMD: ${{ inputs.suite-cmd }}
+    INPUT_SUITE_JUNIT: ${{ inputs.suite-junit }}

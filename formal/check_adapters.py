@@ -32,7 +32,9 @@ code, driven through the same entry point the command uses:
   A7  outcome mapping is total and closed: for every adapter and every
       exit status in a representative set, the outcome is one of
       ``passed`` / ``failed`` / ``error``, and it is the one the adapter's
-      documented table gives
+      documented table gives; and in suite mode, every JUnit status a
+      report can carry (passed, failed, error, skipped) and a test absent
+      from the report map to the documented outcome and reason
 
 Fixture sources are the ones the unit tests use, imported from them, so
 there is one set of representative programs.
@@ -624,9 +626,32 @@ PASS_NEEDS_EVIDENCE = frozenset({"mocha"})
 FAIL_NEEDS_FAIL_EVIDENCE = frozenset({"mocha"})
 
 
+# Suite mode: the outcome a nominated test takes from the suite's JUnit
+# report. A skipped or absent test produced no outcome, so it is ``error``
+# with a reason (unknown to the verifier); an errored test did not pass.
+JUNIT_OUTCOME_TABLE: dict = {
+    "passed": (OUTCOME_PASSED, ""),
+    "failed": (OUTCOME_FAILED, ""),
+    "error": (OUTCOME_ERROR, ""),
+    "skipped": (OUTCOME_ERROR, "skipped under mutation"),
+    None: (OUTCOME_ERROR, "not in report"),
+    "": (OUTCOME_ERROR, "not in report"),
+    "unknown-status": (OUTCOME_ERROR, "not in report"),
+}
+
+
 def check_a7() -> Tuple[int, List[str]]:
+    from mipiti_verify.dependence import suite_outcome
+
     violations: List[str] = []
     checked = 0
+    for status, expected in JUNIT_OUTCOME_TABLE.items():
+        checked += 1
+        got = suite_outcome(status)
+        if got[0] not in OUTCOMES:
+            violations.append(f"A7: suite status {status!r} -> {got[0]!r}, outside {sorted(OUTCOMES)}")
+        elif got != expected:
+            violations.append(f"A7: suite status {status!r} -> {got!r}, documented {expected!r}")
     root = Path(tempfile.mkdtemp(prefix="mipiti-formal-a7-"))
     try:
         names = {cls.name: cls for cls in _all_adapters()}

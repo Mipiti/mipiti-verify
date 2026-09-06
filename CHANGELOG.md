@@ -124,6 +124,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are.
 - Action inputs `reach-pairs`, `runner`, `run-cmd`, `coverage-cmd` and
   `coverage-file`; `dependence-pairs` is no longer Python-only.
+- `attest-dependence --suite-cmd "<command>" --suite-junit <report>`:
+  dependence from a whole-suite run, for simulators and any harness that
+  cannot select one test. Pairs are grouped by mechanism; each mechanism is
+  disabled in turn through the runner's strategy (same compile/lint gate,
+  same byte-exact restore), the suite command runs once, and the JUnit
+  report it wrote gives every nominated test its outcome. A skipped test
+  records `error` with reason `skipped under mutation`, an absent one
+  `not in report`, a run that wrote no report `no report`, and a failed
+  gate its reason, for every pair on that mechanism. `--timeout` applies
+  per suite run and `--total-timeout` across mechanisms. Same
+  `kind: "dependence"` attestation. Action inputs `suite-cmd` and
+  `suite-junit`. The pytest disable plugin also loads through
+  `PYTEST_PLUGINS`, so a pytest suite command needs no extra flag.
 - `attest-dependence --total-timeout` (default 1800s, also
   `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would
   start after the budget is spent is recorded as not run, with a `reason`,

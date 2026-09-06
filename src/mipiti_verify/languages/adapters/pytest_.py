@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,7 @@ from ._common import (
 
 ENV_MECHANISM = "MIPITI_DISABLE_MECHANISM"
 ENV_MARKER = "MIPITI_DISABLE_MARKER"
+ENV_PLUGINS = "PYTEST_PLUGINS"
 PLUGIN = "mipiti_verify._disable_plugin"
 
 _MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "conftest.py")
@@ -66,7 +68,10 @@ class PytestAdapter(RunnerAdapter):
         env = dict(env or {})
         argv = [sys.executable, "-m", "pytest", "-q"]
         if env.get(ENV_MECHANISM):
+            # The plugin goes on the command line here; the environment
+            # route exists for a suite command this adapter does not build.
             argv += ["-p", PLUGIN]
+            env.pop(ENV_PLUGINS, None)
         argv += test_selector(test_id)
         outcome = self._execute(argv, env=env, timeout=timeout)
         marker = env.get(ENV_MARKER)
@@ -119,8 +124,13 @@ class PytestAdapter(RunnerAdapter):
             return
         with temp_dir("mipiti-dep-") as tmp:
             marker = Path(tmp) / "marker"
+            # PYTEST_PLUGINS loads the plugin into any pytest the run starts,
+            # which is how a whole-suite command (``--suite-cmd``) gets it
+            # without the command naming it.
+            plugins = os.environ.get(ENV_PLUGINS, "")
+            plugins = f"{plugins},{PLUGIN}" if plugins and PLUGIN not in plugins.split(",") else (plugins or PLUGIN)
             yield DisableHandle(
                 env={ENV_MECHANISM: mech.spec if not mech.kind else f"{mech.file}::{mech.name}",
-                     ENV_MARKER: str(marker)},
+                     ENV_MARKER: str(marker), ENV_PLUGINS: plugins},
                 marker=marker,
             )

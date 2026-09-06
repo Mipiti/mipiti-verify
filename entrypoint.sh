@@ -88,6 +88,12 @@ if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
   for pair in $INPUT_DEPENDENCE_PAIRS; do
     RUN_ARGS+=("--pair" "$pair")
   done
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
+  if [ -n "${INPUT_SUITE_JUNIT:-}" ]; then
+    RUN_ARGS+=("--suite-junit" "$INPUT_SUITE_JUNIT")
+  fi
   run_options
   mipiti-verify "${RUN_ARGS[@]}"
 fi

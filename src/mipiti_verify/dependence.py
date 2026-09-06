@@ -16,6 +16,7 @@ unknown, never as either outcome.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from .languages.adapters import (
     OUTCOME_ERROR, OUTCOME_FAILED, OUTCOME_PASSED, AdapterError, DisableError,
     RunnerAdapter, detect_adapter, language_of,
 )
+from .languages.adapters._common import run_command
 
 PAIR_TIMEOUT_SECONDS = 300
 # Budget for the whole run, across pairs. Pairs that would start after it is
@@ -33,12 +35,18 @@ PAIR_TIMEOUT_SECONDS = 300
 # that was asked for and a reader can tell "not run" from "ran and errored".
 TOTAL_TIMEOUT_SECONDS = 1800
 REASON_BUDGET_EXHAUSTED = "not run: dependence budget exhausted"
+# Suite mode: the outcome comes from the report the whole-suite run wrote.
+REASON_SKIPPED = "skipped under mutation"
+REASON_NOT_IN_REPORT = "not in report"
+REASON_NO_REPORT = "no report"
+REASON_AMBIGUOUS = "names more than one test in the report"
 
 __all__ = [
     "OUTCOME_ERROR", "OUTCOME_FAILED", "OUTCOME_PASSED", "PAIR_TIMEOUT_SECONDS",
-    "REASON_BUDGET_EXHAUSTED", "TOTAL_TIMEOUT_SECONDS", "adapter_for",
+    "REASON_BUDGET_EXHAUSTED", "REASON_NOT_IN_REPORT", "REASON_NO_REPORT",
+    "REASON_SKIPPED", "TOTAL_TIMEOUT_SECONDS", "adapter_for", "group_by_mechanism",
     "outcome_of", "pairs_from_assertions", "parse_pair", "run_dependence",
-    "run_pair", "test_selector",
+    "run_pair", "run_suite_dependence", "suite_outcome", "test_selector",
 ]
 
 
@@ -238,3 +246,168 @@ def run_dependence(
         "runner": adapter.name,
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Suite mode: one whole-suite run per mechanism
+# ---------------------------------------------------------------------------
+
+def group_by_mechanism(pairs: list[tuple[str, str]]) -> list[tuple[str, list[str]]]:
+    """``[(mechanism, [tests...])]`` in first-seen order, tests deduplicated
+    per mechanism. One disable and one suite run serve every test that
+    names the same mechanism."""
+    order: list[str] = []
+    tests: dict[str, list[str]] = {}
+    for test, mechanism in pairs:
+        if mechanism not in tests:
+            order.append(mechanism)
+            tests[mechanism] = []
+        if test not in tests[mechanism]:
+            tests[mechanism].append(test)
+    return [(m, tests[m]) for m in order]
+
+
+def suite_outcome(report_status: Optional[str]) -> tuple[str, str]:
+    """``(outcome, reason)`` for a test's status in the suite's JUnit report.
+
+    ``passed`` and ``failed`` are what they say; ``error`` from the report is
+    the test not passing (an exception under the disabled mechanism), so it
+    carries no reason and reads as dependence. A ``skipped`` test produced no
+    outcome, and a test absent from the report was never run: both are
+    ``error`` with a reason, which the verifier reads as unknown.
+    """
+    if report_status == OUTCOME_PASSED:
+        return OUTCOME_PASSED, ""
+    if report_status == OUTCOME_FAILED:
+        return OUTCOME_FAILED, ""
+    if report_status == OUTCOME_ERROR:
+        return OUTCOME_ERROR, ""
+    if report_status == "skipped":
+        return OUTCOME_ERROR, REASON_SKIPPED
+    return OUTCOME_ERROR, REASON_NOT_IN_REPORT
+
+
+def _report_status(summary: dict, test: str) -> tuple[Optional[str], str]:
+    """The named test's status in a parsed report, or ``(None, reason)``."""
+    from .verifiers.tests import _names_test
+
+    matched = [t for t in summary.get("tests") or [] if _names_test(t, test)]
+    if not matched:
+        return None, REASON_NOT_IN_REPORT
+    if len(matched) > 1:
+        return None, REASON_AMBIGUOUS
+    return str(matched[0].get("status") or ""), ""
+
+
+def run_suite_dependence(
+    project_root: Path,
+    pairs: list[tuple[str, str]],
+    *,
+    suite_cmd: str,
+    suite_junit: str,
+    adapter: RunnerAdapter,
+    timeout: int = PAIR_TIMEOUT_SECONDS,
+    total_timeout: int = TOTAL_TIMEOUT_SECONDS,
+    runner: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+    progress: Optional[Callable[[str, str, str], None]] = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict:
+    """Dependence from whole-suite runs, for harnesses that cannot select
+    one test.
+
+    Pairs are grouped by mechanism. For each distinct mechanism the adapter
+    disables it (same gate, same restore as ``run_dependence``), the suite
+    command runs once with ``timeout``, and the JUnit report it wrote gives
+    every nominated test naming that mechanism its outcome
+    (``suite_outcome``). A gate failure, a run that could not happen, or a
+    missing report is ``error`` with the reason for every pair on that
+    mechanism. ``total_timeout`` is spent across mechanisms: a mechanism
+    that would start after it records every pair as not run. The result
+    has the shape ``run_dependence`` returns, so the attestation is the
+    same ``kind: "dependence"`` record.
+    """
+    if not pairs:
+        raise AttestationError("No (test, mechanism) pairs to run.")
+    if not suite_cmd.strip() or not suite_junit.strip():
+        raise AttestationError("Suite mode needs both --suite-cmd and --suite-junit.")
+    argv = shlex.split(suite_cmd)
+    report_path = project_root / suite_junit
+    tests: list[dict] = []
+    counts = {"passed": 0, "failed": 0, "errors": 0}
+    not_run = 0
+    started = clock()
+
+    def record(test: str, mechanism: str, status: str, reason: str = "") -> None:
+        counts["errors" if status == OUTCOME_ERROR else status] += 1
+        item = {"mechanism": mechanism, "status": status}
+        if reason:
+            item["reason"] = reason
+        tests.append({
+            "id": test, "name": test.rsplit("::", 1)[-1], "status": status,
+            "fails_without": [item],
+        })
+        if progress is not None:
+            progress(test, mechanism, f"{status} ({reason})" if reason else status)
+
+    for mechanism, names in group_by_mechanism(pairs):
+        if total_timeout > 0 and clock() - started >= total_timeout:
+            for test in names:
+                not_run += 1
+                record(test, mechanism, OUTCOME_ERROR, REASON_BUDGET_EXHAUSTED)
+            continue
+        try:
+            report_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            for test in names:
+                record(test, mechanism, OUTCOME_ERROR, f"cannot remove a stale report: {e}")
+            continue
+        try:
+            with adapter.disable(mechanism) as handle:
+                _code, _out, err, note = run_command(
+                    argv, cwd=project_root, env=handle.env, timeout=timeout, runner=runner)
+                failure = handle.failure_reason()
+        except (DisableError, AdapterError) as e:
+            for test in names:
+                record(test, mechanism, OUTCOME_ERROR, str(e))
+            continue
+        if note or failure:
+            for test in names:
+                record(test, mechanism, OUTCOME_ERROR, note or failure)
+            continue
+        if not report_path.is_file():
+            for test in names:
+                record(test, mechanism, OUTCOME_ERROR, REASON_NO_REPORT)
+            continue
+        try:
+            summary = parse_junit_report(report_path)
+        except AttestationError as e:
+            for test in names:
+                record(test, mechanism, OUTCOME_ERROR, str(e))
+            continue
+        for test in names:
+            status, reason = _report_status(summary, test)
+            if status is None:
+                record(test, mechanism, OUTCOME_ERROR, reason)
+                continue
+            outcome, reason = suite_outcome(status)
+            record(test, mechanism, outcome, reason)
+    return {
+        "totals": {
+            "total": len(tests),
+            "passed": counts["passed"],
+            "failed": counts["failed"],
+            "skipped": 0,
+            "errors": counts["errors"],
+        },
+        "tests": tests,
+        "not_run": not_run,
+        "runner": adapter.name,
+    }
+
+
+def parse_junit_report(path: Path) -> dict:
+    from .attestation import parse_junit
+
+    return parse_junit(path)
