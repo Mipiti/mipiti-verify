@@ -222,6 +222,14 @@
               }
             },
             "description": "Optional; present on dependence records (kind = \"dependence\"). One entry per mechanism the test was run without."
+          },
+          "mechanism": {
+            "type": "string",
+            "description": "Optional; on a reach record. The <file>::<symbol> the entry's coverage run was made for. A reach record entry is consulted for a test_attested assertion naming this mechanism (or naming none)."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Optional; on a reach record. Why the entry's coverage run produced no outcome (the run budget was exhausted, the coverage report could not be read). Present only when status is error; such an entry establishes nothing about reach."
           }
         }
       },

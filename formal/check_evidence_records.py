@@ -29,6 +29,13 @@ EVERY combination of the record states, through the real verifier:
       from the other records or stays unknown, and when it stays unknown
       with such a record present the verdict says so
       (``reach_scope == "suite"``)
+  R8  the enumeration exercises the whole schema: every field the
+      test-result schema declares (record-level optional fields, every
+      per-test field, every nested field) is carried by at least one
+      enumerated statement, and no enumerated statement carries a field the
+      schema does not declare. A schema addition without a matching axis
+      value, or an emitted field the schema has not caught up with, fails
+      the run
 
 The space is the product of eight axes. Every statement is built once per
 axis value and reused; the verifier reads them through its own loader,
@@ -41,6 +48,7 @@ Usage:
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import shutil
 import sys
@@ -57,6 +65,8 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 from mipiti_verify.attestation import build_statement, sign_statement  # noqa: E402
 from mipiti_verify.verifiers import get_verifier  # noqa: E402
 from mipiti_verify.verifiers import tests as tests_mod  # noqa: E402
+
+_SCHEMA = Path(_ROOT) / "schemas" / "test-result-v1.schema.json"
 
 COMMIT = "abc123def456abc123def456abc123def456abcd"
 OTHER_COMMIT = "f" * 40
@@ -120,15 +130,54 @@ DEFINITION = ("absent", "present")
 COVERAGE = ("absent", "reaches", "misses")
 REACH = ("absent", "same_reaching", "same_missing", "unnamed_reaching", "other_mechanism",
          "unrun_with_reason", "commit_differs")
-DEPENDENCE = ("absent", "fails_without_failed", "fails_without_passed", "other_mechanism",
-              "unrun_with_reason", "commit_differs")
+DEPENDENCE = ("absent", "fails_without_failed", "hook_fails_without_failed", "fails_without_passed",
+              "other_mechanism", "unrun_with_reason", "commit_differs")
 ASSERTION_MECHANISM = ("absent", "present")
 # A suite-scope reach record alongside: what the suite reached in the
 # mechanism's file, or a suite run that did not touch it.
 SUITE_REACH = ("absent", "suite_reaching", "suite_missing")
 
 
+# Every field path the enumeration emits, recorded as statements are built
+# (``tests[].reached[].lines``), for R8.
+EMITTED_PATHS: set = set()
+
+
+# Paths the schema declares as open maps (``additionalProperties``): their
+# keys are data, not fields, so nothing below them is a path on either side.
+OPEN_MAPS: set = set()
+
+
+def _record_paths(node: object, prefix: str, into: set) -> None:
+    if prefix in OPEN_MAPS:
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else key
+            into.add(path)
+            _record_paths(value, path, into)
+    elif isinstance(node, list):
+        for item in node:
+            _record_paths(item, prefix + "[]", into)
+
+
+def _schema_paths(schema: dict, prefix: str = "") -> set:
+    """Every declared field path, walked the same way the emitted ones are."""
+    out: set = set()
+    if schema.get("additionalProperties") not in (None, False) and not schema.get("properties"):
+        OPEN_MAPS.add(prefix)  # keys are data (``coverage``, ``environment``), not fields
+    for key, spec in (schema.get("properties") or {}).items():
+        path = f"{prefix}.{key}" if prefix else key
+        out.add(path)
+        out |= _schema_paths(spec, path)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        out |= _schema_paths(items, prefix + "[]")
+    return out
+
+
 def _envelope(statement: dict) -> str:
+    _record_paths(statement["predicate"], "", EMITTED_PATHS)
     envelope, provenance = sign_statement(statement)  # unsigned: nothing here could sign
     assert provenance == "unsigned"
     return envelope
@@ -146,6 +195,8 @@ def _test_result(state: str, commit: str, definition: str, coverage: str) -> str
         if definition == "present":
             entry["file"] = "tests/test_guard.py"
             entry["definition_sha256"] = DEFINITION_SHA
+            entry["definition_scope"] = "symbol"
+            entry["parser"] = "ast"
         if coverage == "reaches":
             entry["reached"] = REACHING
         elif coverage == "misses":
@@ -161,6 +212,12 @@ def _test_result(state: str, commit: str, definition: str, coverage: str) -> str
     statement = build_statement(
         commit=COMMIT if commit == "matches" else OTHER_COMMIT,
         summary=summary, invocation=["pytest", "-q"], selected_pattern="",
+        # Record-level facts the verdict does not turn on, carried so the
+        # enumeration exercises them: the run's nominated environment (the
+        # assertion names no ``env`` requirement) and the run's lines-per-path
+        # summary beside the per-test coverage it was derived from.
+        environment={"FEATURE_AUTH": "on"} if state == "passed" else None,
+        coverage={"app/guard.py": 2} if coverage != "absent" else None,
     )
     return _envelope(statement)
 
@@ -205,12 +262,28 @@ def _dependence(state: str) -> str | None:
     item: dict = {"mechanism": mechanism, "status": status}
     if state == "unrun_with_reason":
         item = {"mechanism": mechanism, "status": "error", "reason": "mutated tree does not compile"}
+    extra = None
+    if state == "hook_fails_without_failed":
+        # The same fact from a hook-instrumented build: the record names the
+        # strategy, where the tripwire sits, and the control run that showed
+        # the hooks answer to nothing when no mechanism is named.
+        item["hook_location"] = "app/guard.c:12"
+        extra = {
+            "strategy": "hook",
+            "control_run": {
+                "status": "passed", "mechanism": "<none>",
+                "tests": [{"id": f"tests.test_guard::{TEST}", "status": "passed"},
+                          {"id": f"tests.test_guard::{OTHER_TEST}", "status": "error",
+                           "reason": "not selected for the control run"}],
+            },
+        }
     entry = {"id": f"tests.test_guard::{TEST}", "name": TEST, "status": item["status"],
              "fails_without": [item]}
     counts = {"passed": int(item["status"] == "passed"), "failed": int(item["status"] == "failed"),
               "skipped": 0, "errors": int(item["status"] == "error")}
     summary = {"totals": {"total": 1, **counts}, "tests": [entry]}
-    return _envelope(build_statement(commit=commit, summary=summary, invocation=[], kind="dependence"))
+    return _envelope(build_statement(commit=commit, summary=summary, invocation=[], kind="dependence",
+                                     predicate_extra=extra))
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +311,7 @@ def _expected(tr: str, tr_commit: str, definition: str, coverage: str,
     else:  # absent, other mechanism, unrun (reason), commit differs
         reached = None
     # R4
-    if dependence == "fails_without_failed":
+    if dependence in ("fails_without_failed", "hook_fails_without_failed"):
         depends: object = True
     elif dependence == "fails_without_passed":
         depends = False
@@ -332,6 +405,20 @@ def check_records() -> Tuple[int, dict, List[str]]:
     return checked, per_property, violations
 
 
+def declared_paths() -> set:
+    return _schema_paths(json.loads(_SCHEMA.read_text(encoding="utf-8")))
+
+
+def check_schema_coverage(declared: set) -> Tuple[int, List[str]]:
+    """R8: emitted field paths and declared field paths are the same set."""
+    violations: List[str] = []
+    for path in sorted(declared - EMITTED_PATHS):
+        violations.append(f"R8: schema field {path!r} is never emitted by the enumeration; add an axis value for it")
+    for path in sorted(EMITTED_PATHS - declared):
+        violations.append(f"R8: emitted field {path!r} is not declared by the schema")
+    return len(declared | EMITTED_PATHS), violations
+
+
 def main() -> int:
     print("=" * 70)
     print("TEST EVIDENCE RECORDS")
@@ -342,7 +429,10 @@ def main() -> int:
           f"(8 axes: {len(TEST_RESULT)} x {len(TR_COMMIT)} x {len(DEFINITION)} x {len(COVERAGE)} "
           f"x {len(REACH)} x {len(SUITE_REACH)} x {len(DEPENDENCE)} x {len(ASSERTION_MECHANISM)})...\n")
     started = time.monotonic()
+    declared = declared_paths()  # also settles which maps are open, before any statement is built
     checked, per_property, violations = check_records()
+    schema_checked, schema_violations = check_schema_coverage(declared)
+    violations += schema_violations
     elapsed = time.monotonic() - started
 
     if violations:
@@ -360,6 +450,7 @@ def main() -> int:
     print(f"  R5 no mechanism named, no facts:                        {per_property['R5']} checks")
     print(f"  R6 an unrun entry never yields False:                   {per_property['R6']} checks")
     print(f"  R7 a suite-scope reach record never sets reached:       {per_property['R7']} checks")
+    print(f"  R8 every schema field emitted, every emitted field declared: {schema_checked} field paths")
     print(f"\n{'=' * 70}")
     print("ALL EVIDENCE RECORD PROPERTIES VERIFIED")
     print(f"  Combinations: {checked} (exhaustive over the 8 axes) in {elapsed:.2f}s")

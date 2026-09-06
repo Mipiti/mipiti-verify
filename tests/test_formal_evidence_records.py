@@ -23,4 +23,4 @@ def test_every_evidence_record_property_is_verified():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "ALL EVIDENCE RECORD PROPERTIES VERIFIED" in result.stdout, result.stdout
-    assert "Combinations: 15120 (exhaustive over the 8 axes)" in result.stdout, result.stdout
+    assert "Combinations: 17640 (exhaustive over the 8 axes)" in result.stdout, result.stdout
