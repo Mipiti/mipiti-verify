@@ -386,6 +386,12 @@ def main() -> None:
               help="Environment key whose value this run should record, e.g. --env FEATURE_AUTH. "
                    "Repeatable. Lets an assertion require that the run ran with a control switched on. "
                    "Credential-looking names are refused.")
+@click.option("--coverage", "coverage_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help=("coverage.py JSON export with contexts (from "
+                    "'coverage json --show-contexts' after a run with "
+                    "'--cov-context=test'); records, per test, the files and "
+                    "lines it reached"))
 @click.option("--pattern", default="", help="Selector the run used, recorded for the reader")
 @click.option("--invocation", default="", help="Command the run executed, recorded for the reader")
 @click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
@@ -398,7 +404,8 @@ def main() -> None:
               type=click.Path(exists=True, dir_okay=False),
               help="Pre-downloaded Sigstore ClientTrustConfig JSON, for air-gapped CI")
 def attest_tests(junit_path: str, project_root: str, commit: str,
-                 env_keys: tuple, pattern: str, invocation: str, key_path: str,
+                 env_keys: tuple, coverage_path: str | None, pattern: str,
+                 invocation: str, key_path: str,
                  key_passphrase: str, sigstore_tuf_url: str,
                  sigstore_trust_config: str) -> None:
     """Record that this CI job's tests ran, as a signed statement.
@@ -406,18 +413,22 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     Reads a report the test run already produced. It does not run tests; the
     workflow step that does is yours, and this command never invokes one.
 
+    Each recorded test carries the path and a hash of its definition as found
+    in the checkout, so the attestation is bound to the test as written. With
+    --coverage it also carries the files and lines the test reached.
+
     Write this into the job that runs the tests, after them:
 
         pytest --junitxml=report.xml
         mipiti-verify attest-tests --junit report.xml
     """
-    import json as _json
     import re as _re
     from pathlib import Path as _Path
 
     from .attestation import (
         ATTESTATION_DIR, AttestationError, build_statement, collect_environment,
-        head_commit, parse_junit, sign_statement,
+        head_commit, locate_test_definitions, merge_coverage, parse_junit,
+        sign_statement,
     )
     from .runner import _auto_detect_oidc
 
@@ -427,6 +438,16 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     except AttestationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
+
+    locate_test_definitions(root, summary["tests"])
+    if coverage_path:
+        # Any format the coverage readers know (coverage.py JSON, LCOV,
+        # Cobertura, JaCoCo) or a directory of one report per test.
+        try:
+            merge_coverage(summary, _Path(coverage_path), root)
+        except AttestationError as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
 
     resolved_commit = commit.strip() or head_commit(root)
     if not resolved_commit:
@@ -474,16 +495,484 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     out_path.write_text(attestation, encoding="utf-8")
 
     totals = statement["predicate"]["totals"]
+    located = sum(1 for t in summary["tests"] if t.get("definition_sha256"))
     click.echo(
         f"Attested {totals['total']} test(s) at {resolved_commit[:12]} "
         f"({totals['passed']} passed, {totals['failed']} failed, "
-        f"{totals['skipped']} skipped) -> {out_path}"
+        f"{totals['skipped']} skipped; {located} definition(s) located"
+        f"{'; coverage recorded' if coverage_path else ''}) -> {out_path}"
     )
     click.echo(f"Signing identity: {provenance}")
     if provenance == "unsigned":
         click.echo(
             "Note: no CI workload identity and no --signing-key, so this is "
             "recorded as self-declared evidence.", err=True)
+
+
+def _attest_run_options(command):
+    """Options ``attest-dependence`` and ``attest-reach`` share: how pairs
+    are named, which runner executes them, the two clocks, and signing."""
+    options = [
+        click.option("--pair", "pair_specs", multiple=True,
+                     help=("A test and the mechanism it should depend on, as "
+                           "<test>=<file>::<symbol> (repeatable). The test is named "
+                           "the way the runner selects it: a pytest node id, "
+                           "'file::name' for jest/vitest/mocha, 'TestName' or "
+                           "'pkg::TestName' for go, 'Class::method' for JVM and "
+                           ".NET runners, or whatever --run-cmd's {test} takes. The "
+                           "symbol is a function, 'Class.method' or 'kind:name' "
+                           "(module:, task:, always:, property:, assert:, "
+                           "architecture:, process:, ...).")),
+        click.option("--from-model", "model_id", default=None,
+                     help=("Take the pairs from this model's test_attested assertions "
+                           "that name a mechanism, fetched with the same credentials "
+                           "'run' uses (MIPITI_API_KEY / MIPITI_BASE_URL).")),
+        click.option("--api-key", envvar="MIPITI_API_KEY", default=None, help="Mipiti API key (with --from-model)"),
+        click.option("--base-url", envvar="MIPITI_BASE_URL", default=None, help="API base URL (with --from-model)"),
+        click.option("--repo", default="", help="Repository scope for --from-model (default: auto-detected)"),
+        click.option("--project-root", type=click.Path(exists=True), default=".",
+                     help="Checkout the tests run in (default: .)"),
+        click.option("--commit", default="", help="Commit the run covers (default: CI env or .git/HEAD)"),
+        click.option("--runner", "runner_name", default="", envvar="MIPITI_RUNNER",
+                     help=("Runner adapter: pytest, jest, vitest, mocha, go, cargo, maven, "
+                           "gradle, dotnet, rspec, phpunit or command. Default: detected "
+                           "from the project's files (go.mod, Cargo.toml, package.json, "
+                           "pom.xml, ...).")),
+        click.option("--run-cmd", default="", envvar="MIPITI_RUN_CMD",
+                     help=("Command that runs one test, with {test} substituted, for the "
+                           "'command' runner (simulators, Makefiles): exit 0 is passed, 1 "
+                           "failed, anything else error. Selects the command runner.")),
+        click.option("--coverage-cmd", default="", envvar="MIPITI_COVERAGE_CMD",
+                     help=("Command that runs one test under coverage ({test} substituted), "
+                           "for the command runner; defaults to --run-cmd.")),
+        click.option("--coverage-file", default="", envvar="MIPITI_COVERAGE_FILE",
+                     help=("Report the coverage command writes, relative to the project "
+                           "root (LCOV, Cobertura, JaCoCo or coverage.py JSON), for the "
+                           "command runner.")),
+        click.option("--strategy", type=click.Choice(["mutation", "hook"], case_sensitive=False),
+                     default="mutation", show_default=True, envvar="MIPITI_STRATEGY",
+                     help=("How a compiled mechanism is disabled. 'mutation' rewrites its "
+                           "body and recompiles per mechanism. 'hook' builds once with the "
+                           "customer's tripwires compiled in (go: -tags mipiti_hooks; cargo: "
+                           "--features mipiti_hooks; command: --build-cmd) and names the "
+                           "mechanism in MIPITI_DISABLE_MECHANISM per run; dependence is "
+                           "credited only with the location proof and after a passing "
+                           "control run. Refused for runtime-disabling runners (pytest, "
+                           "jest, vitest, mocha).")),
+        click.option("--build-cmd", default="", envvar="MIPITI_BUILD_CMD",
+                     help=("For the command runner under --strategy hook: the build with the "
+                           "hooks compiled in (e.g. 'make build CFLAGS=-DMIPITI_HOOKS', "
+                           "'make sim-build DEFINES=+define+MIPITI_HOOKS'), run once.")),
+        click.option("--timeout", default=300, type=int, show_default=True,
+                     help="Seconds allowed per pair"),
+        click.option("--total-timeout", default=1800, type=int, show_default=True,
+                     envvar="MIPITI_DEPENDENCE_TOTAL_TIMEOUT",
+                     help=("Seconds allowed for the whole run. Pairs that would start "
+                           "after the budget is spent are recorded as not run "
+                           "(status error, with a reason), never as an outcome")),
+        click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
+                     default="", help="ECDSA P-256 private key (PEM) for CI without a workload identity"),
+        click.option("--key-passphrase", envvar="MIPITI_ATTESTATION_KEY_PASSPHRASE",
+                     default="", help="Passphrase for --signing-key"),
+        click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL"),
+        click.option("--sigstore-trust-config", default=None,
+                     type=click.Path(exists=True, dir_okay=False),
+                     help="Pre-downloaded Sigstore ClientTrustConfig JSON"),
+    ]
+    for option in reversed(options):
+        command = option(command)
+    return command
+
+
+def _collect_pairs(pair_specs: tuple, model_id, api_key, base_url, repo, root) -> list:
+    from .attestation import AttestationError
+    from .dependence import pairs_from_assertions, parse_pair
+    from .runner import _auto_detect_repo
+
+    pairs: list[tuple[str, str]] = []
+    try:
+        for spec in pair_specs:
+            pairs.append(parse_pair(spec))
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    if model_id:
+        try:
+            client = MipitiClient(api_key=api_key, base_url=base_url)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
+        try:
+            payload = client.get_all_assertions(
+                model_id, repo=repo or _auto_detect_repo(root))
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"Error: could not fetch assertions for {model_id}: {e}", err=True)
+            raise SystemExit(1)
+        finally:
+            client.close()
+        for pair in pairs_from_assertions(payload):
+            if pair not in pairs:
+                pairs.append(pair)
+
+    if not pairs:
+        click.echo(
+            "Error: nothing to run. Pass --pair <test>=<file>::<symbol> or "
+            "--from-model <id> (whose test_attested assertions name a "
+            "mechanism).", err=True)
+        raise SystemExit(1)
+    return pairs
+
+
+def _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file, build_cmd=""):
+    from .dependence import adapter_for
+    from .languages.adapters import AdapterError
+
+    try:
+        return adapter_for(
+            root, pairs, runner_name=runner_name, run_cmd=run_cmd,
+            coverage_cmd=coverage_cmd, coverage_file=coverage_file, build_cmd=build_cmd)
+    except AdapterError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+
+def _resolved_commit(commit: str, root) -> str:
+    from .attestation import head_commit
+
+    resolved = commit.strip() or head_commit(root)
+    if not resolved:
+        click.echo(
+            "Error: could not determine the commit this run covers. Pass "
+            "--commit explicitly.", err=True)
+        raise SystemExit(1)
+    return resolved
+
+
+def _write_run_attestation(root, statement, *, suffix: str, model_id, key_path,
+                           key_passphrase, sigstore_tuf_url, sigstore_trust_config):
+    import re as _re
+
+    from .attestation import ATTESTATION_DIR, sign_statement
+    from .runner import _auto_detect_oidc
+
+    attestation, provenance = sign_statement(
+        statement,
+        identity_token=_auto_detect_oidc("sigstore"),
+        key_path=key_path,
+        key_passphrase=key_passphrase,
+        tuf_url=sigstore_tuf_url,
+        trust_config_path=sigstore_trust_config,
+    )
+    out_dir = root / ATTESTATION_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = _re.sub(r"[^A-Za-z0-9._-]", "-", model_id or "pairs")[:48]
+    commit = statement["predicate"]["commit"]
+    out_path = out_dir / f"tests-{commit[:12]}-{slug}-{suffix}.json"
+    out_path.write_text(attestation, encoding="utf-8")
+    return out_path, provenance
+
+
+def _echo_provenance(provenance: str) -> None:
+    click.echo(f"Signing identity: {provenance}")
+    if provenance == "unsigned":
+        click.echo(
+            "Note: no CI workload identity and no --signing-key, so this is "
+            "recorded as self-declared evidence.", err=True)
+
+
+@main.command(name="attest-dependence")
+@_attest_run_options
+@click.option("--suite-cmd", default="", envvar="MIPITI_SUITE_CMD",
+              help=("Suite mode: a command that runs the whole suite and writes a JUnit "
+                    "report, for harnesses that cannot select one test (simulators, "
+                    "Makefiles). Run once per distinct mechanism with that mechanism "
+                    "disabled; each nominated test takes its outcome from the report. "
+                    "Needs --suite-junit. Works with any --runner (the runner supplies "
+                    "the disable strategy, the command runs the tests)."))
+@click.option("--suite-junit", default="", envvar="MIPITI_SUITE_JUNIT",
+              help="Suite mode: the JUnit report --suite-cmd writes, relative to the project root")
+def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | None,
+                      base_url: str | None, repo: str, project_root: str,
+                      commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
+                      coverage_file: str, strategy: str, build_cmd: str, timeout: int,
+                      total_timeout: int, key_path: str, key_passphrase: str,
+                      sigstore_tuf_url: str, sigstore_trust_config: str, suite_cmd: str,
+                      suite_junit: str) -> None:
+    """Record whether each test fails once its mechanism is disabled.
+
+    THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
+    runs your tests, next to attest-tests; verification ('run') still executes
+    nothing. Each pair is run once with the mechanism disabled, and the
+    outcome is signed into a dependence attestation: a test that fails
+    without the mechanism depends on it; one that still passes does not.
+
+        mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
+
+    The runner is detected from the project's files (--runner overrides it)
+    and decides how the mechanism is disabled: a pytest plugin stubs a Python
+    symbol at import time; jest, vitest and mocha load a setup file that mocks
+    the module and replaces the export with a function that throws; every
+    other language (Go, Rust, Java, Kotlin, C, C++, C#, Swift, Verilog,
+    SystemVerilog, VHDL) has the definition's body replaced in the source by
+    one that aborts, compile- or lint-checked first, and the file restored
+    byte-for-byte afterwards. A mutated tree that does not compile, a file
+    with uncommitted changes, or a mechanism that cannot be disabled records
+    'error' with the reason, never an outcome. Simulators and custom harnesses
+    use --run-cmd "make sim TEST={test}" (the command runner).
+
+    The Python plugin imports the mechanism's module at pytest configuration
+    time, before any test runs, so a module with import-time side effects
+    (connections, threads, global state) runs them then. Nominate mechanisms
+    that live in modules that are safe to import.
+
+    Suite mode (--suite-cmd "<command>" --suite-junit <report>) is for a
+    harness that runs everything at once: pairs are grouped by mechanism,
+    each mechanism is disabled in turn (same gate, same restore), the suite
+    command runs once and the JUnit report it wrote gives every nominated
+    test its outcome. A test the report skipped or lacks records 'error'
+    with the reason. --timeout then applies per suite run and
+    --total-timeout across mechanisms.
+
+    Two clocks bound the run: --timeout per pair and --total-timeout for the
+    whole command. A pair that would start after the total budget is spent is
+    recorded as not run, so the attestation still names every pair.
+    """
+    from pathlib import Path as _Path
+
+    from .attestation import AttestationError, build_statement
+    from .dependence import run_dependence, run_suite_dependence
+    from .hook import STRATEGY_HOOK, run_hook_dependence
+
+    if bool(suite_cmd.strip()) != bool(suite_junit.strip()):
+        click.echo("Error: --suite-cmd and --suite-junit go together.", err=True)
+        raise SystemExit(1)
+    hooks = strategy.lower() == STRATEGY_HOOK
+    if hooks and suite_cmd.strip():
+        click.echo("Error: --strategy hook runs each test alone; it has no suite mode.", err=True)
+        raise SystemExit(1)
+
+    root = _Path(project_root)
+    pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
+    resolved_commit = _resolved_commit(commit, root)
+    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file,
+                               build_cmd)
+
+    def _progress(test: str, mechanism: str, status: str) -> None:
+        click.echo(f"  {test} without {mechanism}: {status}")
+
+    predicate_extra: dict = {}
+    try:
+        if hooks:
+            if not adapter.supports_hooks:
+                click.echo(f"Error: {adapter.hook_refusal}.", err=True)
+                raise SystemExit(1)
+            click.echo(
+                f"Building once with hooks on through the {adapter.name} runner, then a control "
+                f"run and {len(pairs)} pair(s) (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_hook_dependence(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
+            predicate_extra = {"strategy": summary.pop("strategy"),
+                               "control_run": summary.pop("control_run")}
+            control = predicate_extra["control_run"]
+            if control is not None:
+                click.echo(f"Control run: {control['status']} ({len(control['tests'])} test(s))")
+        elif suite_cmd.strip():
+            from .dependence import group_by_mechanism
+
+            click.echo(
+                f"Running the suite once per mechanism ({len(group_by_mechanism(pairs))} "
+                f"mechanism(s), {len(pairs)} pair(s)) with the mechanism disabled through "
+                f"the {adapter.name} runner (up to {timeout}s per run, {total_timeout}s in all)...")
+            summary = run_suite_dependence(
+                root, pairs, suite_cmd=suite_cmd, suite_junit=suite_junit, adapter=adapter,
+                timeout=timeout, total_timeout=total_timeout, progress=_progress)
+        else:
+            click.echo(
+                f"Running {len(pairs)} pair(s) with the mechanism disabled through the "
+                f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_dependence(
+                root, pairs, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress, adapter=adapter)
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    not_run = int(summary.pop("not_run", 0) or 0)
+    summary.pop("runner", None)
+    click.echo(
+        f"Ran {len(pairs) - not_run} of {len(pairs)} pair(s); {not_run} not "
+        f"run (total budget of {total_timeout}s exhausted)."
+        if not_run else f"Ran {len(pairs)} of {len(pairs)} pair(s)."
+    )
+
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=["mipiti-verify", "attest-dependence", "--runner", adapter.name]
+        + (["--suite"] if suite_cmd.strip() else [])
+        + (["--strategy", "hook"] if hooks else []),
+        selected_pattern="",
+        kind="dependence",
+        predicate_extra=predicate_extra,
+    )
+    out_path, provenance = _write_run_attestation(
+        root, statement, suffix="dependence", model_id=model_id, key_path=key_path,
+        key_passphrase=key_passphrase, sigstore_tuf_url=sigstore_tuf_url,
+        sigstore_trust_config=sigstore_trust_config)
+
+    totals = summary["totals"]
+    click.echo(
+        f"Attested dependence for {totals['total']} pair(s) at "
+        f"{resolved_commit[:12]} ({totals['failed']} depend on their "
+        f"mechanism, {totals['passed']} do not, {totals['errors']} without an "
+        f"outcome) -> {out_path}"
+    )
+    _echo_provenance(provenance)
+
+
+@main.command(name="attest-reach")
+@_attest_run_options
+@click.option("--suite-cmd", default="", envvar="MIPITI_SUITE_CMD",
+              help=("Suite mode: a command that runs the whole suite under coverage and "
+                    "writes the report --coverage-file names, for harnesses that cannot "
+                    "run one test alone. Run ONCE; every nominated test records what the "
+                    "suite reached in its mechanism's file as suite_reached, with "
+                    "reach_scope = \"suite\". Information only: per-test reach is "
+                    "undefined for such a harness, so this never establishes the reach "
+                    "fact. Needs --coverage-file."))
+def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
+                 base_url: str | None, repo: str, project_root: str,
+                 commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
+                 coverage_file: str, strategy: str, build_cmd: str, timeout: int, total_timeout: int,
+                 key_path: str, key_passphrase: str, sigstore_tuf_url: str,
+                 sigstore_trust_config: str, suite_cmd: str) -> None:
+    """Record which lines of its mechanism's file each test executes.
+
+    THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
+    runs your tests, next to attest-tests. Each nominated test is run alone
+    under the language's coverage tool through the project's runner, and the
+    lines it executed in the mechanism's file are signed into a reach
+    attestation (predicate.kind = "reach") in the same per-test 'reached'
+    shape attest-tests --coverage records. Running one test at a time is
+    what makes it a fact about that test rather than about the suite.
+
+        mipiti-verify attest-reach --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
+
+    Coverage tools per runner: coverage.py (pytest), the runner's LCOV
+    reporter (jest, vitest; c8 or nyc for mocha), go test -coverprofile,
+    cargo llvm-cov, JaCoCo (Maven/Gradle, when the plugin is configured),
+    coverlet (dotnet test --collect), SimpleCov (rspec), Clover (phpunit),
+    and for the command runner --coverage-cmd plus --coverage-file naming the
+    report it writes (LCOV, Cobertura, JaCoCo or coverage.py JSON; Verilator
+    coverage converts with 'verilator_coverage --write-info'). A run whose
+    coverage tool is missing or produced no report records 'error' with the
+    reason.
+
+    The same two clocks as attest-dependence bound the run.
+
+    Suite mode (--suite-cmd "<command>" --coverage-file <report>) is for a
+    harness that cannot run one test alone. The command runs ONCE under
+    coverage and every nominated test records what the suite reached in
+    its mechanism's file as suite_reached, with reach_scope = "suite".
+    Per-test reach is undefined for such a harness, so the record is
+    information: it never establishes the reach fact, which stays unknown.
+    """
+    from pathlib import Path as _Path
+
+    from .attestation import AttestationError, build_statement, locate_test_definitions
+    from .reach import KIND_REACH, REACH_SCOPE_SUITE, REACH_SCOPE_TEST, run_reach, run_suite_reach
+
+    suite = bool(suite_cmd.strip())
+    if suite and not coverage_file.strip():
+        click.echo("Error: --suite-cmd needs --coverage-file (the report the suite writes).", err=True)
+        raise SystemExit(1)
+
+    root = _Path(project_root)
+    pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
+    resolved_commit = _resolved_commit(commit, root)
+    adapter = _resolve_adapter(root, pairs, runner_name, run_cmd, coverage_cmd, coverage_file,
+                               build_cmd)
+    hooks = strategy.lower() == "hook"
+    if hooks and not adapter.supports_hooks:
+        click.echo(f"Error: {adapter.hook_refusal}.", err=True)
+        raise SystemExit(1)
+
+    def _progress(test: str, mechanism: str, status: str) -> None:
+        click.echo(f"  {test} for {mechanism}: {status}")
+
+    try:
+        if suite:
+            click.echo(
+                f"Running the suite once under coverage for {len(pairs)} pair(s) "
+                f"(up to {timeout}s); recording suite-level reach, which does not "
+                f"establish per-test reach...")
+            summary = run_suite_reach(
+                root, pairs, suite_cmd=suite_cmd, coverage_file=coverage_file,
+                adapter=adapter, timeout=timeout, progress=_progress)
+        elif hooks:
+            from .hook import run_hook_reach
+
+            click.echo(
+                f"Building once with hooks on through the {adapter.name} runner, then "
+                f"{len(pairs)} test(s) alone under coverage (up to {timeout}s each, "
+                f"{total_timeout}s in all)...")
+            summary = run_hook_reach(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
+        else:
+            click.echo(
+                f"Running {len(pairs)} test(s) alone under coverage through the "
+                f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_reach(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    not_run = int(summary.pop("not_run", 0) or 0)
+    summary.pop("runner", None)
+    locate_test_definitions(root, summary["tests"])
+    if not suite:
+        click.echo(
+            f"Ran {len(pairs) - not_run} of {len(pairs)} test(s); {not_run} not "
+            f"run (total budget of {total_timeout}s exhausted)."
+            if not_run else f"Ran {len(pairs)} of {len(pairs)} test(s)."
+        )
+
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=["mipiti-verify", "attest-reach", "--runner", adapter.name]
+        + (["--suite"] if suite else [])
+        + (["--strategy", "hook"] if hooks else []),
+        selected_pattern="",
+        kind=KIND_REACH,
+        reach_scope=REACH_SCOPE_SUITE if suite else REACH_SCOPE_TEST,
+        predicate_extra={"strategy": summary.pop("strategy")} if summary.get("strategy") else None,
+    )
+    out_path, provenance = _write_run_attestation(
+        root, statement, suffix="reach", model_id=model_id, key_path=key_path,
+        key_passphrase=key_passphrase, sigstore_tuf_url=sigstore_tuf_url,
+        sigstore_trust_config=sigstore_trust_config)
+
+    totals = summary["totals"]
+    if suite:
+        touched = sum(1 for t in summary["tests"] if t.get("suite_reached"))
+        click.echo(
+            f"Attested suite-level reach for {totals['total']} pair(s) at "
+            f"{resolved_commit[:12]} (the suite reached the mechanism's file for "
+            f"{touched}, {totals['errors']} without a coverage run); per-test reach "
+            f"stays unknown -> {out_path}"
+        )
+    else:
+        reached = sum(1 for t in summary["tests"] if t.get("reached"))
+        click.echo(
+            f"Attested reach for {totals['total']} test(s) at {resolved_commit[:12]} "
+            f"({reached} reached their mechanism's file, {totals['errors']} without "
+            f"a coverage run) -> {out_path}"
+        )
+    _echo_provenance(provenance)
 
 
 @main.command()
@@ -588,6 +1077,12 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 @click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
+@click.option("--test-file-pattern", "test_file_pattern", default=None, envvar="MIPITI_TEST_FILE_PATTERN",
+              help=("Regular expression marking additional repository-relative paths as test files, "
+                    "on top of the built-in layout heuristic (tests/, test/, __tests__/, test_*, "
+                    "*_test.*, *.spec.*). Test-backed assertions are never skipped under "
+                    "--changed-files; use this for tests that live outside the conventional "
+                    "layouts, e.g. '^specs/'."))
 @click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
 @click.option("--component", "component_id", default=None, help="Component ID to scope verification (only verify assertions for controls in this component). Auto-detect from git remote if not specified.")
 @click.option(
@@ -626,6 +1121,7 @@ def run(
     verbose: bool,
     repo: str,
     changed_files_path: str | None,
+    test_file_pattern: str | None,
     concurrency: int,
     component_id: str | None,
     auto_component_path: bool,
@@ -709,6 +1205,7 @@ def run(
             verbose=verbose,
             repo=repo,
             changed_files=changed_files,
+            test_file_pattern=test_file_pattern,
             concurrency=concurrency,
             component_id=component_id,
             auto_component_path=auto_component_path,

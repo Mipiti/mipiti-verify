@@ -30,6 +30,18 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
     if [ -n "$INPUT_ATTESTATION_ENV" ]; then
       ATTEST_ARGS+=("--env" "$INPUT_ATTESTATION_ENV")
     fi
+    # Coverage with contexts, so each test records what it reached. Same
+    # resolution as the report: relative to project-root first.
+    if [ -n "${INPUT_COVERAGE_REPORT:-}" ]; then
+      if [ -f "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT")
+      elif [ -f "$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_COVERAGE_REPORT")
+      else
+        echo "::error::coverage-report '$INPUT_COVERAGE_REPORT' not found. Point it at the JSON that 'coverage json --show-contexts' wrote, relative to project-root."
+        exit 1
+      fi
+    fi
     if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
       ATTEST_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
     fi
@@ -41,6 +53,69 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
     fi
     mipiti-verify "${ATTEST_ARGS[@]}"
   done
+fi
+
+# Dependence and reach are the two opt-in steps that run tests: each named
+# test once, with its mechanism disabled (dependence) or alone under
+# coverage (reach), in this job. Nothing below these blocks executes
+# project code.
+run_options() {
+  if [ -n "${INPUT_RUNNER:-}" ]; then
+    RUN_ARGS+=("--runner" "$INPUT_RUNNER")
+  fi
+  if [ -n "${INPUT_RUN_CMD:-}" ]; then
+    RUN_ARGS+=("--run-cmd" "$INPUT_RUN_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_CMD:-}" ]; then
+    RUN_ARGS+=("--coverage-cmd" "$INPUT_COVERAGE_CMD")
+  fi
+  if [ -n "${INPUT_COVERAGE_FILE:-}" ]; then
+    RUN_ARGS+=("--coverage-file" "$INPUT_COVERAGE_FILE")
+  fi
+  if [ -n "${INPUT_STRATEGY:-}" ]; then
+    RUN_ARGS+=("--strategy" "$INPUT_STRATEGY")
+  fi
+  if [ -n "${INPUT_BUILD_CMD:-}" ]; then
+    RUN_ARGS+=("--build-cmd" "$INPUT_BUILD_CMD")
+  fi
+  if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
+    RUN_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+    RUN_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+    RUN_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+  fi
+}
+
+if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-dependence" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_DEPENDENCE_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
+  if [ -n "${INPUT_SUITE_JUNIT:-}" ]; then
+    RUN_ARGS+=("--suite-junit" "$INPUT_SUITE_JUNIT")
+  fi
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
+fi
+
+if [ -n "${INPUT_REACH_PAIRS:-}" ]; then
+  RUN_ARGS=("attest-reach" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_REACH_PAIRS; do
+    RUN_ARGS+=("--pair" "$pair")
+  done
+  # Suite mode: one whole-suite run; the record is suite-level reach
+  # (reach_scope = suite), which never establishes per-test reach.
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
+  run_options
+  mipiti-verify "${RUN_ARGS[@]}"
 fi
 
 ARGS=("run")

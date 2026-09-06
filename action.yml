@@ -80,6 +80,50 @@ inputs:
     description: "Path to an ECDSA P-256 private key (PEM) used to sign the test-result attestation on CI that has no workload identity. Leave unset on GitHub Actions: the run already mints an OIDC token and the attestation is signed keylessly through Sigstore, which needs no secret and binds the repository, ref and workflow."
     required: false
     default: ""
+  coverage-report:
+    description: "Path to a coverage.py JSON export with contexts (run the tests with --cov-context=test, then 'coverage json --show-contexts'), relative to project-root. Passed to attest-tests --coverage so each recorded test carries the files and lines it reached, which is what a test_attested assertion's 'reached' fact is computed from."
+    required: false
+    default: ""
+  dependence-pairs:
+    description: "Space-separated test=file::symbol pairs (e.g. 'tests/test_auth.py::test_token_required=app/auth.py::require_token'). When set, the action runs 'attest-dependence' before verifying: each named test is run once with its mechanism disabled through the project's runner (a stub for Python, a mocking setup file for jest/vitest/mocha, a compile-checked source mutation restored afterwards for Go, Rust, JVM, .NET, C/C++, Swift and HDL), and the outcome is signed into a dependence attestation. This input RUNS TESTS; it is opt-in. Leave unset to keep the action read-only."
+    required: false
+    default: ""
+  reach-pairs:
+    description: "Space-separated test=file::symbol pairs. When set, the action runs 'attest-reach' before verifying: each named test is run alone under the language's coverage tool through the project's runner, and the lines it executed in the mechanism's file are signed into a reach attestation, which is what the 'reached' fact of a test_attested assertion is computed from for runners other than pytest-with-coverage.py. This input RUNS TESTS; it is opt-in."
+    required: false
+    default: ""
+  runner:
+    description: "Runner adapter for dependence-pairs and reach-pairs: pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit or command. Default: detected from the project's files. The 'command' runner takes run-cmd."
+    required: false
+    default: ""
+  run-cmd:
+    description: "For the 'command' runner: the command that runs one test, with {test} substituted (e.g. 'make sim TEST={test}'); exit 0 is passed, 1 failed, anything else error. Setting it selects the command runner."
+    required: false
+    default: ""
+  coverage-cmd:
+    description: "For the 'command' runner with reach-pairs: the command that runs one test under coverage ({test} substituted). Defaults to run-cmd."
+    required: false
+    default: ""
+  coverage-file:
+    description: "For the 'command' runner with reach-pairs: the report the coverage command writes, relative to project-root (LCOV, Cobertura, JaCoCo or coverage.py JSON). With suite-cmd, the report the suite run writes."
+    required: false
+    default: ""
+  suite-cmd:
+    description: "Suite mode, for harnesses that cannot select one test. For dependence-pairs: a command that runs the whole suite and writes a JUnit report; run once per distinct mechanism with that mechanism disabled, each nominated test taking its outcome from the report (needs suite-junit). For reach-pairs: the same command must also write the coverage report coverage-file names; it runs ONCE and each nominated test records what the suite reached in its mechanism's file as suite_reached (reach_scope = suite). Suite-level reach is information only: it never establishes the per-test reach fact, which stays unknown."
+    required: false
+    default: ""
+  suite-junit:
+    description: "Suite mode for dependence-pairs: the JUnit report suite-cmd writes, relative to project-root."
+    required: false
+    default: ""
+  strategy:
+    description: "How a compiled mechanism is disabled for dependence-pairs and reach-pairs: 'mutation' (default; rewrite the body, recompile per mechanism) or 'hook' (build once with the repository's build-flagged tripwires compiled in, name the mechanism per run; credited only with the location proof and a passing control run)."
+    required: false
+    default: ""
+  build-cmd:
+    description: "For the 'command' runner under strategy 'hook': the build with the hooks compiled in, run once."
+    required: false
+    default: ""
 
 outputs:
   content-hash:
@@ -108,3 +152,14 @@ runs:
     INPUT_JUNIT_REPORT: ${{ inputs.junit-report }}
     INPUT_ATTESTATION_SIGNING_KEY: ${{ inputs.attestation-signing-key }}
     INPUT_ATTESTATION_ENV: ${{ inputs.attestation-env }}
+    INPUT_COVERAGE_REPORT: ${{ inputs.coverage-report }}
+    INPUT_DEPENDENCE_PAIRS: ${{ inputs.dependence-pairs }}
+    INPUT_REACH_PAIRS: ${{ inputs.reach-pairs }}
+    INPUT_RUNNER: ${{ inputs.runner }}
+    INPUT_RUN_CMD: ${{ inputs.run-cmd }}
+    INPUT_COVERAGE_CMD: ${{ inputs.coverage-cmd }}
+    INPUT_COVERAGE_FILE: ${{ inputs.coverage-file }}
+    INPUT_SUITE_CMD: ${{ inputs.suite-cmd }}
+    INPUT_SUITE_JUNIT: ${{ inputs.suite-junit }}
+    INPUT_STRATEGY: ${{ inputs.strategy }}
+    INPUT_BUILD_CMD: ${{ inputs.build-cmd }}

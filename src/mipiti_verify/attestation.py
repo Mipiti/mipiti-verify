@@ -82,12 +82,19 @@ def parse_junit(report_path: Path) -> dict:
         # distinguish the test that passed from the one that was skipped in
         # the same run, and a claim about a named test needs that distinction:
         # adding a skip is the cheapest way to stop a test failing.
-        tests.append({
+        entry = {
             "id": f"{classname}::{name}" if classname else name,
             "name": name,
             "classname": classname,
             "status": status,
-        })
+        }
+        # Some runners say where the test lives. Kept as a hint for locating
+        # the definition; it is replaced by the resolved path when that
+        # succeeds and dropped when the path is not in the checkout.
+        junit_file = (case.get("file") or "").strip()
+        if junit_file:
+            entry["file"] = junit_file
+        tests.append(entry)
 
     total = len(cases)
     return {
@@ -100,6 +107,305 @@ def parse_junit(report_path: Path) -> dict:
         },
         "tests": tests,
     }
+
+
+# ---------------------------------------------------------------------------
+# Locating each test's definition -- the content the attestation binds
+# ---------------------------------------------------------------------------
+
+# pytest appends the parametrize id to the name: ``test_x[case-1]``. Every
+# case shares one definition, so the id is stripped before lookup.
+_PARAM_SUFFIX = re.compile(r"\[.*$", re.DOTALL)
+
+
+def base_test_name(name: str) -> str:
+    """The function name a recorded test name refers to."""
+    return _PARAM_SUFFIX.sub("", str(name or "")).strip()
+
+
+def normalised_definition(block: str) -> str:
+    """Line endings and trailing whitespace are not part of a definition."""
+    return "\n".join(
+        line.rstrip() for line in block.replace("\r\n", "\n").split("\n")
+    )
+
+
+def definition_sha256(block: str) -> str:
+    from .languages.definitions import hash_of
+
+    return hash_of(block)
+
+
+def _relative_posix(project_root: Path, path: Path) -> str:
+    return path.resolve().relative_to(project_root.resolve()).as_posix()
+
+
+def _resolve_in_root(project_root: Path, rel: str) -> Optional[Path]:
+    """``rel`` as a file inside ``project_root``, or ``None``."""
+    if not rel or "\0" in rel:
+        return None
+    try:
+        candidate = (project_root / rel).resolve()
+        root = project_root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _module_file(project_root: Path, dotted: str) -> Optional[Path]:
+    """The file a dotted module path names, as ``a/b/c.py`` or a package."""
+    parts = [p for p in dotted.split(".") if p]
+    if not parts or len(parts) != len(dotted.split(".")):
+        return None
+    if any(p in (".", "..") or "/" in p or "\\" in p for p in parts):
+        return None
+    base = "/".join(parts)
+    for rel in (f"{base}.py", f"{base}/__init__.py"):
+        found = _resolve_in_root(project_root, rel)
+        if found is not None:
+            return found
+    return None
+
+
+class DefinitionRecord(tuple):
+    """``(sha256, scope, parser)`` of a located definition.
+
+    ``scope`` is ``symbol`` (a parser or an exact keyword-pair block isolated
+    the named definition), ``block`` (a block starting at the first line that
+    matched the name) or ``file`` (the whole file; ``parser`` is then empty).
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, sha256: str, scope: str, parser: str = ""):
+        return super().__new__(cls, (sha256, scope, parser))
+
+    @property
+    def sha256(self) -> str:
+        return self[0]
+
+    @property
+    def scope(self) -> str:
+        return self[1]
+
+    @property
+    def parser(self) -> str:
+        return self[2]
+
+
+def locate_definition_record(
+    project_root: Path, rel_file: str, name: str, owner: str = "",
+) -> Optional[DefinitionRecord]:
+    """Where and how ``name`` is defined in ``rel_file``, or ``None``.
+
+    The language is taken from the file's extension. An empty ``name``
+    hashes the file. The hash is taken over the untruncated block: the
+    reviewer's copy is bounded, the evidence is not.
+    """
+    from .definition_extract import locate_definition
+    from .languages.definitions import language_of
+
+    path = _resolve_in_root(project_root, rel_file)
+    if path is None:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if name:
+        qualified = f"{owner}.{name}" if owner else name
+        kind = "method" if owner else "function"
+        found = locate_definition(content, kind, qualified, language=language_of(rel_file))
+        if found is not None:
+            return DefinitionRecord(definition_sha256(found.text), found.scope, found.parser)
+    return DefinitionRecord(definition_sha256(content), "file", "")
+
+
+def definition_hash_for(
+    project_root: Path, rel_file: str, name: str, owner: str = "",
+) -> Optional[tuple[str, str]]:
+    """``(sha256, scope)`` for ``name`` in ``rel_file``, or ``None``.
+
+    ``scope`` is ``"definition"`` when the block could be isolated -- inside
+    ``owner`` when a class is named -- and ``"file"`` when only the file
+    could be found, in which case the hash covers the whole file. See
+    ``locate_definition_record`` for the finer scope and the parser.
+    """
+    record = locate_definition_record(project_root, rel_file, name, owner)
+    if record is None:
+        return None
+    return record.sha256, ("file" if record.scope == "file" else "definition")
+
+
+def _locate_one(project_root: Path, entry: dict) -> None:
+    name = base_test_name(entry.get("name"))
+    classname = str(entry.get("classname") or "").strip()
+    hint = str(entry.get("file") or "").strip()
+    entry.pop("file", None)
+
+    candidates: list[tuple[Path, str]] = []  # (file, owning class or "")
+    if classname:
+        whole = _module_file(project_root, classname)
+        if whole is not None:
+            candidates.append((whole, ""))
+        owner, _, cls = classname.rpartition(".")
+        if owner and cls:
+            holder = _module_file(project_root, owner)
+            if holder is not None:
+                candidates.append((holder, cls))
+    if hint:
+        hinted = _resolve_in_root(project_root, hint.replace("\\", "/"))
+        if hinted is not None:
+            candidates.append((hinted, ""))
+
+    fallback: Optional[tuple[Path, str]] = None
+    for path, owner in candidates:
+        rel = _relative_posix(project_root, path)
+        if owner:
+            # The class must be defined in that file for the method to be
+            # the definition; otherwise the file is only a location.
+            from .definition_extract import definition_line_span
+            from .languages.definitions import language_of
+
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if definition_line_span(content, "class", owner, language=language_of(rel)) is None:
+                # The dotted name's last segment was read as a class and the
+                # file defines none by that name, so this file is not where
+                # the test lives; it is not even a fallback location.
+                continue
+        record = locate_definition_record(project_root, rel, name, owner)
+        if record is None:
+            continue
+        if record.scope != "file":
+            entry["file"] = rel
+            entry["definition_sha256"] = record.sha256
+            entry["definition_scope"] = record.scope
+            entry["parser"] = record.parser
+            return
+        fallback = fallback or (path, "")
+    if fallback is not None:
+        path, _ = fallback
+        record = locate_definition_record(project_root, _relative_posix(project_root, path), "")
+        if record is not None:
+            entry["file"] = _relative_posix(project_root, path)
+            entry["definition_sha256"] = record.sha256
+            entry["definition_scope"] = "file"
+            entry.pop("parser", None)
+
+
+def locate_test_definitions(project_root: Path, tests: list) -> None:
+    """Record, per test, where it is defined and a hash of that definition.
+
+    Adds ``file`` (repository-relative), ``definition_sha256``,
+    ``definition_scope`` (``symbol`` / ``block`` / ``file``) and, unless the
+    scope is the file, ``parser`` (what isolated the span) to each entry
+    that resolves. An entry that cannot be resolved is left without the
+    fields: absence means "not resolved", which a reader treats as unknown,
+    never as a match. Nothing here raises.
+    """
+    for entry in tests or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            _locate_one(project_root, entry)
+        except Exception:  # noqa: BLE001
+            entry.pop("file", None)
+            entry.pop("definition_sha256", None)
+            entry.pop("definition_scope", None)
+            entry.pop("parser", None)
+
+
+# ---------------------------------------------------------------------------
+# Coverage contexts -- what each test reached
+# ---------------------------------------------------------------------------
+
+def _key_names_entry(key: str, entry: dict) -> bool:
+    """Whether a coverage attribution key names the recorded test.
+
+    Keys come in two shapes. A coverage.py context,
+    ``tests/test_x.py::TestCase::test_name[case]|run`` (the phase suffix
+    is already stripped), names the test by file and leaf; the file must
+    be the one the test was located in, unless the test was not located.
+    A per-test report's file stem names it by id, with ``::`` spelled
+    ``__``, or by bare name.
+    """
+    name = base_test_name(entry.get("name"))
+    if not name:
+        return False
+    known_file = str(entry.get("file") or "").replace("\\", "/")
+    classname = str(entry.get("classname") or "")
+    test_id = str(entry.get("id") or "")
+    key = str(key or "").replace("\\", "/")
+    if "::" in key:
+        head, _, rest = key.partition("::")
+        if base_test_name(rest.rsplit("::", 1)[-1]) != name:
+            return False
+        if not head or head == classname or head == test_id.partition("::")[0]:
+            return True
+        return not known_file or head == known_file
+    raw_name = str(entry.get("name") or "")
+    accepted = {test_id, raw_name, name}
+    for prefix in (classname, known_file):
+        if prefix:
+            accepted.add(f"{prefix}::{raw_name}")
+            accepted.add(f"{prefix}::{name}")
+    accepted |= {a.replace("::", "__") for a in accepted}
+    return key in accepted
+
+
+def merge_coverage(summary: dict, coverage: object, project_root: Path) -> None:
+    """Record what each test reached, from a coverage report.
+
+    ``coverage`` is a report path (any format ``coverage_readers`` reads, or
+    a directory of one report per test), an already-read ``CoverageReport``,
+    or a parsed coverage.py JSON export.
+
+    A report that attributes lines to tests gives each recorded test
+    ``reached: [{file, lines}]``; a test nothing names gets an explicitly
+    empty list, which is a fact (the run had coverage and the test touched
+    nothing tracked), unlike the absence of the field. An aggregate report
+    gives each test ``suite_reached`` instead and no ``reached``: reach is
+    a claim about one test, and a suite-wide report cannot make it.
+    """
+    from .coverage_readers import CoverageReadError, CoverageReport, read_coverage, read_coveragepy
+
+    try:
+        if isinstance(coverage, CoverageReport):
+            report = coverage
+        elif isinstance(coverage, (str, Path)):
+            report = read_coverage(coverage, project_root)
+        else:
+            report = read_coveragepy(coverage, project_root)
+    except CoverageReadError as e:
+        raise AttestationError(str(e)) from e
+
+    tests = [t for t in (summary.get("tests") or []) if isinstance(t, dict)]
+    if report.attributed:
+        for entry in tests:
+            entry.pop("suite_reached", None)
+            reached: dict[str, set[int]] = {}
+            for key, per_file in report.per_test.items():
+                if not _key_names_entry(key, entry):
+                    continue
+                for src, lines in per_file.items():
+                    reached.setdefault(src, set()).update(lines)
+            entry["reached"] = _reach_list(reached)
+        return
+    suite = _reach_list(report.suite)
+    for entry in tests:
+        entry.pop("reached", None)
+        entry["suite_reached"] = [
+            {"file": item["file"], "lines": list(item["lines"])} for item in suite
+        ]
+
+
+def _reach_list(per_file: dict[str, set[int]]) -> list[dict]:
+    return [
+        {"file": src, "lines": sorted(lines)}
+        for src, lines in sorted(per_file.items()) if src
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +509,21 @@ def build_statement(
     selected_pattern: str = "",
     coverage: Optional[dict] = None,
     environment: Optional[dict] = None,
+    kind: str = "",
+    predicate_extra: Optional[dict] = None,
+    reach_scope: str = "",
 ) -> dict:
-    """Assemble the in-toto statement for one test run."""
+    """Assemble the in-toto statement for one test run.
+
+    ``kind`` distinguishes a second statement shape carried under the same
+    predicate type: absent means a test-result record; ``"dependence"``
+    means each test's entry records how it fared with a mechanism disabled;
+    ``"reach"`` means each entry records what a coverage run executed.
+    ``reach_scope`` says what a reach record's coverage is scoped to:
+    ``"test"`` (each test run alone; the entries carry ``reached``) or
+    ``"suite"`` (one whole-suite run; the entries carry ``suite_reached``
+    and never ``reached``).
+    """
     totals = summary["totals"]
     predicate: dict[str, Any] = {
         "invocation": list(invocation),
@@ -220,6 +539,14 @@ def build_statement(
         "ci": _ci_context(),
         "attested_at": datetime.now(timezone.utc).isoformat(),
     }
+    if kind:
+        predicate["kind"] = kind
+    if predicate_extra:
+        # Record-level facts a kind carries beyond the per-test entries
+        # (``strategy`` and ``control_run`` on a hook-built dependence run).
+        predicate.update(predicate_extra)
+    if reach_scope:
+        predicate["reach_scope"] = reach_scope
     if coverage:
         predicate["coverage"] = coverage
     if environment is not None:

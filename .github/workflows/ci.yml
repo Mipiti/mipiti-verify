@@ -105,7 +105,7 @@ jobs:
       - name: Install pinned dependencies
         run: pip install --require-hashes -r requirements.lock
 
-      - name: pip-audit (all three lockfiles)
+      - name: pip-audit (all four lockfiles)
         # Catches newly-published CVEs against already-pinned versions at
         # PR time. --disable-pip audits the lockfile directly without a
         # separate venv install. The audit tool itself is installed
@@ -143,9 +143,17 @@ jobs:
           pip-audit -r requirements.lock       --disable-pip $IGNORE
           pip-audit -r requirements-build.lock --disable-pip $IGNORE
           pip-audit -r requirements-all.lock   --disable-pip $IGNORE
+          pip-audit -r requirements-dev.lock   --disable-pip $IGNORE
+
+      - name: Install parsers for the definition locators
+        # The formal checkers over definition location (formal/check_adapters.py,
+        # A2/A5 parser arms) and the type checker's catalogue properties need the
+        # optional parser pack and the assertion catalogue; both hash-pinned via
+        # requirements-all.lock / requirements-dev.lock.
+        run: pip install --require-hashes -r requirements-all.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
@@ -354,15 +362,13 @@ jobs:
         run: pip install --require-hashes -r requirements.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema pytest-xdist
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run audit-spec BFS implementation check
-        # Parallelize across all available CPU cores via pytest-xdist.
-        # Parametrized rows are pure functions of (pkg, pins) — no
-        # shared state between rows, so xdist-safe by construction.
-        # Real Fulcio bundle minting is per-worker (each xdist worker
-        # is a distinct process and re-mints its bundle set on first
-        # use); the 4 worker × ~8 predicate-combo mint cost is well
-        # under one minute, and the ~7,200-row BFS work is the
-        # dominant cost — net 3-4x speedup on a 4-core runner.
-        run: python -m pytest -v -n auto tests/test_spec_invariants.py
+        # The (Package, Pins) space is swept once per process, in a
+        # module-scoped fixture, and every invariant is one test over
+        # the collected rows. One process: under xdist each worker
+        # would sweep the whole space (and mint its own bundle set)
+        # for the few tests it is handed, so parallelism would only
+        # multiply the work.
+        run: python -m pytest -v tests/test_spec_invariants.py

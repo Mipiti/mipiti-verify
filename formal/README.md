@@ -82,6 +82,40 @@ java -jar formal/tla2tools.jar -config VerificationPipeline.cfg -workers auto Ve
 
 Both run automatically in CI on every commit (see `.github/workflows/ci.yml`).
 
+## Exhaustive checks over the verifiers, the types and the adapters
+
+Four further checkers close the gap between "the pipeline is correct" and
+"every part the pipeline is built from is correct". Each is exhaustive
+over a finite space rather than sampled, cross-checks the real code against
+an independent oracle, and prints one `VERIFIED` line per property. Each
+also runs as an ordinary test (`tests/test_formal_verifiers.py`,
+`tests/test_formal_types.py`, `tests/test_formal_evidence_records.py`,
+`tests/test_formal_adapters.py`), so CI runs
+them on every push without a separate step.
+
+| Checker | Proves | Space |
+|---|---|---|
+| `check_verifiers.py` | Every registered structural verifier passes only when its condition holds, fails when it does not, fails closed on a path that leaves the project root or a pattern the linear-time engine rejects, and fails on a missing input. The verdict of every equivalence class is computed by an independent specification and compared with the verifier's. `test_attested` is enumerated over the facts that decide it (attestation present, commit bound, run outcome, selection non-empty, something passed, the named test's own status, recorded environment, whether a signature was possible) against a fact-derived oracle. A verifier registered without classes fails the run. Structural proofs over the source (no PASS on an error path, safe file access, safe regex) hold for all inputs. | 28 verifiers, 137 classes, 62 structural checks |
+| `check_types.py` | T1 every catalogue type has a structural verifier (or an explicit, reasoned exemption). T2 the parameters each verifier reads, found with `ast` through the helpers it hands `params` to, are the parameters the catalogue declares: a key the verifier requires is catalogue-required, every catalogue-required key is read by the verifier or (for tier-2-only inputs) by the runner, and every optional read is declared or in an allowance that is itself checked against the code. T3 templates and registered types are in bijection and every template uses only the variables the runner supplies (read from the runner's render call). T4 every template, rendered for every subject, carries the fail-closed clause and the injection-refusal clause. T5 every registered type has exactly one evidence class (`presence` or `behavioral`), stated in the registry. | 28 types x 5 properties |
+| `check_evidence_records.py` | How the three signed records compose into one `test_attested` verdict, over every combination of their states through the real verifier: R1 a pass comes only from a test-result record at the verification commit naming the test passed (a reach or dependence record never evidences a pass). R2 `evidence_hash` is the record's definition hash when present, empty otherwise. R3 `reached` comes from the test-result record's own per-test coverage, else from a reach record at the same commit naming the same (or no) mechanism that was run, else unknown. R4 `depends` comes only from a dependence record at the same commit naming the same mechanism that was run, else unknown. R5 no mechanism on the assertion, no facts. R6 an entry with a `reason` (not run) never yields False. R7 a suite-scope reach record (`reach_scope = "suite"`, one whole-suite run) never sets `reached`; when the fact stays unknown with one present, the verdict says so. R8 the enumeration exercises the whole record schema: every field `schemas/test-result-v1.schema.json` declares (record-level optional fields, every per-test field, every nested field) is carried by at least one enumerated statement, and no enumerated statement carries a field the schema does not declare, so a schema addition without an axis value, or an emitted field the schema has not caught up with, fails the run. | 8 axes, 17640 combinations |
+| `check_adapters.py` | A1 a mutated file is restored byte-for-byte on normal exit and when the block raises. A2 a mutation changes the file and only within the named definition's lines (plus the documented extras), cross-checked against the parser's span. A3 the compile check runs before the test, on the mutated tree; a failing check is `error` and the runner is never invoked. A4 an uncommitted or unversioned file is refused as `error` and never rewritten. A5 the parser isolates every fixture definition as `symbol`; with the parser unavailable the fallback declines or reports `block` (the HDL keyword scanner: `symbol`), with the documented span. A6 one table of executed lines written in every accepted coverage format reads back identically from both readers. A7 every adapter maps every exit status to exactly `passed` / `failed` / `error`, per its documented table, and in suite mode every JUnit status (and an absent test) maps to the documented outcome and reason. A8 a mutation runs only on an exactly located span: with the parser unavailable, every fixture the fallback locates as a `block` (or not at all) is refused with the documented reason, and every fixture it still isolates as `symbol` (the HDL keyword scanner) is mutated as with the parser. A9 the hook strategy credits dependence only with a marker for the mechanism inside its exactly located span (outside, another file, another mechanism, or absent refuses with the documented reason), and a failing control run records `error` for every pair with no pair run. | 11 mutation fixtures, 12 adapters, 8 exit statuses |
+
+```bash
+python formal/check_verifiers.py   # ALL VERIFIER PROPERTIES VERIFIED
+python formal/check_types.py       # ALL TYPE PROPERTIES VERIFIED
+python formal/check_evidence_records.py  # ALL EVIDENCE RECORD PROPERTIES VERIFIED
+python formal/check_adapters.py    # ALL ADAPTER PROPERTIES VERIFIED
+```
+
+Two of the properties need something beyond this package and say so
+rather than passing silently: `check_types.py` T1-T2 need the assertion
+type catalogue (`mipiti_mcp.assertion_types`, or a sibling `mcp-server/`
+checkout) and print `NOT ESTABLISHED` without it; the parser arm of
+`check_adapters.py` A2 and A5 needs the `[ast]` extra
+(`tree-sitter-language-pack`) and prints `NOT ESTABLISHED` without it.
+The exit status is 0 in both cases; the tests assert the wording, so the
+gap is visible in the log.
+
 ## Files
 
 | File | Purpose |
@@ -92,6 +126,10 @@ Both run automatically in CI on every commit (see `.github/workflows/ci.yml`).
 | `Tier2RunnerSide.tla` | TLA+ specification — tier-2 runner-side rendering invariants T1–T5 (freshness, secrecy, trusted instructions, data isolation, no legacy fields) |
 | `Tier2RunnerSide.cfg` | TLC configuration for `Tier2RunnerSide.tla` |
 | `check_pipeline.py` | Python checker — BFS + cross-checks + model-based testing + AST proofs (runs both modes) |
+| `check_verifiers.py` | Exhaustive equivalence-class check of every registered structural verifier against an independent spec, plus the `test_attested` fact space against a fact-derived oracle |
+| `check_types.py` | Type-design invariants T1-T5: catalogue coverage, param-spec agreement (via `ast`), template bijection and variables, fail-closed + injection clauses on every rendered prompt, evidence class |
+| `check_evidence_records.py` | Evidence-record composition R1-R7: which of the test-result, reach and dependence records may supply the pass and each fact, exhaustively over their states; R8: the enumeration and the record schema declare the same fields |
+| `check_adapters.py` | Adapter invariants A1-A9: byte-exact restore, confined mutation, compile gate before run, dirty-file refusal, parser/fallback agreement, coverage-reader agreement, total and closed outcome mapping, mutation only on an exactly located span, hook credit only with the location proof and a passing control run |
 | `audit.tla` | TLA+ specification — audit verifier's compromised-platform defense (13 invariants I1–I13) |
 | `audit.cfg` | TLC configuration for `audit.tla` |
 | `audit-README.md` | Detailed README for the audit-verifier formal artefact (threat model, invariant catalogue, pin-layering table, BFS coverage in CI with real Fulcio) |

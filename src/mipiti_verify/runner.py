@@ -66,43 +66,185 @@ def _load_attestation_source(project_root: Path) -> str:
     """
     import json
 
-    from .attestation import (
-        AttestationError, expected_ci_identity, head_commit, load_attestations,
-        verify_attestation,
-    )
-    from .verifiers.tests import _expected_public_key
-
-    identity, issuer = expected_ci_identity()
-    try:
-        public_key = _expected_public_key()
-    except AttestationError:
-        return ""
-    allow_unsigned = not identity and not public_key
-    commit = head_commit(project_root)
-
     blocks = []
-    for raw in load_attestations(project_root):
-        # Verified here, not merely decoded. The semantic tier is told the
-        # mechanical tier already checked these, so handing it an envelope
-        # that failed -- or one for a different commit -- makes that framing
-        # false, and test names are free-form text that reaches the model.
-        try:
-            statement, _ = verify_attestation(
-                raw,
-                expected_identity=identity,
-                expected_issuer=issuer,
-                expected_key_pem=public_key,
-                allow_unsigned=allow_unsigned,
-            )
-        except Exception:  # noqa: BLE001
-            continue
-        attested_commit = str((statement.get("predicate") or {}).get("commit") or "")
-        if not commit or attested_commit != commit:
-            continue
+    for statement in _verified_statements_for_commit(project_root):
         blocks.append(json.dumps(statement, indent=2, sort_keys=True))
     if not blocks:
         return ""
     return "\n\n".join(blocks)[:16000]
+
+
+def _verified_statements_for_commit(project_root: Path) -> list[dict]:
+    """Attestation statements that verify and name the commit under review.
+
+    Verified here, not merely decoded. The semantic tier is told the
+    mechanical tier already checked these, so handing it an envelope that
+    failed -- or one for a different commit -- makes that framing false, and
+    test names are free-form text that reaches the model.
+    """
+    from .attestation import AttestationError
+    from .verifiers.tests import load_verified_statements
+
+    try:
+        statements, _, commit = load_verified_statements(project_root)
+    except AttestationError:
+        return []
+    out = []
+    for statement, _ in statements:
+        attested_commit = str((statement.get("predicate") or {}).get("commit") or "")
+        if commit and attested_commit == commit:
+            out.append(statement)
+    return out
+
+
+def _yes_no_unknown(value: object) -> str:
+    return "unknown" if value is None else ("yes" if value else "no")
+
+
+def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> str:
+    """SOURCE_CODE for a ``test_attested`` review: the closure of the claim.
+
+    The test's definition, read from the checkout at the path the attestation
+    names; the named mechanism's definition when the assertion names one;
+    then a facts block stating what the mechanical tier established -- the
+    definition hash match, whether the run reached the mechanism, and whether
+    the test fails without it. The judge decides only what the facts leave
+    open. When the attestation names no definition, the statement itself is
+    handed over as before.
+    """
+    from .attestation import base_test_name
+    from .definition_extract import MAX_DEFINITION_CHARS, extract_definition
+    from .verifiers import PathTraversalError, safe_resolve_path
+    from .verifiers.tests import (
+        FACT_KINDS, TestAttestedVerifier, _names_test,
+        definition_matches_checkout, mechanism_line_span, parse_mechanism, reach_wording,
+        statement_kind,
+    )
+
+    test_name = str(params.get("test") or params.get("pattern") or "").strip()
+    entry: dict | None = None
+    for statement in _verified_statements_for_commit(project_root):
+        if statement_kind(statement) in FACT_KINDS:
+            continue
+        for candidate in (statement.get("predicate") or {}).get("tests") or []:
+            if _names_test(candidate, test_name):
+                entry = candidate
+                break
+        if entry is not None:
+            break
+
+    def _read(rel: str) -> str:
+        try:
+            path = safe_resolve_path(project_root, rel)
+        except PathTraversalError:
+            return ""
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    test_block = ""
+    test_file = str((entry or {}).get("file") or "")
+    if entry is not None and test_file:
+        content = _read(test_file)
+        if content:
+            name = base_test_name(entry.get("name"))
+            owner = str(entry.get("classname") or "").rpartition(".")[-1]
+            block = extract_definition(content, "function", f"{owner}.{name}") if owner else None
+            if block is None:
+                block = extract_definition(content, "function", name)
+            if block is None and entry.get("definition_scope") == "file":
+                block = content[:16000]
+            if block:
+                test_block = f"--- Test {test_file}::{name} ---\n{block}"
+    if not test_block:
+        fallback = _load_attestation_source(project_root)
+        if not fallback:
+            return ""
+        test_block = fallback
+
+    sections = [test_block]
+    mechanism = str(params.get("mechanism") or "").strip()
+    mech_file, symbol = parse_mechanism(mechanism)
+    if mech_file:
+        # Resolved the way the reach fact is: the symbol's kind (a bare
+        # name, ``Class.method``, or ``kind:name`` such as ``module:alu``)
+        # in the language the file's extension names, so an HDL mechanism
+        # shows the judge its definition too.
+        content = _read(mech_file)
+        block = None
+        if content:
+            span = mechanism_line_span(project_root, mech_file, symbol)
+            if span is not None:
+                start, end = span
+                block = "\n".join(content.splitlines()[start - 1:end])[:MAX_DEFINITION_CHARS]
+        sections.append(
+            f"--- Mechanism {mech_file}::{symbol} ---\n"
+            + (block if block is not None else "(definition not found in the checkout)")
+        )
+
+    # The facts the mechanical tier established, restated for the judge.
+    matches = definition_matches_checkout(project_root, entry) if entry else None
+    reached: object = None
+    depends: object = None
+    reach_scope = ""
+    if mech_file:
+        try:
+            verdict = TestAttestedVerifier().verify(params, project_root)
+        except Exception:  # noqa: BLE001
+            verdict = None
+        if verdict is not None and verdict.passed:
+            reached = verdict.reached
+            depends = verdict.depends
+            reach_scope = getattr(verdict, "reach_scope", "") or ""
+    facts = [
+        f"definition_sha256 matches attestation: {_yes_no_unknown(matches)}",
+    ]
+    if mech_file:
+        facts.append(f"reached mechanism: {reach_wording(reached, reach_scope)}")
+        facts.append(f"fails without mechanism: {_yes_no_unknown(depends)}")
+    sections.append("--- Facts ---\n" + "\n".join(facts))
+    return "\n\n".join(sections)[:16000]
+
+
+# Path shapes that mark a file as a test. A test-backed assertion's subject is
+# the code its test exercises, not the test file, so a change filter keyed on
+# the assertion's own file does not apply to it.
+_TEST_PATH_MARKERS = ("/tests/", "/test/", "/__tests__/")
+_TEST_BASENAME_MARKERS = ("_test.", "_spec.", ".test.", ".spec.")
+
+
+def _is_test_file(path: str, pattern: re.Pattern[str] | None = None) -> bool:
+    """Whether a repository-relative path is a test file.
+
+    The layout heuristic always applies; ``pattern`` (from
+    ``--test-file-pattern``) marks additional paths for repositories whose
+    tests live outside the conventional layouts.
+    """
+    rel = str(path or "").replace("\\", "/")
+    if pattern is not None and pattern.search(rel):
+        return True
+    text = "/" + rel.lstrip("/")
+    if any(marker in text for marker in _TEST_PATH_MARKERS):
+        return True
+    base = text.rsplit("/", 1)[-1]
+    if base.startswith("test_") or base.startswith("conftest"):
+        return True
+    return any(marker in base for marker in _TEST_BASENAME_MARKERS)
+
+
+def _is_test_backed(assertion: dict[str, Any],
+                    pattern: re.Pattern[str] | None = None) -> bool:
+    """Whether an assertion's evidence is a test rather than the code itself."""
+    a_type = str(assertion.get("type") or "")
+    if a_type in ("test_attested", "test_exists"):
+        return True
+    if a_type in ("function_exists", "class_exists"):
+        return _is_test_file(
+            str((assertion.get("params") or {}).get("file") or ""), pattern)
+    return False
 
 
 def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
@@ -261,8 +403,21 @@ class Runner:
         concurrency: int = 1,
         component_id: str | None = None,
         auto_component_path: bool = True,
+        test_file_pattern: str | None = None,
     ) -> None:
         self.client = client
+        # Extra test-file identification, on top of the layout heuristic.
+        # Compiled here so a bad expression stops the run before any
+        # assertion is judged, rather than silently matching nothing.
+        self.test_file_pattern: re.Pattern[str] | None = None
+        if test_file_pattern:
+            try:
+                self.test_file_pattern = re.compile(test_file_pattern)
+            except re.error as e:
+                raise ValueError(
+                    f"--test-file-pattern {test_file_pattern!r} is not a valid "
+                    f"regular expression: {e}"
+                ) from e
         self.project_root = Path(project_root).resolve()
         self.repo = repo or _auto_detect_repo(self.project_root)
         self.component_id = component_id
@@ -746,14 +901,22 @@ class Runner:
 
         # Filter to assertions referencing changed files when --changed-files is set.
         # Assertions without a file param are always included (can't be scoped).
+        # Test-backed assertions are always kept: what a test evidences is
+        # the code it exercises, so an unchanged test file says nothing
+        # about whether its claim still holds.
         if self.changed_files is not None:
             filtered: dict[str, list] = {}
             skipped = 0
+            kept_test_backed = 0
             for ctrl_id, assertions in controls.items():
                 kept = []
                 for a in assertions:
                     a_file = a.get("params", {}).get("file", "")
-                    if not a_file or a_file in self.changed_files:
+                    if _is_test_backed(a, self.test_file_pattern):
+                        kept.append(a)
+                        if a_file and a_file not in self.changed_files:
+                            kept_test_backed += 1
+                    elif not a_file or a_file in self.changed_files:
                         kept.append(a)
                     else:
                         skipped += 1
@@ -761,6 +924,12 @@ class Runner:
                     filtered[ctrl_id] = kept
             if self.verbose and skipped:
                 console.print(f"  Tier {tier}: skipped {skipped} assertions (files unchanged)")
+            if self.verbose and kept_test_backed:
+                console.print(
+                    f"  Tier {tier}: kept {kept_test_backed} test-backed "
+                    f"assertion(s) despite unchanged files (a test's subject "
+                    f"is the code it exercises)"
+                )
             controls = filtered
             if not controls:
                 return [], [], []
@@ -844,6 +1013,12 @@ class Runner:
             }
             if getattr(result, "provenance", ""):
                 out["provenance"] = result.provenance
+            if getattr(result, "evidence_hash", ""):
+                out["evidence_hash"] = result.evidence_hash
+            for fact in ("reached", "depends"):
+                value = getattr(result, fact, None)
+                if value is not None:
+                    out[fact] = bool(value)
             return out
         except Exception as e:
             return {"status": "fail", "details": f"Verifier error: {e}"}
@@ -941,11 +1116,12 @@ class Runner:
                 params.get("target", ""), SUBJECT_REPOSITORY_FILE
             )
         elif a_type == "test_attested":
-            # The evidence for an attested test is the attestation, not a file
-            # in the tree. Hand tier 2 the statement so it judges the claim
-            # against what the run actually reported, rather than being asked
-            # to evaluate empty content.
-            source_code = _load_attestation_source(self.project_root)
+            # The evidence for an attested test is the test the attestation
+            # names, read from the checkout, with the mechanism it is meant
+            # to exercise and the facts the mechanical tier established. The
+            # statement itself is the fallback when the attestation names no
+            # definition.
+            source_code = _load_test_attested_source(self.project_root, params)
         elif not source_file and a_type in _PATTERN_GLOB_TYPES:
             # Pattern-based types (test_exists) use
             # ``params["pattern"]`` and tier-1 globs it. Mirror that
@@ -1284,6 +1460,11 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
     }
     if result.get("provenance"):
         row["provenance"] = result["provenance"]
+    if result.get("evidence_hash"):
+        row["evidence_hash"] = result["evidence_hash"]
+    for fact in ("reached", "depends"):
+        if result.get(fact) is not None:
+            row[fact] = result[fact]
     return row
 
 

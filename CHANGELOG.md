@@ -9,6 +9,216 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A source mutation runs only on a definition the language layer isolates
+  exactly (`scope: symbol`, from a parser or the HDL keyword scanner). A
+  span the line heuristic can only offer as a `block` may be a different
+  definition, and a mutation of the wrong block can still compile, so the
+  pair is `error` with reason `definition not isolated exactly (install
+  mipiti-verify[ast] or nominate a unique symbol)`. Formal property A8 in
+  `formal/check_adapters.py`.
+
+- Command output (test runs, suite runs, coverage runs, compile checks) is
+  streamed to a temporary file and only its last 64 KiB read back for a
+  reason string, so memory stays bounded whatever a harness prints.
+
+- The end-to-end runner tests that wrap a toolchain in `sh -c` skip on a
+  runner without a POSIX shell.
+
+- Property-based checks (`hypothesis`, in the `dev` extra) over the
+  definition locators and the coverage readers: `locate` never raises on
+  arbitrary text and every span it returns is the file's own lines
+  carrying the name; `hash_of` ignores line endings and trailing blanks and
+  nothing else; the HDL keyword scanner never raises and its blocks nest;
+  `read_coverage` returns a report or its own error on any bytes, with only
+  positive line numbers under normalised repository-relative paths;
+  `parse_junit` returns a summary or its own error. Three findings fixed
+  along the way: a deeply nested Python file no longer escapes as
+  `MemoryError` from the parser, a coverage path with a `..` segment is
+  folded (and dropped when it climbs out of the root) instead of kept
+  verbatim, and a negative line number in a coverage.py export is ignored
+  like a zero.
+
+- `attest-reach --suite-cmd "<command>" --coverage-file <report>` (action:
+  `suite-cmd` with `reach-pairs`): reach for a harness that cannot run one
+  test alone. The suite runs once under coverage and every nominated test
+  records what the suite executed in its mechanism's file as
+  `suite_reached`, with `predicate.reach_scope = "suite"` (schema: optional
+  `reach_scope`, `test` | `suite`; per-test records now carry `test`).
+  Stated for what it is: per-test reach is undefined for such a harness,
+  so a suite-scope record is information and never yields `reached`. The
+  verifier's details line and the tier-2 facts block read
+  `reached mechanism: unknown (suite-level coverage only)` when that is
+  all there is. `formal/check_evidence_records.py` gains a suite-scope
+  reach axis (8 axes, 15120 combinations) showing R3 never sets the fact
+  from it.
+
+- `attest-dependence` stubs a Verilog / SystemVerilog `module` declared in
+  the non-ANSI style (`module m(a, y); input a; output y; ...`): the
+  header is kept, the body's port declarations are re-emitted verbatim
+  (directions, `wire` / `reg` / `logic`, packed ranges, `signed`, comma
+  lists), every `output` is driven to `x` (`assign` for a net, an
+  `always_comb` / `always @*` block for a variable), and the stub ends
+  with `endmodule`. The declarations are read with the grammar when the
+  `[ast]` extra is installed and by the keyword scanner otherwise. A port
+  the header names without a declaration in the body, or a declaration
+  naming a port the header does not list, is `error` with the reason.
+
+- `no_plaintext_secret` refuses an empty or omitted `patterns` list: an
+  absence check names what it checked for, or it establishes nothing.
+
+- Formal checks over every verifier, every assertion type, the composition
+  of test-evidence records, and every runner adapter
+  (`formal/check_verifiers.py`, `formal/check_types.py`,
+  `formal/check_evidence_records.py`, `formal/check_adapters.py`), each exhaustive over its space and
+  cross-checked against an independent oracle: a structural verifier passes
+  only when its condition holds and fails closed otherwise; a type is stated
+  consistently across the catalogue, its verifier's parameter reads, its
+  tier-2 template and its evidence class; a mutated source file is restored
+  byte-for-byte, changed only within the named definition, compile-checked
+  before the test runs, and refused when the working tree is dirty; a
+  `test_attested` pass comes only from a test-result record at the commit,
+  and the reach and dependence facts only from a record that was actually
+  run at that commit for that mechanism. Each
+  runs as an ordinary test, so CI runs them on every push. The verifier
+  registry now states each type's evidence class (`presence` or
+  `behavioral`) via `EVIDENCE_CLASS` / `evidence_class()`.
+- Test-result attestations carry each test's definition: `attest-tests`
+  locates every recorded test in the checkout and records its `file` and a
+  `definition_sha256` over the definition block (or the file, marked
+  `definition_scope: "file"`, when the block cannot be isolated). The
+  `test_attested` result reports it as `evidence_hash`, so the platform can
+  bind acceptance to the test as written.
+- `attest-tests --coverage <coverage.py JSON with contexts>` records, per
+  test, the files and lines it reached. When a `test_attested` assertion names
+  a `mechanism` (`<file>::<symbol>`), the result reports `reached: true|false`
+  from that record.
+- `attest-dependence`, a new opt-in command for the job that already runs
+  tests: each `(test, mechanism)` pair is run once with the mechanism replaced
+  by a stub and the outcome is signed into a dependence attestation
+  (`predicate.kind = "dependence"`). The `test_attested` result reports
+  `depends: true|false` when such a record names the test and mechanism at
+  the commit under verification. This command runs tests; `run` still
+  executes nothing. Pairs come from `--pair` or `--from-model`.
+- Tier-2 review of a `test_attested` assertion reads the test's definition
+  from the checkout, the named mechanism's definition, and a facts block
+  (definition hash match, reached, fails without); the criterion answers NO
+  when the facts show the test never reached, or does not depend on, the
+  mechanism.
+- Test-backed assertions (`test_attested`, `test_exists`, and
+  `function_exists` / `class_exists` on a test file) are always verified under
+  `--changed-files`: a test's subject is the code it exercises, not its own
+  file.
+- The predicate schema gains the optional per-test fields `file`,
+  `definition_sha256`, `definition_scope`, `reached`, `fails_without` and the
+  optional `kind`. No version bump; absence means "not recorded".
+- Definition location for every supported language. `attest-tests` cuts a
+  test's definition with Python's `ast`, with tree-sitter for JavaScript,
+  TypeScript, Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP, Swift, Verilog,
+  SystemVerilog and VHDL when the new optional extra `mipiti-verify[ast]`
+  (`tree-sitter-language-pack`, also in `[all]`) is installed, with a
+  keyword-pair block scanner for the HDLs when it is not, and with the brace
+  / indentation block otherwise. Each test entry now always records
+  `definition_scope` (`symbol`, `block` or `file`) and, unless the scope is
+  the file, `parser` (`ast`, `tree-sitter`, `keyword`, `lines`), so a reader
+  knows what the hash covers and how the span was found.
+- The `mechanism` of a `test_attested` assertion may name its kind:
+  `<file>::<kind>:<name>` (`rtl/alu.sv::module:alu`,
+  `rtl/fsm.sv::always:seq_logic`); a bare name is tried as a function, then a
+  class, then each HDL kind in a fixed order. Reach is computed against the
+  span the file's language resolves.
+- `attest-tests --coverage` reads LCOV (`.info` / `.lcov`, including
+  `verilator_coverage --write-info` output), Cobertura XML and JaCoCo XML in
+  addition to coverage.py JSON, detected from content, and accepts a
+  directory of one report per test (`<test id>.<ext>`, `::` spelled `__`).
+  A report that attributes lines to tests records `reached` per test; an
+  aggregate report (any format, or coverage.py without contexts) is no longer
+  refused: it records `suite_reached` per test and leaves `reached` absent,
+  because a suite-wide report cannot say what one test executed.
+- The predicate schema gains the optional per-test `parser` and
+  `suite_reached`; `definition_scope` accepts `symbol` and `block`.
+- Action inputs `coverage-report` and `dependence-pairs`.
+- Runner adapters (`languages/adapters/`) behind `attest-dependence` and the
+  new `attest-reach`: pytest (also cocotb suites driven by pytest), jest,
+  vitest, mocha, `go test -run`, `cargo test`, Maven (`-Dtest=`), Gradle
+  (`--tests`), `dotnet test --filter`, rspec, phpunit, and a command runner
+  (`--run-cmd "make sim TEST={test}"`, `--coverage-cmd`, `--coverage-file`)
+  for simulators and custom harnesses. Detected from the project's files,
+  the mechanisms' language breaking a polyglot tie; `--runner` overrides.
+  Every adapter selects exactly one test, maps the runner's exit status so a
+  run that selected nothing, failed to build, could not start or timed out is
+  `error` with a reason (never `failed`), and runs the test under the
+  language's coverage tool.
+- Dependence for every supported language. A JavaScript or TypeScript
+  mechanism is disabled by a setup file registered for the run (jest
+  `--setupFilesAfterEnv`, a temporary vitest config extending the project's
+  with a `setupFiles` entry, mocha `--require`) that mocks the module by its
+  resolved path and replaces the export (`default`, a function, or
+  `Class.method` on the prototype) with a function that throws. Go, Rust,
+  Java, Kotlin, C, C++, C#, Swift, Verilog, SystemVerilog and VHDL mechanisms
+  are disabled by source mutation: the definition's body is replaced by one
+  that aborts (a Verilog `module` by a stub with the same ANSI header whose
+  outputs are driven to `x`, a `function`/`task` by `$fatal`, a labelled
+  block, `property`, `sequence` or `assert` removed; a VHDL `architecture`
+  emptied, a `process` removed, a `function`/`procedure` by `assert false`),
+  the tree is compile- or lint-checked first with the language's toolchain,
+  the file is refused when it has uncommitted changes, and the original
+  bytes are restored afterwards and verified by hash. A compile failure, a
+  refused file or a mechanism that cannot be disabled records `error` with
+  the reason in `fails_without[].reason`, which the verifier reads as
+  unknown.
+- `attest-reach`: runs each nominated test alone under coverage through the
+  runner adapter and signs the lines it executed in the mechanism's file
+  into a `predicate.kind = "reach"` attestation (`-reach` suffix), in the
+  same per-test `reached: [{file, lines}]` shape `attest-tests --coverage`
+  records. Only the mechanism's file is kept. Same pair sources
+  (`--pair`, `--from-model`), same `--timeout` / `--total-timeout` budget
+  (unrun pairs recorded as `error` with a reason), same signing ladder as
+  `attest-dependence`. Go `-coverprofile`, SimpleCov `.resultset.json` and
+  Clover XML are converted to LCOV; JaCoCo and Cobertura are read as they
+  are.
+- Action inputs `reach-pairs`, `runner`, `run-cmd`, `coverage-cmd` and
+  `coverage-file`; `dependence-pairs` is no longer Python-only.
+- `--strategy hook` on `attest-dependence` and `attest-reach` (default stays
+  `mutation`): a second dependence strategy for compiled codebases that
+  build once. The repository places a tripwire inside each mechanism's own
+  body, gated out of production by a build flag (Go tag / Rust feature
+  `mipiti_hooks`, C/C++ and Swift `MIPITI_HOOKS`, Verilog `` `MIPITI_HOOKS ``,
+  a VHDL generic; Java/Kotlin compiled always, inert), that aborts with
+  `mipiti-hook <file>::<symbol> at <file>:<line>` only when
+  `MIPITI_DISABLE_MECHANISM` equals its own id. The go runner builds one
+  test binary per package with `go test -c -tags mipiti_hooks`, cargo with
+  `cargo test --no-run --features mipiti_hooks`, the command runner with a
+  new `--build-cmd`, then each pair runs with its mechanism named; no
+  source is rewritten and the tree need not be clean. Two mandatory checks
+  are recorded: the location proof (dependence is credited only when the
+  marker for this mechanism lies inside its exactly located definition,
+  recorded as `fails_without[].hook_location`; a failure without the marker
+  or with one outside the span is `error` with the reason) and a control
+  run (every nominated test once with a value no hook answers to, recorded
+  as `control_run`; any failure records `error` for every pair and stops).
+  The record carries `strategy: "hook"`. pytest, jest, vitest and mocha
+  refuse the strategy with a reason pointing at their runtime disable.
+  Action inputs `strategy` and `build-cmd`.
+- `attest-dependence --suite-cmd "<command>" --suite-junit <report>`:
+  dependence from a whole-suite run, for simulators and any harness that
+  cannot select one test. Pairs are grouped by mechanism; each mechanism is
+  disabled in turn through the runner's strategy (same compile/lint gate,
+  same byte-exact restore), the suite command runs once, and the JUnit
+  report it wrote gives every nominated test its outcome. A skipped test
+  records `error` with reason `skipped under mutation`, an absent one
+  `not in report`, a run that wrote no report `no report`, and a failed
+  gate its reason, for every pair on that mechanism. `--timeout` applies
+  per suite run and `--total-timeout` across mechanisms. Same
+  `kind: "dependence"` attestation. Action inputs `suite-cmd` and
+  `suite-junit`. The pytest disable plugin also loads through
+  `PYTEST_PLUGINS`, so a pytest suite command needs no extra flag.
+- `attest-dependence --total-timeout` (default 1800s, also
+  `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would
+  start after the budget is spent is recorded as not run, with a `reason`,
+  and reads as unknown rather than as an outcome.
+- `run --test-file-pattern` (also `MIPITI_TEST_FILE_PATTERN`) marks
+  additional paths as test files for the `--changed-files` rule, for
+  repositories whose tests live outside the conventional layouts.
 - Each `test_attested` result submitted to the platform carries the signing
   class of the attestation it was checked against (`ci_oidc`, `customer_key`
   or `unsigned`) in a `provenance` field, as data rather than inside the

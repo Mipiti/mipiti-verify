@@ -15,9 +15,12 @@ as the TLA+ model, this test:
        implementation's output.
 
 The BFS is the regression gate: any change to `cli.py` that breaks
-an invariant produces a failed parametrised test naming the exact
-abstract (pkg, pins) tuple that violated it — the same kind of
-counterexample TLC would emit.
+an invariant fails that invariant's test with every violating abstract
+(pkg, pins) tuple collected as (pkg, pins, expected, got), the first ten
+quoted — the same kind of counterexample TLC would emit. The space is
+enumerated once per session, in-process, and each invariant is one test
+function over the collected rows (a parametrised layout spent most of
+its time in per-case overhead).
 
 CI Fulcio integration:
     The test detects whether the CI runner has OIDC token access
@@ -30,10 +33,11 @@ CI Fulcio integration:
     permission — bundle-present rows skip and only no-bundle rows
     execute.
 
-State space: 4 SANs × 3 issuers × 3 fingerprints × ~6 package shapes
-(no-bundle) + ~4 bundle shapes when OIDC is available. ~1800–2200
-total parametrised rows. Runs in a few seconds locally, ~30s in CI
-with the Fulcio mint amortised across rows.
+State space: 5 SANs × 3 issuers × 3 fingerprints × 2 model-id pins × 2
+commit pins, over every package shape (bundle rows included, skipped
+inside the sweep without OIDC and counted in every assertion message).
+About 9,000 executed rows locally in roughly a minute; more in CI with
+the Fulcio mint amortised across rows.
 """
 
 from __future__ import annotations
@@ -1518,127 +1522,199 @@ def _skip_outside_modeled_domain(pkg: dict, pins: dict) -> None:
     return
 
 
-# --- Tests --------------------------------------------------------------
+# --- Driver: one sweep of the (Package, Pins) space --------------------
+#
+# The space is enumerated ONCE per session, in-process, and every
+# invariant below is one test function over the collected rows. A
+# parametrised layout (one pytest case per cell) spends most of its time
+# in pytest's own per-case overhead; enumerating internally keeps the
+# same finite space, the same spec mirror and the same invariant
+# definitions, and reports every counterexample of an invariant together
+# as (pkg, pins, expected, got).
+#
+# The Fulcio gating is exactly the per-case gating: a bundle-present row
+# (or a real-SAN pin) is materialised only when a real bundle could be
+# minted; otherwise the row is skipped inside the loop, counted, and the
+# count is reported in each invariant's assertion message.
 
 
-@pytest.mark.parametrize(
-    "pkg",
-    PACKAGES,
-    ids=[_pkg_id(p) for p in PACKAGES],
-)
-@pytest.mark.parametrize(
-    "pins",
-    PINS_LIST,
-    ids=[_pins_id(p) for p in PINS_LIST],
-)
-def test_implementation_matches_spec(tmp_path, pkg, pins):
+class _Row:
+    __slots__ = ("pkg", "pins", "verdict", "output")
+
+    def __init__(self, pkg: dict, pins: dict, verdict: str, output: str):
+        self.pkg = pkg
+        self.pins = pins
+        self.verdict = verdict
+        self.output = output
+
+    @property
+    def is_cd(self) -> bool:
+        # Customer-keyed offline DSSE discriminator (mirrors audit.tla's
+        # IsCustomerDsse). The identity-pin invariants are key_source-AWARE:
+        # the SAN / predicate-co-pin / workspace-fp pin clauses are scoped
+        # OUT of customer_dsse (the CLI's customer-DSSE path gates identity
+        # solely on --expected-customer-key); the corresponding positive
+        # properties are asserted as V5a/V5b. The issuer-explicit-alone
+        # clause stays key_source-unconditional.
+        ws_cd = self.pkg.get("ws_sig")
+        return (
+            ws_cd is not ABSENT
+            and ws_cd is not None
+            and ws_cd.get("key_source") == "customer_dsse"
+        )
+
+
+class _Sweep:
+    def __init__(self, rows: list, skipped: int, skip_reasons: dict):
+        self.rows = rows
+        self.skipped = skipped
+        self.skip_reasons = skip_reasons
+
+    def gating(self) -> str:
+        reasons = "; ".join(f"{n} x {r}" for r, n in sorted(self.skip_reasons.items()))
+        return (f"{len(self.rows)} rows executed, {self.skipped} Fulcio-gated rows skipped"
+                + (f" ({reasons})" if reasons else ""))
+
+
+def _sweep_space(tmp_path) -> _Sweep:
+    """Run the real CLI over every (Package, Pins) cell once."""
+    rows: list = []
+    skipped = 0
+    skip_reasons: dict = {}
+    runner = CliRunner()
+    for pkg in PACKAGES:
+        for pins in PINS_LIST:
+            try:
+                pkg_resolved = _resolve_bundle_san(pkg)
+                pins_resolved = _resolve_pins_san(pins)
+                _skip_outside_modeled_domain(pkg_resolved, pins_resolved)
+                path = _materialise(tmp_path, pkg_resolved)
+            except pytest.skip.Exception as e:
+                skipped += 1
+                reason = str(e).split(" not in ")[0] if "not in minted set" in str(e) else str(e)
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                continue
+            result = runner.invoke(
+                main,
+                ["audit", path]
+                + _pin_args(pins_resolved)
+                + _customer_key_args(tmp_path, pkg_resolved),
+            )
+            rows.append(_Row(pkg_resolved, pins_resolved, _classify(result), result.output))
+    return _Sweep(rows, skipped, skip_reasons)
+
+
+@pytest.fixture(scope="module")
+def sweep(tmp_path_factory) -> _Sweep:
+    return _sweep_space(tmp_path_factory.mktemp("spec-bfs"))
+
+
+def _assert_no_counterexamples(name: str, sweep: _Sweep, bad: list) -> None:
+    """``bad`` is ``[(pkg, pins, expected, got, output)]``; the first ten
+    are quoted, the gating is stated, so the message is actionable and the
+    skipped rows are never mistaken for checked ones."""
+    print(f"{name}: {sweep.gating()}; {len(bad)} counterexample(s)")
+    if not bad:
+        return
+    lines = [f"{name} violated in {len(bad)} of {len(sweep.rows)} rows ({sweep.gating()}). "
+             f"First {min(10, len(bad))}:"]
+    for pkg, pins, expected, got, output in bad[:10]:
+        lines.append(
+            f"  pkg = {pkg}\n  pins = {pins}\n  expected = {expected}\n  got = {got}\n"
+            f"  output:\n{output}"
+        )
+    pytest.fail("\n".join(lines))
+
+
+# --- Spec agreement -----------------------------------------------------
+
+
+def test_implementation_matches_spec(sweep):
     """For every (Package, Pins), spec_verdict == real_verdict.
 
     This is the implementation conformance check: any divergence
     between the TLA+-mirror `audit_spec()` and the actual Python
-    `audit()` Click command is a regression. Pytest reports the
-    offending (pkg, pins) ID in the test name so it's actionable.
+    `audit()` Click command is a regression. The counterexample names
+    the exact (pkg, pins) so it's actionable.
     """
-    pkg_resolved = _resolve_bundle_san(pkg)
-    pins_resolved = _resolve_pins_san(pins)
-    _skip_outside_modeled_domain(pkg_resolved, pins_resolved)
-    expected = audit_spec(pkg_resolved, pins_resolved)
-    path = _materialise(tmp_path, pkg_resolved)
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        ["audit", path]
-        + _pin_args(pins_resolved)
-        + _customer_key_args(tmp_path, pkg_resolved),
-    )
-    actual = _classify(result)
-    assert actual == expected, (
-        f"Spec/impl divergence:\n"
-        f"  pkg = {pkg_resolved}\n"
-        f"  pins = {pins_resolved}\n"
-        f"  spec verdict = {expected}\n"
-        f"  impl verdict = {actual}\n"
-        f"  output:\n{result.output}"
-    )
+    bad = []
+    for row in sweep.rows:
+        expected = audit_spec(row.pkg, row.pins)
+        if row.verdict != expected:
+            bad.append((row.pkg, row.pins, expected, row.verdict, row.output))
+    _assert_no_counterexamples("Spec/impl agreement", sweep, bad)
 
 
-@pytest.mark.parametrize("pins", PINS_LIST, ids=[_pins_id(p) for p in PINS_LIST])
-@pytest.mark.parametrize("pkg", PACKAGES, ids=[_pkg_id(p) for p in PACKAGES])
-def test_invariants_on_implementation(tmp_path, pkg, pins):
-    """Each of I1–I7 holds on the actual Python implementation.
+# --- Invariants I1–I14 and V5 on the implementation ---------------------
+#
+# Each of I1–I7 (and I8–I14, V5) holds on the actual Python
+# implementation. Same enumeration as test_implementation_matches_spec
+# but each assertion is the invariant in its raw form. A failure here
+# pins down which specific invariant the implementation violated, even
+# if test_implementation_matches_spec also fails for the same row.
 
-    Same enumeration as test_implementation_matches_spec but each
-    assertion is the invariant in its raw form. A failure here pins
-    down which specific invariant the implementation violated, even
-    if test_implementation_matches_spec also fails for the same row.
-    """
-    pkg_resolved = _resolve_bundle_san(pkg)
-    pins = _resolve_pins_san(pins)
-    _skip_outside_modeled_domain(pkg_resolved, pins)
-    path = _materialise(tmp_path, pkg_resolved)
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        ["audit", path]
-        + _pin_args(pins)
-        + _customer_key_args(tmp_path, pkg_resolved),
-    )
-    verdict = _classify(result)
 
-    # Customer-keyed offline DSSE discriminator (mirrors audit.tla's
-    # IsCustomerDsse). The identity-pin invariants below are
-    # key_source-AWARE: the SAN / predicate-co-pin / workspace-fp pin
-    # clauses are scoped OUT of customer_dsse (the CLI's customer-DSSE
-    # path gates identity solely on --expected-customer-key); the
-    # corresponding positive properties are asserted as V5a/V5b. The
-    # issuer-explicit-alone clause stays key_source-unconditional.
-    ws_cd = pkg_resolved.get("ws_sig")
-    is_cd = (
-        ws_cd is not ABSENT
-        and ws_cd is not None
-        and ws_cd.get("key_source") == "customer_dsse"
-    )
-
+def _i7_applies(row: _Row) -> bool:
     # I7 — issuer-explicit-alone (no SAN) is a usage error for EVERY
     # key_source (cli.py line ~1840). The model_id / commit_sha
     # co-pin clause is a usage error too, EXCEPT for customer_dsse,
     # whose --expected-customer-key is the SAN-substitute (cli.py
-    # line ~1866).
-    if pins["san"] is None and (
+    # line ~1866). When it applies, I7 fires first — the other
+    # invariants don't apply to that row.
+    pins = row.pins
+    return pins["san"] is None and (
         pins["issuer_explicit"] is not None
         or (
             (pins.get("model_id") is not None
              or pins.get("commit_sha") is not None)
-            and not is_cd
+            and not row.is_cd
         )
-    ):
-        assert verdict == "USAGE_ERROR", (
-            f"I7 violated: pins={pins}, verdict={verdict}\n{result.output}"
-        )
-        return  # I7 fires first — other invariants don't apply.
+    )
 
+
+def _check(sweep: _Sweep, name: str, applies, expected) -> None:
+    """Sweep one invariant: ``applies(row)`` says whether its premise
+    holds (I7 rows excluded for every invariant but I7); ``expected(row)``
+    gives ``(expected, got)`` and the pair must agree."""
+    bad = []
+    for row in sweep.rows:
+        if name != "I7" and _i7_applies(row):
+            continue
+        if not applies(row):
+            continue
+        exp, got = expected(row)
+        if exp != got:
+            bad.append((row.pkg, row.pins, exp, got, row.output))
+    _assert_no_counterexamples(name, sweep, bad)
+
+
+def test_i7_issuer_or_copin_without_san_is_a_usage_error(sweep):
+    _check(sweep, "I7", _i7_applies, lambda r: ("USAGE_ERROR", r.verdict))
+
+
+def test_i1_san_pin_without_bundle_fails(sweep):
     # I1 — SAN pin + no bundle ⇒ FAILED. Scoped out of customer_dsse:
     # the dsse_bundle is its own upstream evidence (cli.py line
     # ~2750), so a SAN / predicate pin + no Sigstore bundle is not
     # pin-bypass-by-omission for that key_source — see V5b.
-    if (
-        pins["san"] is not None
-        and pkg_resolved["bundle"] is ABSENT
-        and not is_cd
-    ):
-        assert verdict == "FAILED", (
-            f"I1 violated: pins={pins}, pkg={pkg_resolved}, verdict={verdict}\n"
-            f"{result.output}"
-        )
+    _check(
+        sweep, "I1",
+        lambda r: r.pins["san"] is not None and r.pkg["bundle"] is ABSENT and not r.is_cd,
+        lambda r: ("FAILED", r.verdict),
+    )
 
+
+def test_i2_workspace_pin_without_ws_sig_fails(sweep):
     # I2 — workspace pin + no ws_sig ⇒ FAILED. (customer_dsse always
     # carries a ws_sig, so this is vacuous there — left unscoped.)
-    if pins["workspace_fp"] is not None and pkg_resolved["ws_sig"] is ABSENT:
-        assert verdict == "FAILED", (
-            f"I2 violated: pins={pins}, pkg={pkg_resolved}, verdict={verdict}\n"
-            f"{result.output}"
-        )
+    _check(
+        sweep, "I2",
+        lambda r: r.pins["workspace_fp"] is not None and r.pkg["ws_sig"] is ABSENT,
+        lambda r: ("FAILED", r.verdict),
+    )
 
+
+def test_v5_customer_dsse_pinned_verdict(sweep):
     # V5a/V5b — the customer_dsse pinned property, asserted positively
     # against the real CLI. The materialiser always supplies the
     # matching --expected-customer-key (via _customer_key_args) and
@@ -1650,77 +1726,72 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     # INDEPENDENT of any SAN / issuer / workspace-fp pin set, proving
     # those pins do not gate customer_dsse (V5c). --expected-issuer
     # alone is excluded (key_source-independent USAGE_ERROR handled
-    # by the I7 return above).
-    if is_cd:
-        hash_intact = (
-            pkg_resolved["results_hash"]
-            == pkg_resolved["results_canonical_hash"]
-        )
-        expected_cd = "VERIFIED" if hash_intact else "FAILED"
-        assert verdict == expected_cd, (
-            f"V5 violated: customer_dsse pinned verdict\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n"
-            f"  expected={expected_cd}, got={verdict}\n{result.output}"
-        )
+    # by the I7 exclusion).
+    def expected(r):
+        hash_intact = r.pkg["results_hash"] == r.pkg["results_canonical_hash"]
+        return ("VERIFIED" if hash_intact else "FAILED", r.verdict)
 
+    _check(sweep, "V5", lambda r: r.is_cd, expected)
+
+
+def test_i3_bundle_issuer_differs_from_resolved_expected_fails(sweep):
     # I3 — bundle present + pin SAN matches but bundle's actual issuer
     # differs from resolved expected: must FAIL. (For real Fulcio
     # bundles, the actual issuer is always GitHub Actions, so this
     # invariant fires when the auditor pinned a non-GitHub explicit
     # issuer alongside the real GitHub SAN.)
-    if (
-        pkg_resolved["bundle"] is not ABSENT
-        and pins["san"] is not None
-        and pkg_resolved["bundle"]["san"] == pins["san"]
-        and _resolve_issuer(pins) is not None
-        and pkg_resolved["bundle"]["issuer"] != _resolve_issuer(pins)
-    ):
-        assert verdict == "FAILED", (
-            f"I3 violated: bundle issuer ≠ resolved expected, but pass\n"
-            f"  pkg={pkg_resolved}, pins={pins}, verdict={verdict}\n"
-            f"  resolved={_resolve_issuer(pins)}\n{result.output}"
-        )
+    _check(
+        sweep, "I3",
+        lambda r: (
+            r.pkg["bundle"] is not ABSENT
+            and r.pins["san"] is not None
+            and r.pkg["bundle"]["san"] == r.pins["san"]
+            and _resolve_issuer(r.pins) is not None
+            and r.pkg["bundle"]["issuer"] != _resolve_issuer(r.pins)
+        ),
+        lambda r: ("FAILED", r.verdict),
+    )
 
+
+def test_i4_workspace_pin_mismatch_fails(sweep):
     # I4 — workspace pin + signing_key_fp ≠ pinned ⇒ FAILED. Scoped
     # out of customer_dsse: the customer-DSSE CLI path never consults
     # --expected-workspace-key; its identity binding is the
-    # --expected-customer-key fingerprint pin (asserted via V5
-    # above).
-    if (
-        pins["workspace_fp"] is not None
-        and pkg_resolved["ws_sig"] is not ABSENT
-        and not is_cd
-        and pkg_resolved["ws_sig"]["signing_key_fp"] != pins["workspace_fp"]
-    ):
-        assert verdict == "FAILED", (
-            f"I4 violated: pins={pins}, pkg={pkg_resolved}, verdict={verdict}\n"
-            f"{result.output}"
-        )
+    # --expected-customer-key fingerprint pin (asserted via V5).
+    _check(
+        sweep, "I4",
+        lambda r: (
+            r.pins["workspace_fp"] is not None
+            and r.pkg["ws_sig"] is not ABSENT
+            and not r.is_cd
+            and r.pkg["ws_sig"]["signing_key_fp"] != r.pins["workspace_fp"]
+        ),
+        lambda r: ("FAILED", r.verdict),
+    )
 
+
+def test_i5_verified_implies_a_valid_signature_was_checked(sweep):
     # I5 — VERIFIED ⇒ at least one valid signature was checked.
-    if verdict == "VERIFIED":
-        has_valid_bundle = (
-            pkg_resolved["bundle"] is not ABSENT and pkg_resolved["bundle"]["valid"]
-        )
-        has_valid_ws = (
-            pkg_resolved["ws_sig"] is not ABSENT and pkg_resolved["ws_sig"]["valid"]
-        )
-        assert has_valid_bundle or has_valid_ws, (
-            f"I5 violated: VERIFIED with no valid evidence\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    def expected(r):
+        has_valid_bundle = r.pkg["bundle"] is not ABSENT and r.pkg["bundle"]["valid"]
+        has_valid_ws = r.pkg["ws_sig"] is not ABSENT and r.pkg["ws_sig"]["valid"]
+        return ("a valid bundle or ws_sig", "a valid bundle or ws_sig"
+                if (has_valid_bundle or has_valid_ws) else "VERIFIED with no valid evidence")
 
+    _check(sweep, "I5", lambda r: r.verdict == "VERIFIED", expected)
+
+
+def test_i6_positive_verdict_implies_hash_matches_canonical(sweep):
     # I6 — VERIFIED|PARTIALLY ⇒ results_hash matches canonical (when
     # results_hash is set).
-    if (
-        verdict in {"VERIFIED", "PARTIALLY_VERIFIED"}
-        and pkg_resolved["results_hash"] is not None
-    ):
-        assert pkg_resolved["results_hash"] == pkg_resolved["results_canonical_hash"], (
-            f"I6 violated: positive verdict with hash mismatch\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    _check(
+        sweep, "I6",
+        lambda r: r.verdict in {"VERIFIED", "PARTIALLY_VERIFIED"} and r.pkg["results_hash"] is not None,
+        lambda r: (r.pkg["results_canonical_hash"], r.pkg["results_hash"]),
+    )
 
+
+def test_i8_positive_verdict_with_bundle_binds_the_bundle_hash(sweep):
     # I8 — VERIFIED|PARTIALLY with bundle ⇒ bundle_bind_hash present
     # and bundle.bound_hash matches it. Defense-in-depth check beyond
     # Sigstore's verify_artifact: the envelope's explicit
@@ -1728,21 +1799,19 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     # binds to. results_hash is independently recomputed downstream
     # against the platform's content-integrity signature; it is not
     # part of the bundle-bind check.
-    if (
-        verdict in {"VERIFIED", "PARTIALLY_VERIFIED"}
-        and pkg_resolved["bundle"] is not ABSENT
-    ):
-        assert pkg_resolved.get("bundle_bind_hash") is not None, (
-            f"I8 violated: positive verdict with bundle but no bundle_bind_hash\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
-        assert (
-            pkg_resolved["bundle"]["bound_hash"] == pkg_resolved["bundle_bind_hash"]
-        ), (
-            f"I8 violated: positive verdict with bundle.bound_hash != bundle_bind_hash\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    def expected(r):
+        if r.pkg.get("bundle_bind_hash") is None:
+            return ("bundle_bind_hash present", "no bundle_bind_hash")
+        return (r.pkg["bundle_bind_hash"], r.pkg["bundle"]["bound_hash"])
 
+    _check(
+        sweep, "I8",
+        lambda r: r.verdict in {"VERIFIED", "PARTIALLY_VERIFIED"} and r.pkg["bundle"] is not ABSENT,
+        expected,
+    )
+
+
+def test_i9_verified_implies_every_present_signature_is_valid(sweep):
     # I9 (refined) — VERIFIED ⇒ every present signature is valid,
     # EXCEPT when the ws_sig carries key_source ∈ {sigstore,
     # customer_dsse, unverifiable_orphan}. Sigstore-tagged ws_sig is
@@ -1757,106 +1826,83 @@ def test_invariants_on_implementation(tmp_path, pkg, pins):
     # VERIFIED preconditions. Mirrors the audit.tla
     # I9_AllPresentSignaturesValid refinement (skip set
     # {KS_SIGSTORE, KS_CUSTOMER_DSSE, KS_ORPHAN}).
-    if verdict == "VERIFIED":
-        if pkg_resolved["bundle"] is not ABSENT:
-            assert pkg_resolved["bundle"]["valid"], (
-                f"I9 violated: VERIFIED with invalid bundle present\n"
-                f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-            )
-        if pkg_resolved["ws_sig"] is not ABSENT:
-            ws_ks = pkg_resolved["ws_sig"].get("key_source", "legacy")
-            if ws_ks not in ("sigstore", "customer_dsse", "unverifiable_orphan"):
-                assert pkg_resolved["ws_sig"]["valid"], (
-                    f"I9 violated: VERIFIED with invalid ws_sig present "
-                    f"(key_source={ws_ks!r})\n"
-                    f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-                )
+    def expected(r):
+        if r.pkg["bundle"] is not ABSENT and not r.pkg["bundle"]["valid"]:
+            return ("every present signature valid", "VERIFIED with invalid bundle present")
+        if r.pkg["ws_sig"] is not ABSENT:
+            ws_ks = r.pkg["ws_sig"].get("key_source", "legacy")
+            if ws_ks not in ("sigstore", "customer_dsse", "unverifiable_orphan") \
+                    and not r.pkg["ws_sig"]["valid"]:
+                return ("every present signature valid",
+                        f"VERIFIED with invalid ws_sig present (key_source={ws_ks!r})")
+        return ("every present signature valid", "every present signature valid")
 
+    _check(sweep, "I9", lambda r: r.verdict == "VERIFIED", expected)
+
+
+def test_i10_unbindable_bundle_is_never_verified(sweep):
     # I10 — bundle present + results_hash = NONE ⇒ not VERIFIED. The
     # bundle has no artifact to bind to and Sigstore verify_artifact
     # cannot run; the implementation must emit UNVERIFIED or FAILED.
-    if (
-        pkg_resolved["bundle"] is not ABSENT
-        and pkg_resolved["results_hash"] is None
-    ):
-        assert verdict in {"UNVERIFIED", "FAILED"}, (
-            f"I10 violated: VERIFIED with unbindable bundle\n"
-            f"  pkg={pkg_resolved}, pins={pins}, verdict={verdict}\n"
-            f"{result.output}"
-        )
+    _check(
+        sweep, "I10",
+        lambda r: r.pkg["bundle"] is not ABSENT and r.pkg["results_hash"] is None,
+        lambda r: ("UNVERIFIED or FAILED",
+                   r.verdict if r.verdict not in {"UNVERIFIED", "FAILED"} else "UNVERIFIED or FAILED"),
+    )
 
+
+def test_i11_verified_with_bundle_and_san_pin_means_san_matches(sweep):
     # I11 — VERIFIED with bundle + SAN pin ⇒ bundle.san = pin.san.
     # Defense-in-depth on top of policy.Identity's SAN check.
-    if (
-        verdict == "VERIFIED"
-        and pkg_resolved["bundle"] is not ABSENT
-        and pins["san"] is not None
-    ):
-        assert pkg_resolved["bundle"]["san"] == pins["san"], (
-            f"I11 violated: VERIFIED with bundle.san != pin.san\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    _check(
+        sweep, "I11",
+        lambda r: r.verdict == "VERIFIED" and r.pkg["bundle"] is not ABSENT and r.pins["san"] is not None,
+        lambda r: (r.pins["san"], r.pkg["bundle"]["san"]),
+    )
 
+
+def test_i12_verified_with_bundle_and_model_pin_means_model_matches(sweep):
     # I12 — VERIFIED + bundle + model_id pin ⇒
     # bundle.predicate_model_id = pin.model_id. Defends against
     # cross-model substitution.
-    if (
-        verdict == "VERIFIED"
-        and pkg_resolved["bundle"] is not ABSENT
-        and pins.get("model_id") is not None
-    ):
-        assert (
-            pkg_resolved["bundle"].get("predicate_model_id") == pins["model_id"]
-        ), (
-            f"I12 violated: VERIFIED with predicate.model_id != pin.model_id\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    _check(
+        sweep, "I12",
+        lambda r: (r.verdict == "VERIFIED" and r.pkg["bundle"] is not ABSENT
+                   and r.pins.get("model_id") is not None),
+        lambda r: (r.pins["model_id"], r.pkg["bundle"].get("predicate_model_id")),
+    )
 
+
+def test_i13_verified_with_bundle_and_commit_pin_means_commit_matches(sweep):
     # I13 — VERIFIED + bundle + commit_sha pin ⇒
     # bundle.predicate_commit_sha = pin.commit_sha. Defends against
     # replay of an older verification run.
-    if (
-        verdict == "VERIFIED"
-        and pkg_resolved["bundle"] is not ABSENT
-        and pins.get("commit_sha") is not None
-    ):
-        assert (
-            pkg_resolved["bundle"].get("predicate_commit_sha")
-            == pins["commit_sha"]
-        ), (
-            f"I13 violated: VERIFIED with predicate.commit_sha != "
-            f"pin.commit_sha\n  pkg={pkg_resolved}, pins={pins}\n"
-            f"{result.output}"
-        )
+    _check(
+        sweep, "I13",
+        lambda r: (r.verdict == "VERIFIED" and r.pkg["bundle"] is not ABSENT
+                   and r.pins.get("commit_sha") is not None),
+        lambda r: (r.pins["commit_sha"], r.pkg["bundle"].get("predicate_commit_sha")),
+    )
 
+
+def test_i14_verified_with_bundle_has_a_valid_bind(sweep):
     # I14 — VERIFIED + bundle present ⇒ bundle_bind_hash equals the
     # bundle's Subject digest AND, when bundle_bind_signature is
     # populated, the signature is valid. The verifier reads
     # bundle_bind_hash off the envelope and compares directly with no
     # canonicalisation; older envelopes that omit the field cannot
     # earn VERIFIED.
-    if (
-        verdict == "VERIFIED"
-        and pkg_resolved["bundle"] is not ABSENT
-    ):
-        assert pkg_resolved.get("bundle_bind_hash") is not None, (
-            f"I14 violated: VERIFIED with bundle but no bundle_bind_hash\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
-        assert (
-            pkg_resolved["bundle"]["bound_hash"]
-            == pkg_resolved["bundle_bind_hash"]
-        ), (
-            f"I14 violated: VERIFIED with bundle.bound_hash != "
-            f"bundle_bind_hash\n  pkg={pkg_resolved}, pins={pins}\n"
-            f"{result.output}"
-        )
-        assert pkg_resolved.get("bundle_bind_signature") not in (
-            "INVALID", "KEY_UNRESOLVABLE"
-        ), (
-            f"I14 violated: VERIFIED with non-VALID bundle_bind_signature\n"
-            f"  pkg={pkg_resolved}, pins={pins}\n{result.output}"
-        )
+    def expected(r):
+        if r.pkg.get("bundle_bind_hash") is None:
+            return ("bundle_bind_hash present", "no bundle_bind_hash")
+        if r.pkg["bundle"]["bound_hash"] != r.pkg["bundle_bind_hash"]:
+            return (r.pkg["bundle_bind_hash"], r.pkg["bundle"]["bound_hash"])
+        if r.pkg.get("bundle_bind_signature") in ("INVALID", "KEY_UNRESOLVABLE"):
+            return ("VALID bundle_bind_signature", r.pkg.get("bundle_bind_signature"))
+        return ("valid bind", "valid bind")
+
+    _check(sweep, "I14", lambda r: r.verdict == "VERIFIED" and r.pkg["bundle"] is not ABSENT, expected)
 
 
 # --- Scenario-knob invariants (V6..V12) -------------------------------
