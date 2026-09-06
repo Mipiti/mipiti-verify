@@ -105,7 +105,7 @@ jobs:
       - name: Install pinned dependencies
         run: pip install --require-hashes -r requirements.lock
 
-      - name: pip-audit (all three lockfiles)
+      - name: pip-audit (all four lockfiles)
         # Catches newly-published CVEs against already-pinned versions at
         # PR time. --disable-pip audits the lockfile directly without a
         # separate venv install. The audit tool itself is installed
@@ -143,9 +143,17 @@ jobs:
           pip-audit -r requirements.lock       --disable-pip $IGNORE
           pip-audit -r requirements-build.lock --disable-pip $IGNORE
           pip-audit -r requirements-all.lock   --disable-pip $IGNORE
+          pip-audit -r requirements-dev.lock   --disable-pip $IGNORE
+
+      - name: Install parsers for the definition locators
+        # The formal checkers over definition location (formal/check_adapters.py,
+        # A2/A5 parser arms) and the type checker's catalogue properties need the
+        # optional parser pack and the assertion catalogue; both hash-pinned via
+        # requirements-all.lock / requirements-dev.lock.
+        run: pip install --require-hashes -r requirements-all.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
@@ -354,7 +362,7 @@ jobs:
         run: pip install --require-hashes -r requirements.lock
 
       - name: Install package and dev extras
-        run: pip install --no-deps -e . && pip install pytest pytest-mock respx jsonschema pytest-xdist
+        run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run audit-spec BFS implementation check
         # Parallelize across all available CPU cores via pytest-xdist.

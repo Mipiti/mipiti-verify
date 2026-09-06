@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `no_plaintext_secret` refuses an empty or omitted `patterns` list: an
+  absence check names what it checked for, or it establishes nothing.
+
 - Formal checks over every verifier, every assertion type, the composition
   of test-evidence records, and every runner adapter
   (`formal/check_verifiers.py`, `formal/check_types.py`,

@@ -289,7 +289,15 @@ class NoPlaintextSecretVerifier:
         if content is None:
             return VerifierResult(passed=False, details=f"Source not found: {source}")
 
-        patterns = params.get("patterns", [])
+        patterns = params.get("patterns") or []
+        if not patterns:
+            # An absence claim over no patterns establishes nothing; it is
+            # refused rather than passed so a claim always names what it
+            # checked for.
+            return VerifierResult(
+                passed=False,
+                details="No patterns given: an absence check needs at least one pattern to check for.",
+            )
         found = []
         for pattern in patterns:
             try:

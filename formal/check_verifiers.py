@@ -312,6 +312,9 @@ def _spec_expected(atype: str, params: dict, project: Path) -> bool:
         content = _read_safe(file_param)
         if content is None:
             return False
+        if not params.get("patterns"):
+            # An absence check over nothing establishes nothing: refused.
+            return False
         for pattern in params.get("patterns", []):
             try:
                 if re2.search(pattern, content, options=quiet):
@@ -633,8 +636,8 @@ def _test_inputs() -> List[Tuple[str, str, dict]]:
         ("no_plaintext_secret: no pattern matches", "no_plaintext_secret", {"file": "app/clean.py", "patterns": [r"password\s*=\s*['\"]", r"AKIA[0-9A-Z]{16}"]}),
         ("no_plaintext_secret: a pattern matches", "no_plaintext_secret", {"file": "app/settings.py", "patterns": [r"password\s*=\s*['\"]", r"AKIA[0-9A-Z]{16}"]}),
         ("no_plaintext_secret: later pattern matches", "no_plaintext_secret", {"file": "app/settings.py", "patterns": [r"AKIA[0-9A-Z]{16}", r"hunter2"]}),
-        ("no_plaintext_secret: empty pattern list (vacuous)", "no_plaintext_secret", {"file": "app/settings.py", "patterns": []}),
-        ("no_plaintext_secret: patterns omitted (vacuous)", "no_plaintext_secret", {"file": "app/settings.py"}),
+        ("no_plaintext_secret: empty pattern list is refused", "no_plaintext_secret", {"file": "app/settings.py", "patterns": []}),
+        ("no_plaintext_secret: patterns omitted is refused", "no_plaintext_secret", {"file": "app/settings.py"}),
         ("no_plaintext_secret: unevaluable pattern is not absent", "no_plaintext_secret", {"file": "app/clean.py", "patterns": [r"(a)\1"]}),
         ("no_plaintext_secret: file missing", "no_plaintext_secret", {"file": "missing.py", "patterns": [r"password"]}),
         ("no_plaintext_secret: path traversal", "no_plaintext_secret", {"file": "../../etc/passwd", "patterns": [r"root"]}),

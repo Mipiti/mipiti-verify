@@ -60,6 +60,9 @@ dev = [
     "pytest-mock>=3",
     "respx>=0.22",
     "jsonschema>=4",
+    "pytest-xdist>=3",
+    # The assertion catalogue, for the type-design checker (formal/check_types.py).
+    "mipiti-mcp>=0.74",
 ]
 
 [tool.pytest.ini_options]
@@ -68,7 +71,7 @@ testpaths = ["tests"]
 # Transitive CVE floors (pinned at compile time only — uv's
 # constraint-dependencies don't ship in the published wheel's metadata,
 # they just force the lockfile resolution). Refresh the four lockfiles
-# (requirements.lock, requirements-all.lock, requirements-build.lock,
+# (requirements.lock, requirements-all.lock, requirements-build.lock, requirements-dev.lock,
 # and re-run pip-audit) when bumping these.
 [tool.uv]
 constraint-dependencies = [
