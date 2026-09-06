@@ -48,8 +48,13 @@ jobs:
           - audit_main_platform
           - audit_main_workspace
           - audit_main_cdsse
-          - audit_main_orphan_legacy
-          - audit_bundle_bind
+          - audit_main_orphan
+          - audit_main_legacy
+          - audit_bind_sigstore
+          - audit_bind_platform
+          - audit_bind_workspace
+          - audit_bind_orphan
+          - audit_bind_legacy
     steps:
       - env:
           CFG: ${{ matrix.cfg }}
