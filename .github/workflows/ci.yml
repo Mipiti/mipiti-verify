@@ -365,12 +365,10 @@ jobs:
         run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
       - name: Run audit-spec BFS implementation check
-        # Parallelize across all available CPU cores via pytest-xdist.
-        # Parametrized rows are pure functions of (pkg, pins) — no
-        # shared state between rows, so xdist-safe by construction.
-        # Real Fulcio bundle minting is per-worker (each xdist worker
-        # is a distinct process and re-mints its bundle set on first
-        # use); the 4 worker × ~8 predicate-combo mint cost is well
-        # under one minute, and the ~7,200-row BFS work is the
-        # dominant cost — net 3-4x speedup on a 4-core runner.
-        run: python -m pytest -v -n auto tests/test_spec_invariants.py
+        # The (Package, Pins) space is swept once per process, in a
+        # module-scoped fixture, and every invariant is one test over
+        # the collected rows. One process: under xdist each worker
+        # would sweep the whole space (and mint its own bundle set)
+        # for the few tests it is handed, so parallelism would only
+        # multiply the work.
+        run: python -m pytest -v tests/test_spec_invariants.py

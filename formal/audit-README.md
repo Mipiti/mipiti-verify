@@ -52,12 +52,15 @@ present.
   signature is the trust anchor; Sigstore and customer_dsse cover
   the whole body via DSSE and don't need the manifest).
 - `../tests/test_spec_invariants.py` — Python BFS. Enumerates the
-  same finite cross-product `Package × Pins`, runs the actual
-  Python `audit()` Click command on each materialised package, and
-  asserts the same invariants on the real verdict. In CI (with
-  `id-token: write` permission) bundle-present rows mint real
-  Sigstore bundles via Fulcio; locally and in fork-PR runs, those
-  rows skip and only the no-bundle slice executes.
+  same finite cross-product `Package × Pins` once per session, runs
+  the actual Python `audit()` Click command on each materialised
+  package, and asserts each invariant, as one test function over the
+  collected rows, on the real verdict; a violation fails that
+  invariant's test with every counterexample as `(pkg, pins,
+  expected, got)`, the first ten quoted. In CI (with `id-token:
+  write` permission) bundle-present rows mint real Sigstore bundles
+  via Fulcio; locally and in fork-PR runs, those rows skip inside
+  the sweep and the assertion message states how many.
 
 ## Running TLC
 
