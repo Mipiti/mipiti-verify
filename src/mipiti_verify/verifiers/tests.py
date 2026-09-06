@@ -278,14 +278,18 @@ class TestAttestedVerifier:
             params if isinstance(params, dict) else {},
             project_root, dependence or [], commit, reach=reach or [],
         )
+        sentence = _facts_sentence(facts, bool(parse_mechanism(params.get("mechanism"))[0])
+                                   if isinstance(params, dict) else False)
+        # The reason a fact is unknown is wording for the reader; the result
+        # record carries facts only.
+        facts.pop("depends_reason", None)
         return VerifierResult(
             passed=True,
             details=(
                 f"Attested by {provenance}: '{test_name}' passed in a run of "
                 f"{totals.get('total', 0)} test(s) at commit "
                 f"{(attested_commit or commit)[:12]}."
-                + _facts_sentence(facts, bool(parse_mechanism(params.get("mechanism"))[0])
-                                  if isinstance(params, dict) else False)
+                + sentence
             ),
             provenance=provenance,
             **facts,
@@ -417,6 +421,26 @@ def _reached_mechanism(entry: dict, project_root: Path | None,
     return False
 
 
+def _dependence_reason(dependence: list, test_name: str, commit: str,
+                       mechanism: str) -> str:
+    """Why a dependence run recorded no outcome for the pair, or ``""``:
+    the ``reason`` on the record for this commit that names the pair and
+    was not run. A reader then sees why the fact is unknown instead of an
+    unexplained gap."""
+    for statement in dependence:
+        predicate = statement.get("predicate") or {}
+        if not commit or str(predicate.get("commit") or "") != commit:
+            continue
+        for entry in predicate.get("tests") or []:
+            if not _names_test(entry, test_name):
+                continue
+            for item in entry.get("fails_without") or []:
+                if isinstance(item, dict) and str(item.get("mechanism") or "").strip() == mechanism \
+                        and item.get("reason"):
+                    return str(item["reason"])
+    return ""
+
+
 def _depends_on_mechanism(dependence: list, test_name: str, commit: str,
                           mechanism: str) -> bool | None:
     """Whether a dependence record says the test fails without the mechanism.
@@ -520,6 +544,10 @@ def _evidence_facts(entry: dict, test_name: str, params: dict,
     depends = _depends_on_mechanism(dependence, test_name, commit, mechanism)
     if depends is not None:
         facts["depends"] = depends
+    else:
+        reason = _dependence_reason(dependence, test_name, commit, mechanism)
+        if reason:
+            facts["depends_reason"] = reason
     return facts
 
 
@@ -547,7 +575,10 @@ def _facts_sentence(facts: dict, mechanism_named: bool) -> str:
         parts.append(f"definition {digest[:19]}…")
     if mechanism_named:
         parts.append(f"reached mechanism: {reach_wording(facts.get('reached'), facts.get('reach_scope', ''))}")
-        parts.append(f"fails without mechanism: {_yes_no(facts.get('depends'))}")
+        if facts.get("depends") is None and facts.get("depends_reason"):
+            parts.append(f"fails without mechanism: not established ({facts['depends_reason']})")
+        else:
+            parts.append(f"fails without mechanism: {_yes_no(facts.get('depends'))}")
     if not parts:
         return ""
     return " " + "; ".join(parts) + "."

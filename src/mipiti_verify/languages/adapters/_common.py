@@ -303,8 +303,10 @@ def mutated_file(
     dirty = git_has_changes(project_root, rel_file)
     if dirty is None:
         raise DisableError(
-            f"{rel_file} is not in a git checkout, so a mutation could not be "
-            f"proven restored; commit the file first")
+            f"{rel_file} is not in a git checkout (or git is not installed), so a "
+            f"source mutation could not be proven restored. Source mutation needs a "
+            f"clean git checkout; outside one, use --strategy hook for compiled code "
+            f"(Python and JavaScript are disabled at runtime and need no checkout)")
     if dirty:
         raise DisableError(
             f"{rel_file} has uncommitted changes; a mutation is only applied "

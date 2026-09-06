@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A dependence pair that recorded no outcome now says why in the verifier's
+  details (`fails without mechanism: not established (<reason>)`), and the
+  refusal outside a git checkout names the alternatives (`--strategy hook`;
+  runtime disabling for Python and JavaScript). The README states the git
+  requirement of source mutation.
 - `run --all` reports on the models bound to the repository it runs in. A
   model whose description provenance names another repository is skipped
   with one notice. One that names this repository has every coverage gap
