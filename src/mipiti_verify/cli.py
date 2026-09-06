@@ -794,12 +794,20 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
 
 @main.command(name="attest-reach")
 @_attest_run_options
+@click.option("--suite-cmd", default="", envvar="MIPITI_SUITE_CMD",
+              help=("Suite mode: a command that runs the whole suite under coverage and "
+                    "writes the report --coverage-file names, for harnesses that cannot "
+                    "run one test alone. Run ONCE; every nominated test records what the "
+                    "suite reached in its mechanism's file as suite_reached, with "
+                    "reach_scope = \"suite\". Information only: per-test reach is "
+                    "undefined for such a harness, so this never establishes the reach "
+                    "fact. Needs --coverage-file."))
 def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
                  base_url: str | None, repo: str, project_root: str,
                  commit: str, runner_name: str, run_cmd: str, coverage_cmd: str,
                  coverage_file: str, timeout: int, total_timeout: int,
                  key_path: str, key_passphrase: str, sigstore_tuf_url: str,
-                 sigstore_trust_config: str) -> None:
+                 sigstore_trust_config: str, suite_cmd: str) -> None:
     """Record which lines of its mechanism's file each test executes.
 
     THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
@@ -823,11 +831,23 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
     reason.
 
     The same two clocks as attest-dependence bound the run.
+
+    Suite mode (--suite-cmd "<command>" --coverage-file <report>) is for a
+    harness that cannot run one test alone. The command runs ONCE under
+    coverage and every nominated test records what the suite reached in
+    its mechanism's file as suite_reached, with reach_scope = "suite".
+    Per-test reach is undefined for such a harness, so the record is
+    information: it never establishes the reach fact, which stays unknown.
     """
     from pathlib import Path as _Path
 
     from .attestation import AttestationError, build_statement, locate_test_definitions
-    from .reach import KIND_REACH, run_reach
+    from .reach import KIND_REACH, REACH_SCOPE_SUITE, REACH_SCOPE_TEST, run_reach, run_suite_reach
+
+    suite = bool(suite_cmd.strip())
+    if suite and not coverage_file.strip():
+        click.echo("Error: --suite-cmd needs --coverage-file (the report the suite writes).", err=True)
+        raise SystemExit(1)
 
     root = _Path(project_root)
     pairs = _collect_pairs(pair_specs, model_id, api_key, base_url, repo, root)
@@ -837,31 +857,43 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
     def _progress(test: str, mechanism: str, status: str) -> None:
         click.echo(f"  {test} for {mechanism}: {status}")
 
-    click.echo(
-        f"Running {len(pairs)} test(s) alone under coverage through the "
-        f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
     try:
-        summary = run_reach(
-            root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
-            progress=_progress)
+        if suite:
+            click.echo(
+                f"Running the suite once under coverage for {len(pairs)} pair(s) "
+                f"(up to {timeout}s); recording suite-level reach, which does not "
+                f"establish per-test reach...")
+            summary = run_suite_reach(
+                root, pairs, suite_cmd=suite_cmd, coverage_file=coverage_file,
+                adapter=adapter, timeout=timeout, progress=_progress)
+        else:
+            click.echo(
+                f"Running {len(pairs)} test(s) alone under coverage through the "
+                f"{adapter.name} runner (up to {timeout}s each, {total_timeout}s in all)...")
+            summary = run_reach(
+                root, pairs, adapter=adapter, timeout=timeout, total_timeout=total_timeout,
+                progress=_progress)
     except AttestationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
     not_run = int(summary.pop("not_run", 0) or 0)
     summary.pop("runner", None)
     locate_test_definitions(root, summary["tests"])
-    click.echo(
-        f"Ran {len(pairs) - not_run} of {len(pairs)} test(s); {not_run} not "
-        f"run (total budget of {total_timeout}s exhausted)."
-        if not_run else f"Ran {len(pairs)} of {len(pairs)} test(s)."
-    )
+    if not suite:
+        click.echo(
+            f"Ran {len(pairs) - not_run} of {len(pairs)} test(s); {not_run} not "
+            f"run (total budget of {total_timeout}s exhausted)."
+            if not_run else f"Ran {len(pairs)} of {len(pairs)} test(s)."
+        )
 
     statement = build_statement(
         commit=resolved_commit,
         summary=summary,
-        invocation=["mipiti-verify", "attest-reach", "--runner", adapter.name],
+        invocation=["mipiti-verify", "attest-reach", "--runner", adapter.name]
+        + (["--suite"] if suite else []),
         selected_pattern="",
         kind=KIND_REACH,
+        reach_scope=REACH_SCOPE_SUITE if suite else REACH_SCOPE_TEST,
     )
     out_path, provenance = _write_run_attestation(
         root, statement, suffix="reach", model_id=model_id, key_path=key_path,
@@ -869,12 +901,21 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
         sigstore_trust_config=sigstore_trust_config)
 
     totals = summary["totals"]
-    reached = sum(1 for t in summary["tests"] if t.get("reached"))
-    click.echo(
-        f"Attested reach for {totals['total']} test(s) at {resolved_commit[:12]} "
-        f"({reached} reached their mechanism's file, {totals['errors']} without "
-        f"a coverage run) -> {out_path}"
-    )
+    if suite:
+        touched = sum(1 for t in summary["tests"] if t.get("suite_reached"))
+        click.echo(
+            f"Attested suite-level reach for {totals['total']} pair(s) at "
+            f"{resolved_commit[:12]} (the suite reached the mechanism's file for "
+            f"{touched}, {totals['errors']} without a coverage run); per-test reach "
+            f"stays unknown -> {out_path}"
+        )
+    else:
+        reached = sum(1 for t in summary["tests"] if t.get("reached"))
+        click.echo(
+            f"Attested reach for {totals['total']} test(s) at {resolved_commit[:12]} "
+            f"({reached} reached their mechanism's file, {totals['errors']} without "
+            f"a coverage run) -> {out_path}"
+        )
     _echo_provenance(provenance)
 
 

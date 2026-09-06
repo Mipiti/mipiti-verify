@@ -510,12 +510,18 @@ def build_statement(
     coverage: Optional[dict] = None,
     environment: Optional[dict] = None,
     kind: str = "",
+    reach_scope: str = "",
 ) -> dict:
     """Assemble the in-toto statement for one test run.
 
     ``kind`` distinguishes a second statement shape carried under the same
     predicate type: absent means a test-result record; ``"dependence"``
-    means each test's entry records how it fared with a mechanism disabled.
+    means each test's entry records how it fared with a mechanism disabled;
+    ``"reach"`` means each entry records what a coverage run executed.
+    ``reach_scope`` says what a reach record's coverage is scoped to:
+    ``"test"`` (each test run alone; the entries carry ``reached``) or
+    ``"suite"`` (one whole-suite run; the entries carry ``suite_reached``
+    and never ``reached``).
     """
     totals = summary["totals"]
     predicate: dict[str, Any] = {
@@ -534,6 +540,8 @@ def build_statement(
     }
     if kind:
         predicate["kind"] = kind
+    if reach_scope:
+        predicate["reach_scope"] = reach_scope
     if coverage:
         predicate["coverage"] = coverage
     if environment is not None:

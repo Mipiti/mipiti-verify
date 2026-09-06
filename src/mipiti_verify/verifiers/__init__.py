@@ -32,6 +32,12 @@ class VerifierResult:
     evidence_hash: str = ""
     reached: bool | None = None
     depends: bool | None = None
+    # What qualifies an unknown ``reached``: ``"suite"`` when the only
+    # coverage on record for the test is a whole-suite run (a reach record
+    # with ``reach_scope = "suite"``), which says what the suite executed,
+    # not what the test did. Empty otherwise. Not a fact: never reported
+    # as an outcome.
+    reach_scope: str = ""
 
 
 class PathTraversalError(Exception):

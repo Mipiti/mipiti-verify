@@ -103,6 +103,11 @@ if [ -n "${INPUT_REACH_PAIRS:-}" ]; then
   for pair in $INPUT_REACH_PAIRS; do
     RUN_ARGS+=("--pair" "$pair")
   done
+  # Suite mode: one whole-suite run; the record is suite-level reach
+  # (reach_scope = suite), which never establishes per-test reach.
+  if [ -n "${INPUT_SUITE_CMD:-}" ]; then
+    RUN_ARGS+=("--suite-cmd" "$INPUT_SUITE_CMD")
+  fi
   run_options
   mipiti-verify "${RUN_ARGS[@]}"
 fi

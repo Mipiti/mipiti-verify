@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `attest-reach --suite-cmd "<command>" --coverage-file <report>` (action:
+  `suite-cmd` with `reach-pairs`): reach for a harness that cannot run one
+  test alone. The suite runs once under coverage and every nominated test
+  records what the suite executed in its mechanism's file as
+  `suite_reached`, with `predicate.reach_scope = "suite"` (schema: optional
+  `reach_scope`, `test` | `suite`; per-test records now carry `test`).
+  Stated for what it is: per-test reach is undefined for such a harness,
+  so a suite-scope record is information and never yields `reached`. The
+  verifier's details line and the tier-2 facts block read
+  `reached mechanism: unknown (suite-level coverage only)` when that is
+  all there is. `formal/check_evidence_records.py` gains a suite-scope
+  reach axis (8 axes, 15120 combinations) showing R3 never sets the fact
+  from it.
+
 - `attest-dependence` stubs a Verilog / SystemVerilog `module` declared in
   the non-ANSI style (`module m(a, y); input a; output y; ...`): the
   header is kept, the body's port declarations are re-emitted verbatim

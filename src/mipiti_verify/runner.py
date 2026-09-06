@@ -117,7 +117,7 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     from .verifiers import PathTraversalError, safe_resolve_path
     from .verifiers.tests import (
         FACT_KINDS, TestAttestedVerifier, _names_test,
-        definition_matches_checkout, mechanism_line_span, parse_mechanism,
+        definition_matches_checkout, mechanism_line_span, parse_mechanism, reach_wording,
         statement_kind,
     )
 
@@ -189,6 +189,7 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
     matches = definition_matches_checkout(project_root, entry) if entry else None
     reached: object = None
     depends: object = None
+    reach_scope = ""
     if mech_file:
         try:
             verdict = TestAttestedVerifier().verify(params, project_root)
@@ -197,11 +198,12 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
         if verdict is not None and verdict.passed:
             reached = verdict.reached
             depends = verdict.depends
+            reach_scope = getattr(verdict, "reach_scope", "") or ""
     facts = [
         f"definition_sha256 matches attestation: {_yes_no_unknown(matches)}",
     ]
     if mech_file:
-        facts.append(f"reached mechanism: {_yes_no_unknown(reached)}")
+        facts.append(f"reached mechanism: {reach_wording(reached, reach_scope)}")
         facts.append(f"fails without mechanism: {_yes_no_unknown(depends)}")
     sections.append("--- Facts ---\n" + "\n".join(facts))
     return "\n\n".join(sections)[:16000]

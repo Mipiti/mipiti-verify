@@ -612,12 +612,16 @@ def _attest_dependence(project, status, *, commit=COMMIT, key_path="", test=TEST
 
 
 def _attest_reach(project, reached, *, commit=COMMIT, key_path="", test=TEST, mechanism=MECHANISM,
-                  reason=""):
+                  reason="", reach_scope=""):
     """A reach record as ``attest-reach`` writes it: the test run alone, its
-    per-test coverage of the mechanism's file, the mechanism it ran for."""
+    per-test coverage of the mechanism's file, the mechanism it ran for.
+    With ``reach_scope="suite"``, the suite-mode record: what the suite
+    reached, as ``suite_reached``, and never ``reached``."""
     entry = {"id": test, "name": test, "status": "passed", "mechanism": mechanism}
     if reason:
         entry.update({"status": "error", "reason": reason})
+    elif reach_scope == "suite":
+        entry["suite_reached"] = reached
     else:
         entry["reached"] = reached
     summary = {
@@ -625,8 +629,9 @@ def _attest_reach(project, reached, *, commit=COMMIT, key_path="", test=TEST, me
                    "errors": 1 if reason else 0},
         "tests": [entry],
     }
-    statement = build_statement(commit=commit, summary=summary, invocation=[], kind="reach")
-    _write(project, statement, "tests-reach.json", key_path)
+    statement = build_statement(commit=commit, summary=summary, invocation=[], kind="reach",
+                                reach_scope=reach_scope)
+    _write(project, statement, f"tests-reach{'-suite' if reach_scope == 'suite' else ''}.json", key_path)
 
 
 class TestReachRecords:
@@ -672,6 +677,43 @@ class TestReachRecords:
     def test_reach_record_alone_never_evidences_a_pass(self, project, monkeypatch):
         _no_ci(monkeypatch)
         _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert not r.passed
+
+
+class TestSuiteScopeReachRecords:
+    """A suite-scope reach record says what the suite executed. It never
+    supplies the reach fact; it only qualifies the unknown."""
+
+    def test_suite_scope_record_leaves_reach_unknown_and_says_so(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}], reach_scope="suite")
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.passed and r.reached is None and r.reach_scope == "suite"
+        assert "reached mechanism: unknown (suite-level coverage only)" in r.details
+
+    def test_per_test_fact_wins_over_a_suite_scope_record(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}], reach_scope="suite")
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [1]}])
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.reached is False and r.reach_scope == ""
+        assert "reached mechanism: no" in r.details
+
+    def test_suite_scope_record_for_another_test_does_not_qualify(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}],
+                      reach_scope="suite", test="test_elsewhere")
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.reached is None and r.reach_scope == ""
+        assert "reached mechanism: unknown;" in r.details
+
+    def test_suite_scope_record_alone_never_evidences_a_pass(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}], reach_scope="suite")
         r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
         assert not r.passed
 
@@ -996,8 +1038,15 @@ class TestTier2ReadsTheClosure:
         _no_ci(monkeypatch)
         _attest(project)
         _, source = self._review(project, {"test": TEST, "mechanism": MECHANISM})
-        assert "reached mechanism: unknown" in source
+        assert "reached mechanism: unknown\n" in source
         assert "fails without mechanism: unknown" in source
+
+    def test_facts_name_suite_level_coverage_as_the_reason_reach_is_unknown(self, project, monkeypatch):
+        _no_ci(monkeypatch)
+        _attest(project)
+        _attest_reach(project, [{"file": MECHANISM.split("::")[0], "lines": [5, 6]}], reach_scope="suite")
+        _, source = self._review(project, {"test": TEST, "mechanism": MECHANISM})
+        assert "reached mechanism: unknown (suite-level coverage only)" in source
 
     def test_a_changed_definition_is_reported_as_a_mismatch(self, project, monkeypatch):
         _no_ci(monkeypatch)

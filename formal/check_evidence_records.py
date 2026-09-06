@@ -23,8 +23,14 @@ EVERY combination of the record states, through the real verifier:
   R6  an entry that carries a ``reason`` (the pair was not run) never
       yields False: an outcome that was never produced is not evidence
       either way
+  R7  a suite-scope reach record (``reach_scope = "suite"``, one
+      whole-suite run, entries carrying ``suite_reached``) never sets
+      ``reached``: whatever it says the suite executed, the fact comes
+      from the other records or stays unknown, and when it stays unknown
+      with such a record present the verdict says so
+      (``reach_scope == "suite"``)
 
-The space is the product of seven axes. Every statement is built once per
+The space is the product of eight axes. Every statement is built once per
 axis value and reused; the verifier reads them through its own loader,
 handed the envelopes in memory, so the sweep stays fast.
 
@@ -117,6 +123,9 @@ REACH = ("absent", "same_reaching", "same_missing", "unnamed_reaching", "other_m
 DEPENDENCE = ("absent", "fails_without_failed", "fails_without_passed", "other_mechanism",
               "unrun_with_reason", "commit_differs")
 ASSERTION_MECHANISM = ("absent", "present")
+# A suite-scope reach record alongside: what the suite reached in the
+# mechanism's file, or a suite run that did not touch it.
+SUITE_REACH = ("absent", "suite_reaching", "suite_missing")
 
 
 def _envelope(statement: dict) -> str:
@@ -173,6 +182,18 @@ def _reach(state: str) -> str | None:
     summary = {"totals": {"total": 1, "passed": 1 - errors, "failed": 0, "skipped": 0, "errors": errors},
                "tests": [entry]}
     return _envelope(build_statement(commit=commit, summary=summary, invocation=[], kind="reach"))
+
+
+def _suite_reach(state: str) -> str | None:
+    if state == "absent":
+        return None
+    entry = {"id": f"tests.test_guard::{TEST}", "name": TEST, "status": "passed",
+             "mechanism": MECHANISM,
+             "suite_reached": REACHING if state == "suite_reaching" else MISSING}
+    summary = {"totals": {"total": 1, "passed": 1, "failed": 0, "skipped": 0, "errors": 0},
+               "tests": [entry]}
+    return _envelope(build_statement(commit=COMMIT, summary=summary, invocation=[],
+                                     kind="reach", reach_scope="suite"))
 
 
 def _dependence(state: str) -> str | None:
@@ -233,7 +254,7 @@ def _expected(tr: str, tr_commit: str, definition: str, coverage: str,
 def check_records() -> Tuple[int, dict, List[str]]:
     violations: List[str] = []
     checked = 0
-    per_property = {k: 0 for k in ("R1", "R2", "R3", "R4", "R5", "R6")}
+    per_property = {k: 0 for k in ("R1", "R2", "R3", "R4", "R5", "R6", "R7")}
 
     # Build every statement once per axis value.
     test_results = {
@@ -241,6 +262,7 @@ def check_records() -> Tuple[int, dict, List[str]]:
         for tr in TEST_RESULT for c in TR_COMMIT for d in DEFINITION for cov in COVERAGE
     }
     reaches = {r: _reach(r) for r in REACH}
+    suite_reaches = {r: _suite_reach(r) for r in SUITE_REACH}
     dependences = {d: _dependence(d) for d in DEPENDENCE}
 
     project = Path(tempfile.mkdtemp(prefix="mipiti-formal-records-"))
@@ -256,16 +278,20 @@ def check_records() -> Tuple[int, dict, List[str]]:
             return list(current)
 
         with _no_ci_no_key(), patch.object(tests_mod, "load_attestations", in_memory):
-            for tr, c, d, cov, r, dep, mech in itertools.product(
-                    TEST_RESULT, TR_COMMIT, DEFINITION, COVERAGE, REACH, DEPENDENCE, ASSERTION_MECHANISM):
-                current = [e for e in (test_results[(tr, c, d, cov)], reaches[r], dependences[dep]) if e]
+            for tr, c, d, cov, r, sr, dep, mech in itertools.product(
+                    TEST_RESULT, TR_COMMIT, DEFINITION, COVERAGE, REACH, SUITE_REACH, DEPENDENCE,
+                    ASSERTION_MECHANISM):
+                current = [e for e in (test_results[(tr, c, d, cov)], reaches[r], suite_reaches[sr],
+                                       dependences[dep]) if e]
                 params = {"test": TEST}
                 if mech == "present":
                     params["mechanism"] = MECHANISM
                 result = verifier.verify(params, project)
+                # The oracle takes no suite-reach argument: R7 is that the
+                # axis cannot move any expected value.
                 exp_passed, exp_hash, exp_reached, exp_depends = _expected(tr, c, d, cov, r, dep, mech)
                 where = (f"test_result={tr}/{c} definition={d} coverage={cov} reach={r} "
-                         f"dependence={dep} mechanism={mech}")
+                         f"suite_reach={sr} dependence={dep} mechanism={mech}")
                 checked += 1
 
                 per_property["R1"] += 1
@@ -295,6 +321,12 @@ def check_records() -> Tuple[int, dict, List[str]]:
                         per_property["R6"] += 1
                         if result.depends is False:
                             violations.append(f"R6: {where}: an unrun dependence entry yielded depends=False")
+                    per_property["R7"] += 1
+                    exp_scope = "suite" if (exp_passed and sr != "absent" and exp_reached is None) else ""
+                    if result.reach_scope != exp_scope:
+                        violations.append(f"R7: {where}: reach_scope={result.reach_scope!r}, expected {exp_scope!r}")
+                if mech == "absent" and result.reach_scope:
+                    violations.append(f"R7: {where}: reach_scope stated with no mechanism named")
     finally:
         shutil.rmtree(project, ignore_errors=True)
     return checked, per_property, violations
@@ -305,10 +337,10 @@ def main() -> int:
     print("TEST EVIDENCE RECORDS")
     print("=" * 70)
     space = (len(TEST_RESULT) * len(TR_COMMIT) * len(DEFINITION) * len(COVERAGE)
-             * len(REACH) * len(DEPENDENCE) * len(ASSERTION_MECHANISM))
+             * len(REACH) * len(SUITE_REACH) * len(DEPENDENCE) * len(ASSERTION_MECHANISM))
     print(f"\nEnumerating {space} record combinations through the real verifier "
-          f"(7 axes: {len(TEST_RESULT)} x {len(TR_COMMIT)} x {len(DEFINITION)} x {len(COVERAGE)} "
-          f"x {len(REACH)} x {len(DEPENDENCE)} x {len(ASSERTION_MECHANISM)})...\n")
+          f"(8 axes: {len(TEST_RESULT)} x {len(TR_COMMIT)} x {len(DEFINITION)} x {len(COVERAGE)} "
+          f"x {len(REACH)} x {len(SUITE_REACH)} x {len(DEPENDENCE)} x {len(ASSERTION_MECHANISM)})...\n")
     started = time.monotonic()
     checked, per_property, violations = check_records()
     elapsed = time.monotonic() - started
@@ -327,9 +359,10 @@ def main() -> int:
     print(f"  R4 depends from a run dependence record at the commit:  {per_property['R4']} checks")
     print(f"  R5 no mechanism named, no facts:                        {per_property['R5']} checks")
     print(f"  R6 an unrun entry never yields False:                   {per_property['R6']} checks")
+    print(f"  R7 a suite-scope reach record never sets reached:       {per_property['R7']} checks")
     print(f"\n{'=' * 70}")
     print("ALL EVIDENCE RECORD PROPERTIES VERIFIED")
-    print(f"  Combinations: {checked} (exhaustive over the 7 axes) in {elapsed:.2f}s")
+    print(f"  Combinations: {checked} (exhaustive over the 8 axes) in {elapsed:.2f}s")
     print(f"{'=' * 70}")
     return 0
 

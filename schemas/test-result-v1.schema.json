@@ -269,6 +269,14 @@
         "reach"
       ],
       "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. \"reach\" marks a record produced by `mipiti-verify attest-reach`: each test entry carries the per-test coverage (reached) of a run of that test alone, the mechanism it was run for, and a reason when the pair was not run. Neither kind evidences that a test ran and passed."
+    },
+    "reach_scope": {
+      "type": "string",
+      "enum": [
+        "test",
+        "suite"
+      ],
+      "description": "Optional; only on a reach record. \"test\": each nominated test was run alone under coverage and its entry carries reached (a fact about that test). \"suite\": the whole suite was run once under coverage and each entry carries suite_reached, the lines the suite executed in the mechanism's file; per-test reach is undefined for such a run, so the record is information and never establishes reach. Absent on older reach records, which are per-test."
     }
   }
 }

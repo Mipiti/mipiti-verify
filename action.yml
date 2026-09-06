@@ -105,11 +105,11 @@ inputs:
     required: false
     default: ""
   coverage-file:
-    description: "For the 'command' runner with reach-pairs: the report the coverage command writes, relative to project-root (LCOV, Cobertura, JaCoCo or coverage.py JSON)."
+    description: "For the 'command' runner with reach-pairs: the report the coverage command writes, relative to project-root (LCOV, Cobertura, JaCoCo or coverage.py JSON). With suite-cmd, the report the suite run writes."
     required: false
     default: ""
   suite-cmd:
-    description: "Suite mode for dependence-pairs: a command that runs the whole suite and writes a JUnit report, for harnesses that cannot select one test. Run once per distinct mechanism with that mechanism disabled; each nominated test takes its outcome from the report. Needs suite-junit."
+    description: "Suite mode, for harnesses that cannot select one test. For dependence-pairs: a command that runs the whole suite and writes a JUnit report; run once per distinct mechanism with that mechanism disabled, each nominated test taking its outcome from the report (needs suite-junit). For reach-pairs: the same command must also write the coverage report coverage-file names; it runs ONCE and each nominated test records what the suite reached in its mechanism's file as suite_reached (reach_scope = suite). Suite-level reach is information only: it never establishes the per-test reach fact, which stays unknown."
     required: false
     default: ""
   suite-junit:

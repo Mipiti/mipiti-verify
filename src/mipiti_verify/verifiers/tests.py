@@ -467,10 +467,37 @@ def _reach_entry(reach: list, test_name: str, commit: str, mechanism: str) -> di
     return None
 
 
+def _suite_reach_only(reach: list, test_name: str, commit: str, mechanism: str) -> bool:
+    """Whether a suite-scope reach record (``predicate.reach_scope ==
+    "suite"``, one whole-suite run) at this commit names the test for this
+    mechanism (or none) with ``suite_reached``. Such a record says what the
+    suite executed, never what the test did: it is reported as the reason
+    reach is unknown, and it never supplies the fact."""
+    for statement in reach or []:
+        predicate = statement.get("predicate") or {}
+        if str(predicate.get("reach_scope") or "") != "suite":
+            continue
+        if not commit or str(predicate.get("commit") or "") != commit:
+            continue
+        for entry in predicate.get("tests") or []:
+            if not _names_test(entry, test_name):
+                continue
+            named = str(entry.get("mechanism") or "").strip()
+            if named and named != mechanism:
+                continue
+            if isinstance(entry.get("suite_reached"), list):
+                return True
+    return False
+
+
 def _evidence_facts(entry: dict, test_name: str, params: dict,
                     project_root: Path | None, dependence: list,
                     commit: str, reach: list | None = None) -> dict:
-    """The facts a passing test-result record establishes about its evidence."""
+    """The facts a passing test-result record establishes about its evidence.
+
+    ``reach_scope`` is ``"suite"`` when the reach fact is unknown and the
+    only coverage on record for the test is suite-level: it qualifies the
+    unknown, it is not a fact."""
     facts: dict = {}
     digest = str(entry.get("definition_sha256") or "")
     if digest:
@@ -488,6 +515,8 @@ def _evidence_facts(entry: dict, test_name: str, params: dict,
             reached = _reached_mechanism(reach_entry, project_root, file, symbol)
     if reached is not None:
         facts["reached"] = reached
+    elif _suite_reach_only(reach or [], test_name, commit, mechanism):
+        facts["reach_scope"] = "suite"
     depends = _depends_on_mechanism(dependence, test_name, commit, mechanism)
     if depends is not None:
         facts["depends"] = depends
@@ -496,6 +525,14 @@ def _evidence_facts(entry: dict, test_name: str, params: dict,
 
 def _yes_no(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
+
+
+def reach_wording(reached: bool | None, reach_scope: str = "") -> str:
+    """``yes`` / ``no`` / ``unknown``, the last qualified when the only
+    coverage on record is suite-level."""
+    if reached is None and reach_scope == "suite":
+        return "unknown (suite-level coverage only)"
+    return _yes_no(reached)
 
 
 def _facts_sentence(facts: dict, mechanism_named: bool) -> str:
@@ -509,7 +546,7 @@ def _facts_sentence(facts: dict, mechanism_named: bool) -> str:
     if digest:
         parts.append(f"definition {digest[:19]}…")
     if mechanism_named:
-        parts.append(f"reached mechanism: {_yes_no(facts.get('reached'))}")
+        parts.append(f"reached mechanism: {reach_wording(facts.get('reached'), facts.get('reach_scope', ''))}")
         parts.append(f"fails without mechanism: {_yes_no(facts.get('depends'))}")
     if not parts:
         return ""
