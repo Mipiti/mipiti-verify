@@ -385,7 +385,9 @@ def _depends_on_mechanism(dependence: list, test_name: str, commit: str,
     Only a record for the commit under verification speaks for this tree.
     ``True`` when the test's outcome under the disabled mechanism was
     anything but passed; ``False`` when it still passed; unknown when no
-    record names the pair.
+    record names the pair, or when the record says the pair was not run
+    (it carries a ``reason``): an outcome that was never produced is not
+    evidence in either direction.
     """
     for statement in dependence:
         predicate = statement.get("predicate") or {}
@@ -399,6 +401,8 @@ def _depends_on_mechanism(dependence: list, test_name: str, commit: str,
                     continue
                 if str(item.get("mechanism") or "").strip() != mechanism:
                     continue
+                if item.get("reason"):
+                    return None
                 return str(item.get("status") or "") != "passed"
     return None
 

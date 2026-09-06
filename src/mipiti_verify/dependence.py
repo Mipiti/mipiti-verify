@@ -14,12 +14,18 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from .attestation import AttestationError, base_test_name
 
 PAIR_TIMEOUT_SECONDS = 300
+# Budget for the whole run, across pairs. Pairs that would start after it is
+# spent are recorded as not run, so the attestation still names every pair
+# that was asked for and a reader can tell "not run" from "ran and errored".
+TOTAL_TIMEOUT_SECONDS = 1800
+REASON_BUDGET_EXHAUSTED = "not run: dependence budget exhausted"
 
 OUTCOME_PASSED = "passed"
 OUTCOME_FAILED = "failed"
@@ -155,21 +161,48 @@ def run_dependence(
     pairs: list[tuple[str, str]],
     *,
     timeout: int = PAIR_TIMEOUT_SECONDS,
+    total_timeout: int = TOTAL_TIMEOUT_SECONDS,
     runner: Optional[Callable[..., subprocess.CompletedProcess]] = None,
     progress: Optional[Callable[[str, str, str], None]] = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict:
     """Run every pair and return a summary in the shape ``build_statement``
     takes: one test entry per pair, its ``status`` the outcome, and
-    ``fails_without`` naming the mechanism that was disabled."""
+    ``fails_without`` naming the mechanism that was disabled.
+
+    ``total_timeout`` bounds the whole run. Once it is spent no further pair
+    is started; each remaining pair is still recorded, as ``error`` with a
+    ``reason`` saying it was not run, so every requested pair is present and
+    an unrun pair is never read as evidence either way. The summary carries
+    ``not_run`` with the count.
+    """
     if not pairs:
         raise AttestationError("No (test, mechanism) pairs to run.")
     tests: list[dict] = []
     counts = {"passed": 0, "failed": 0, "errors": 0}
+    not_run = 0
+    started = clock()
     for test, mechanism in pairs:
+        leaf = test.rsplit("::", 1)[-1]
+        if total_timeout > 0 and clock() - started >= total_timeout:
+            not_run += 1
+            counts["errors"] += 1
+            tests.append({
+                "id": test,
+                "name": leaf,
+                "status": OUTCOME_ERROR,
+                "fails_without": [{
+                    "mechanism": mechanism,
+                    "status": OUTCOME_ERROR,
+                    "reason": REASON_BUDGET_EXHAUSTED,
+                }],
+            })
+            if progress is not None:
+                progress(test, mechanism, f"{OUTCOME_ERROR} ({REASON_BUDGET_EXHAUSTED})")
+            continue
         record = run_pair(project_root, test, mechanism, timeout=timeout, runner=runner)
         status = record["status"]
         counts["errors" if status == OUTCOME_ERROR else status] += 1
-        leaf = test.rsplit("::", 1)[-1]
         tests.append({
             "id": test,
             "name": leaf,
@@ -187,4 +220,5 @@ def run_dependence(
             "errors": counts["errors"],
         },
         "tests": tests,
+        "not_run": not_run,
     }

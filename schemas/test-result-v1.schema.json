@@ -173,7 +173,11 @@
                     "failed",
                     "error"
                   ],
-                  "description": "The test's outcome with the mechanism disabled. Anything but passed means the test depends on it; error means the pair could not be run."
+                  "description": "The test's outcome with the mechanism disabled. Anything but passed means the test depends on it; error means the pair produced no outcome (see reason when it was not run at all)."
+                },
+                "reason": {
+                  "type": "string",
+                  "description": "Optional. Present when the pair was not run (for example the run's total budget was spent first). A reader treats such an entry as no outcome, never as dependence or its absence."
                 }
               }
             },

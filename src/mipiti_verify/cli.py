@@ -533,6 +533,11 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
 @click.option("--commit", default="", help="Commit the run covers (default: CI env or .git/HEAD)")
 @click.option("--timeout", default=300, type=int, show_default=True,
               help="Seconds allowed per pair")
+@click.option("--total-timeout", default=1800, type=int, show_default=True,
+              envvar="MIPITI_DEPENDENCE_TOTAL_TIMEOUT",
+              help=("Seconds allowed for the whole run. Pairs that would start "
+                    "after the budget is spent are recorded as not run "
+                    "(status error, with a reason), never as an outcome"))
 @click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
               default="", help="ECDSA P-256 private key (PEM) for CI without a workload identity")
 @click.option("--key-passphrase", envvar="MIPITI_ATTESTATION_KEY_PASSPHRASE",
@@ -543,8 +548,8 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
               help="Pre-downloaded Sigstore ClientTrustConfig JSON")
 def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | None,
                       base_url: str | None, repo: str, project_root: str,
-                      commit: str, timeout: int, key_path: str,
-                      key_passphrase: str, sigstore_tuf_url: str,
+                      commit: str, timeout: int, total_timeout: int,
+                      key_path: str, key_passphrase: str, sigstore_tuf_url: str,
                       sigstore_trust_config: str) -> None:
     """Record whether each test fails once its mechanism is disabled.
 
@@ -557,6 +562,14 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
         mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
 
     Python projects only: the mechanism is disabled through a pytest plugin.
+    The mechanism's module is imported at pytest configuration time, before
+    any test runs, so a module with import-time side effects (connections,
+    threads, global state) runs them then. Nominate mechanisms that live in
+    modules that are safe to import.
+
+    Two clocks bound the run: --timeout per pair and --total-timeout for the
+    whole command. A pair that would start after the total budget is spent is
+    recorded as not run, so the attestation still names every pair.
     """
     import re as _re
     from pathlib import Path as _Path
@@ -612,12 +625,22 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     def _progress(test: str, mechanism: str, status: str) -> None:
         click.echo(f"  {test} without {mechanism}: {status}")
 
-    click.echo(f"Running {len(pairs)} pair(s) with the mechanism disabled...")
+    click.echo(
+        f"Running {len(pairs)} pair(s) with the mechanism disabled "
+        f"(up to {timeout}s each, {total_timeout}s in all)...")
     try:
-        summary = run_dependence(root, pairs, timeout=timeout, progress=_progress)
+        summary = run_dependence(
+            root, pairs, timeout=timeout, total_timeout=total_timeout,
+            progress=_progress)
     except AttestationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
+    not_run = int(summary.pop("not_run", 0) or 0)
+    click.echo(
+        f"Ran {len(pairs) - not_run} of {len(pairs)} pair(s); {not_run} not "
+        f"run (total budget of {total_timeout}s exhausted)."
+        if not_run else f"Ran {len(pairs)} of {len(pairs)} pair(s)."
+    )
 
     statement = build_statement(
         commit=resolved_commit,
@@ -644,8 +667,8 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
     click.echo(
         f"Attested dependence for {totals['total']} pair(s) at "
         f"{resolved_commit[:12]} ({totals['failed']} depend on their "
-        f"mechanism, {totals['passed']} do not, {totals['errors']} could not "
-        f"be run) -> {out_path}"
+        f"mechanism, {totals['passed']} do not, {totals['errors']} without an "
+        f"outcome) -> {out_path}"
     )
     click.echo(f"Signing identity: {provenance}")
     if provenance == "unsigned":
@@ -756,6 +779,12 @@ def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | No
 @click.option("--verbose", is_flag=True, help="Show per-assertion detail")
 @click.option("--repo", default="", help="Repository name (e.g. org/repo). Auto-detected from GITHUB_REPOSITORY, CI_PROJECT_PATH, or git remote.")
 @click.option("--changed-files", "changed_files_path", default=None, help="File with changed paths (one per line, e.g. git diff --name-only). Only assertions referencing these files are verified. Use '-' for stdin.")
+@click.option("--test-file-pattern", "test_file_pattern", default=None, envvar="MIPITI_TEST_FILE_PATTERN",
+              help=("Regular expression marking additional repository-relative paths as test files, "
+                    "on top of the built-in layout heuristic (tests/, test/, __tests__/, test_*, "
+                    "*_test.*, *.spec.*). Test-backed assertions are never skipped under "
+                    "--changed-files; use this for tests that live outside the conventional "
+                    "layouts, e.g. '^specs/'."))
 @click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
 @click.option("--component", "component_id", default=None, help="Component ID to scope verification (only verify assertions for controls in this component). Auto-detect from git remote if not specified.")
 @click.option(
@@ -794,6 +823,7 @@ def run(
     verbose: bool,
     repo: str,
     changed_files_path: str | None,
+    test_file_pattern: str | None,
     concurrency: int,
     component_id: str | None,
     auto_component_path: bool,
@@ -877,6 +907,7 @@ def run(
             verbose=verbose,
             repo=repo,
             changed_files=changed_files,
+            test_file_pattern=test_file_pattern,
             concurrency=concurrency,
             component_id=component_id,
             auto_component_path=auto_component_path,

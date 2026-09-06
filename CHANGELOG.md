@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `definition_sha256`, `definition_scope`, `reached`, `fails_without` and the
   optional `kind`. No version bump; absence means "not recorded".
 - Action inputs `coverage-report` and `dependence-pairs`.
+- `attest-dependence --total-timeout` (default 1800s, also
+  `MIPITI_DEPENDENCE_TOTAL_TIMEOUT`) bounds the whole run; a pair that would
+  start after the budget is spent is recorded as not run, with a `reason`,
+  and reads as unknown rather than as an outcome.
+- `run --test-file-pattern` (also `MIPITI_TEST_FILE_PATTERN`) marks
+  additional paths as test files for the `--changed-files` rule, for
+  repositories whose tests live outside the conventional layouts.
 - Each `test_attested` result submitted to the platform carries the signing
   class of the attestation it was checked against (`ci_oidc`, `customer_key`
   or `unsigned`) in a `provenance` field, as data rather than inside the

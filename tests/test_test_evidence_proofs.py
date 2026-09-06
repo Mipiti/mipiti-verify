@@ -404,6 +404,54 @@ class TestDependence:
         statement = build_statement(commit=COMMIT, summary=summary, invocation=[], kind="dependence")
         assert statement["predicate"]["kind"] == "dependence"
 
+    def test_total_budget_records_unrun_pairs_without_an_outcome(self, project):
+        from mipiti_verify.dependence import REASON_BUDGET_EXHAUSTED, run_dependence
+
+        # Each pair takes 100 simulated seconds; the budget covers two.
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def fake_run(argv, **kwargs):
+            now[0] += 100.0
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        summary = run_dependence(project, [
+            ("test_a", "app/guard.py::require_token"),
+            ("test_b", "app/guard.py::require_token"),
+            ("test_c", "app/guard.py::require_token"),
+            ("test_d", "app/guard.py::Limiter"),
+        ], runner=fake_run, total_timeout=200, clock=clock)
+        assert summary["not_run"] == 2
+        assert summary["totals"] == {"total": 4, "passed": 0, "failed": 2, "skipped": 0, "errors": 2}
+        assert [t["status"] for t in summary["tests"]] == ["failed", "failed", "error", "error"]
+        unrun = summary["tests"][2]["fails_without"][0]
+        assert unrun == {"mechanism": "app/guard.py::require_token", "status": "error",
+                         "reason": REASON_BUDGET_EXHAUSTED}
+        assert "reason" not in summary["tests"][0]["fails_without"][0]
+
+    def test_cli_total_timeout_prints_the_run_and_not_run_counts(self, project, monkeypatch):
+        from click.testing import CliRunner
+
+        from mipiti_verify.cli import main
+
+        _no_ci(monkeypatch)
+        monkeypatch.setenv("MIPITI_DEPENDENCE_TOTAL_TIMEOUT", "0")
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        with patch("mipiti_verify.dependence.subprocess.run", fake_run):
+            result = CliRunner().invoke(main, [
+                "attest-dependence", "--project-root", str(project),
+                "--pair", "test_a=app/guard.py::require_token",
+                "--pair", "test_b=app/guard.py::require_token",
+                "--total-timeout", "1",
+            ])
+        assert result.exit_code == 0, result.output
+        assert "Ran 2 of 2 pair(s)." in result.output
+
     def test_plugin_stubs_a_function_and_a_class(self, project, monkeypatch):
         from mipiti_verify._disable_plugin import disable_symbol, import_mechanism_module
 
@@ -641,6 +689,23 @@ class TestVerifierFacts:
         assert r.depends is False
         assert "fails without mechanism: no" in r.details
 
+    def test_an_unrun_pair_is_unknown_not_dependence(self, project, monkeypatch):
+        from mipiti_verify.dependence import REASON_BUDGET_EXHAUSTED
+
+        _no_ci(monkeypatch)
+        _attest(project)
+        summary = {
+            "totals": {"total": 1, "passed": 0, "failed": 0, "skipped": 0, "errors": 1},
+            "tests": [{"id": TEST, "name": TEST, "status": "error",
+                       "fails_without": [{"mechanism": MECHANISM, "status": "error",
+                                          "reason": REASON_BUDGET_EXHAUSTED}]}],
+        }
+        _write(project, build_statement(commit=COMMIT, summary=summary, invocation=[],
+                                        kind="dependence"), "tests-dependence.json")
+        r = get_verifier("test_attested").verify({"test": TEST, "mechanism": MECHANISM}, project)
+        assert r.passed and r.depends is None
+        assert "fails without mechanism: unknown" in r.details
+
     def test_depends_is_unknown_without_a_record(self, project, monkeypatch):
         _no_ci(monkeypatch)
         _attest(project)
@@ -745,6 +810,47 @@ class TestChangedFilesKeepsTestBacked:
         printed = " ".join(str(c.args[0]) for c in printer.call_args_list if c.args)
         assert "kept 4 test-backed" in printed
 
+    def test_a_pattern_marks_tests_the_heuristic_misses(self, project):
+        from mipiti_verify.runner import Runner
+
+        controls = {"CTRL-01": [
+            {"id": "a_spec", "type": "function_exists",
+             "params": {"file": "specs/auth.py", "name": "verifies_token"}},
+        ]}
+        client = MagicMock()
+        client.get_pending.return_value = {"model_id": "m1", "controls": controls}
+        without = Runner(client=client, project_root=str(project), repo="acme/widgets",
+                         changed_files={"app/other.py"}, reverify=False, dry_run=True)
+        _, _, kept = without._run_tier("m1", tier=1)
+        assert kept == []
+        client.get_pending.return_value = {"model_id": "m1", "controls": controls}
+        with_pattern = Runner(client=client, project_root=str(project), repo="acme/widgets",
+                              changed_files={"app/other.py"}, reverify=False, dry_run=True,
+                              test_file_pattern=r"^specs/")
+        _, _, kept = with_pattern._run_tier("m1", tier=1)
+        assert [a["id"] for a in kept] == ["a_spec"]
+
+    def test_an_invalid_pattern_fails_fast(self, project):
+        from mipiti_verify.runner import Runner
+
+        with pytest.raises(ValueError, match="not a valid regular expression"):
+            Runner(client=MagicMock(), project_root=str(project), repo="acme/widgets",
+                   test_file_pattern="(unclosed")
+
+    def test_cli_rejects_an_invalid_pattern_with_a_clear_message(self, project):
+        from click.testing import CliRunner
+
+        from mipiti_verify.cli import main
+
+        with patch("mipiti_verify.cli.MipitiClient") as client_cls:
+            client_cls.return_value.get_model.return_value = {"title": "t"}
+            result = CliRunner().invoke(main, [
+                "run", "m1", "--api-key", "mv_x", "--project-root", str(project),
+                "--repo", "acme/widgets", "--test-file-pattern", "(unclosed",
+            ])
+        assert result.exit_code == 1
+        assert "not a valid regular expression" in result.output
+
     @pytest.mark.parametrize("path,expected", [
         ("tests/test_guard.py", True), ("app/tests/x.py", True), ("src/__tests__/a.js", True),
         ("test/a.go", True), ("conftest.py", True), ("src/auth_test.go", True),
@@ -755,6 +861,16 @@ class TestChangedFilesKeepsTestBacked:
         from mipiti_verify.runner import _is_test_file
 
         assert _is_test_file(path) is expected
+
+    def test_pattern_adds_to_the_heuristic_without_replacing_it(self):
+        import re
+
+        from mipiti_verify.runner import _is_test_file
+
+        pattern = re.compile(r"^specs/")
+        assert _is_test_file("specs/auth.py", pattern) is True
+        assert _is_test_file("tests/test_x.py", pattern) is True
+        assert _is_test_file("app/guard.py", pattern) is False
 
 
 # ---------------------------------------------------------------------------

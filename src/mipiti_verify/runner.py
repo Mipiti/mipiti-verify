@@ -209,8 +209,17 @@ _TEST_PATH_MARKERS = ("/tests/", "/test/", "/__tests__/")
 _TEST_BASENAME_MARKERS = ("_test.", "_spec.", ".test.", ".spec.")
 
 
-def _is_test_file(path: str) -> bool:
-    text = "/" + str(path or "").replace("\\", "/").lstrip("/")
+def _is_test_file(path: str, pattern: re.Pattern[str] | None = None) -> bool:
+    """Whether a repository-relative path is a test file.
+
+    The layout heuristic always applies; ``pattern`` (from
+    ``--test-file-pattern``) marks additional paths for repositories whose
+    tests live outside the conventional layouts.
+    """
+    rel = str(path or "").replace("\\", "/")
+    if pattern is not None and pattern.search(rel):
+        return True
+    text = "/" + rel.lstrip("/")
     if any(marker in text for marker in _TEST_PATH_MARKERS):
         return True
     base = text.rsplit("/", 1)[-1]
@@ -219,13 +228,15 @@ def _is_test_file(path: str) -> bool:
     return any(marker in base for marker in _TEST_BASENAME_MARKERS)
 
 
-def _is_test_backed(assertion: dict[str, Any]) -> bool:
+def _is_test_backed(assertion: dict[str, Any],
+                    pattern: re.Pattern[str] | None = None) -> bool:
     """Whether an assertion's evidence is a test rather than the code itself."""
     a_type = str(assertion.get("type") or "")
     if a_type in ("test_attested", "test_exists"):
         return True
     if a_type in ("function_exists", "class_exists"):
-        return _is_test_file(str((assertion.get("params") or {}).get("file") or ""))
+        return _is_test_file(
+            str((assertion.get("params") or {}).get("file") or ""), pattern)
     return False
 
 
@@ -385,8 +396,21 @@ class Runner:
         concurrency: int = 1,
         component_id: str | None = None,
         auto_component_path: bool = True,
+        test_file_pattern: str | None = None,
     ) -> None:
         self.client = client
+        # Extra test-file identification, on top of the layout heuristic.
+        # Compiled here so a bad expression stops the run before any
+        # assertion is judged, rather than silently matching nothing.
+        self.test_file_pattern: re.Pattern[str] | None = None
+        if test_file_pattern:
+            try:
+                self.test_file_pattern = re.compile(test_file_pattern)
+            except re.error as e:
+                raise ValueError(
+                    f"--test-file-pattern {test_file_pattern!r} is not a valid "
+                    f"regular expression: {e}"
+                ) from e
         self.project_root = Path(project_root).resolve()
         self.repo = repo or _auto_detect_repo(self.project_root)
         self.component_id = component_id
@@ -881,7 +905,7 @@ class Runner:
                 kept = []
                 for a in assertions:
                     a_file = a.get("params", {}).get("file", "")
-                    if _is_test_backed(a):
+                    if _is_test_backed(a, self.test_file_pattern):
                         kept.append(a)
                         if a_file and a_file not in self.changed_files:
                             kept_test_backed += 1
