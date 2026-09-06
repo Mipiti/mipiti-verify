@@ -308,6 +308,34 @@ _REAL_BUNDLES: dict[tuple[str, str, str], str] = {}
 _REAL_SAN: str | None = None
 _REAL_BUNDLES_INITIALISED: bool = False
 
+# The production Sigstore trust root, fetched once and handed to every
+# audit row as a pinned ``--sigstore-trust-config`` file. Without it each
+# bundle-present row refreshes the TUF repository over the network before
+# verifying; the verdict logic under test is the same either way, since
+# the pinned path is the CLI's own offline mode over the same root.
+_TRUST_CONFIG_PATH: str | None = None
+
+
+def _trust_config_args() -> list[str]:
+    """``--sigstore-trust-config <file>`` for the production root, written
+    on first use; empty when the root cannot be fetched (no bundle row
+    runs then either)."""
+    global _TRUST_CONFIG_PATH
+    if _TRUST_CONFIG_PATH is None:
+        try:
+            import tempfile
+
+            from sigstore.models import ClientTrustConfig
+
+            raw = ClientTrustConfig.production()._inner.model_dump_json(by_alias=True)
+            fd, path = tempfile.mkstemp(prefix="sigstore-trust-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(raw)
+            _TRUST_CONFIG_PATH = path
+        except Exception:
+            _TRUST_CONFIG_PATH = ""
+    return ["--sigstore-trust-config", _TRUST_CONFIG_PATH] if _TRUST_CONFIG_PATH else []
+
 # Predicate combinations the BFS exercises. Kept small to bound the
 # Fulcio mint cost in CI (~2s × |bound_hash_labels| × |combos|
 # = 2 × 2 × 2 = 8 mints, ~16s session setup).
@@ -1576,31 +1604,76 @@ class _Sweep:
                 + (f" ({reasons})" if reasons else ""))
 
 
+def _run_cells(indices: list, tmp_dir: str, trust_args: list) -> tuple:
+    """Run the real CLI over the (Package, Pins) cells at the given
+    ``(i, j)`` indices into ``PACKAGES`` x ``PINS_LIST``, serially, in this
+    process. Cells travel as indices, never as values: the abstract rows
+    carry sentinel objects (``ABSENT``, ``NONE``) compared by identity,
+    which pickling would break. Returns ``(rows, skip_reasons)`` with rows
+    as ``(i, j, verdict, output)``."""
+    from pathlib import Path as _P
+
+    tmp_path = _P(tmp_dir)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    rows: list = []
+    skip_reasons: dict = {}
+    runner = CliRunner()
+    for i, j in indices:
+        pkg, pins = PACKAGES[i], PINS_LIST[j]
+        try:
+            pkg_resolved = _resolve_bundle_san(pkg)
+            pins_resolved = _resolve_pins_san(pins)
+            _skip_outside_modeled_domain(pkg_resolved, pins_resolved)
+            path = _materialise(tmp_path, pkg_resolved)
+        except pytest.skip.Exception as e:
+            reason = str(e).split(" not in ")[0] if "not in minted set" in str(e) else str(e)
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+        result = runner.invoke(
+            main,
+            ["audit", path]
+            + _pin_args(pins_resolved)
+            + _customer_key_args(tmp_path, pkg_resolved)
+            + trust_args,
+        )
+        rows.append((i, j, _classify(result), result.output))
+    return rows, skip_reasons
+
+
 def _sweep_space(tmp_path) -> _Sweep:
-    """Run the real CLI over every (Package, Pins) cell once."""
+    """Run the real CLI over every (Package, Pins) cell once.
+
+    The cells are split across a pool of forked processes, one per CPU:
+    every row is independent, the minted bundles and the pinned trust
+    root are module state the children inherit, and each child writes
+    under its own directory. Where fork is unavailable the sweep runs
+    serially in this process."""
+    import multiprocessing
+
+    _ensure_real_bundles()
+    trust_args = _trust_config_args()
+    indices = [(i, j) for i in range(len(PACKAGES)) for j in range(len(PINS_LIST))]
+    workers = max(1, min(os.cpu_count() or 1, 8))
+    if workers > 1 and hasattr(os, "fork") and "fork" in multiprocessing.get_all_start_methods():
+        chunks = [indices[k::workers] for k in range(workers)]
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(workers) as pool:
+            results = pool.starmap(
+                _run_cells,
+                [(chunk, str(tmp_path / f"w{k}"), trust_args) for k, chunk in enumerate(chunks)],
+            )
+    else:
+        results = [_run_cells(indices, str(tmp_path / "w0"), trust_args)]
     rows: list = []
     skipped = 0
     skip_reasons: dict = {}
-    runner = CliRunner()
-    for pkg in PACKAGES:
-        for pins in PINS_LIST:
-            try:
-                pkg_resolved = _resolve_bundle_san(pkg)
-                pins_resolved = _resolve_pins_san(pins)
-                _skip_outside_modeled_domain(pkg_resolved, pins_resolved)
-                path = _materialise(tmp_path, pkg_resolved)
-            except pytest.skip.Exception as e:
-                skipped += 1
-                reason = str(e).split(" not in ")[0] if "not in minted set" in str(e) else str(e)
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                continue
-            result = runner.invoke(
-                main,
-                ["audit", path]
-                + _pin_args(pins_resolved)
-                + _customer_key_args(tmp_path, pkg_resolved),
-            )
-            rows.append(_Row(pkg_resolved, pins_resolved, _classify(result), result.output))
+    for r_rows, r_reasons in results:
+        for i, j, verdict, output in r_rows:
+            rows.append(_Row(_resolve_bundle_san(PACKAGES[i]), _resolve_pins_san(PINS_LIST[j]), verdict, output))
+        for k, v in r_reasons.items():
+            skipped += v
+            skip_reasons[k] = skip_reasons.get(k, 0) + v
+    rows.sort(key=lambda r: (str(r.pkg), str(r.pins)))
     return _Sweep(rows, skipped, skip_reasons)
 
 

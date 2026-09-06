@@ -1049,13 +1049,16 @@ InitBase(genCustomerDsse) ==
 \* documents. PackageGen(FALSE) ⊆ Package, so TypeOK still holds on
 \* every Config-2 state. Measured: Config 2 completes in ~3.5 min /
 \* 142,743 distinct states (was multi-hour / non-terminating).
-Init_bind ==
-    /\ InitBase(FALSE)
+PinsNone ==
     /\ pins.san = NONE
     /\ pins.issuer_explicit = NONE
     /\ pins.workspace_fp = NONE
     /\ pins.model_id = NONE
     /\ pins.commit_sha = NONE
+
+Init_bind ==
+    /\ InitBase(FALSE)
+    /\ PinsNone
 
 Next == UNCHANGED vars
 
@@ -1063,6 +1066,30 @@ Next == UNCHANGED vars
 \* Config-1's Spec_main_<class> operators are defined below in the
 \* per-key_source sub-split block.
 Spec_bind == Init_bind /\ [][Next]_vars
+
+\* Config-2 per-key_source sub-split. Init_bind enumerates every
+\* non-customer_dsse package in one Init, which TLC computes on a
+\* single thread; splitting the enumeration by ws_sig.key_source the
+\* way Config 1 is split gives five independent runs. The argument is
+\* the same as Config 1's: every Config-2 invariant is a per-row
+\* predicate and key_source is a property of the row, so restricting
+\* allowedKS enumerates a subset of rows and checks every invariant on
+\* it; the union of the five allowedKS sets is exactly
+\* KeySources \ {KS_CUSTOMER_DSSE} (mechanically checked by
+\* formal/check_audit_partition_total.py). ws_sig = ABSENT rows are
+\* enumerated by every sub-config (WSSigGenFor(_) \cup {ABSENT}), a
+\* harmless overlap, as in Config 1.
+Init_bind_sigstore  == /\ InitBaseFor({KS_SIGSTORE})  /\ PinsNone
+Init_bind_platform  == /\ InitBaseFor({KS_PLATFORM})  /\ PinsNone
+Init_bind_workspace == /\ InitBaseFor({KS_WORKSPACE}) /\ PinsNone
+Init_bind_orphan    == /\ InitBaseFor({KS_ORPHAN})    /\ PinsNone
+Init_bind_legacy    == /\ InitBaseFor({KS_LEGACY})    /\ PinsNone
+
+Spec_bind_sigstore  == Init_bind_sigstore  /\ [][Next]_vars
+Spec_bind_platform  == Init_bind_platform  /\ [][Next]_vars
+Spec_bind_workspace == Init_bind_workspace /\ [][Next]_vars
+Spec_bind_orphan    == Init_bind_orphan    /\ [][Next]_vars
+Spec_bind_legacy    == Init_bind_legacy    /\ [][Next]_vars
 
 (*--------------------------------------------------------------------*)
 (* Config 1 per-key_source sub-split — Init / Spec operators.        *)
@@ -1129,11 +1156,29 @@ Init_main_orphan_legacy ==
         => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
            /\ pkg.bundle_bind_signature = "VALID")
 
+\* The two classes as separate sub-configs: the combined enumeration
+\* is the largest Config-1 run, and TLC computes initial states on one
+\* thread, so one run per class halves the wall clock. Same partition
+\* argument; Init_main_orphan_legacy stays for reference.
+Init_main_orphan ==
+    /\ InitBaseFor({KS_ORPHAN})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
+Init_main_legacy ==
+    /\ InitBaseFor({KS_LEGACY})
+    /\ (pkg.bundle # ABSENT
+        => /\ pkg.bundle_bind_hash = pkg.bundle.bound_hash
+           /\ pkg.bundle_bind_signature = "VALID")
+
 Spec_main_sigstore       == Init_main_sigstore       /\ [][Next]_vars
 Spec_main_platform       == Init_main_platform       /\ [][Next]_vars
 Spec_main_workspace      == Init_main_workspace      /\ [][Next]_vars
 Spec_main_cdsse          == Init_main_cdsse          /\ [][Next]_vars
 Spec_main_orphan_legacy  == Init_main_orphan_legacy  /\ [][Next]_vars
+Spec_main_orphan         == Init_main_orphan         /\ [][Next]_vars
+Spec_main_legacy         == Init_main_legacy         /\ [][Next]_vars
 
 (*--------------------------------------------------------------------*)
 (* Scenario-knob sub-configs (gap #249 / #254 / #258 backfill).       *)

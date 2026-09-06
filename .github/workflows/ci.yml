@@ -197,8 +197,8 @@ jobs:
     # docs/audit-pack-signing.md in the parent repo and
     # formal/audit_manifest.tla in this submodule). The 5 Config-1
     # per-key_source sub-configs (audit_main_sigstore / _platform /
-    # _workspace / _cdsse / _orphan_legacy) + Config-2
-    # (audit_bundle_bind) cover the legacy path; audit_manifest_platform
+    # _workspace / _cdsse / _orphan / _legacy) + the five Config-2
+    # per-key_source sub-configs (audit_bind_*) cover the legacy path; audit_manifest_platform
     # and audit_manifest_workspace cover the manifest path on the two
     # key_source classes where it is the trust anchor. Each matrix
     # instance runs the cheap static checks (AuditView AST
@@ -240,8 +240,13 @@ jobs:
           - audit_main_platform
           - audit_main_workspace
           - audit_main_cdsse
-          - audit_main_orphan_legacy
-          - audit_bundle_bind
+          - audit_main_orphan
+          - audit_main_legacy
+          - audit_bind_sigstore
+          - audit_bind_platform
+          - audit_bind_workspace
+          - audit_bind_orphan
+          - audit_bind_legacy
           # Manifest-signature path (Option β) per-key_source slices.
           # See formal/audit_manifest.tla module comment for the
           # KS_PLATFORM / KS_WORKSPACE partition argument.
