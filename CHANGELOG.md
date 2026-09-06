@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `run --all` reports on the models bound to the repository it runs in. A
+  model whose description provenance names another repository is skipped
+  with one notice. One that names this repository has every coverage gap
+  reported, evidence or not. One that names none, and has no assertion
+  bound to this repository, gets a single line saying so instead of one
+  warning per control; the report carries `repo_bound_assertions`.
 - `MIPITI_ATTESTATION_DIR` names where attestations are written and read
   (default `.mipiti/attestations` under the project root). The action sets
   it to a directory of its own when the checkout is not writable by the

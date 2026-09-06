@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .client import MipitiClient
-from .runner import Runner
+from .runner import Runner, BINDING_OTHER_REPO, BINDING_UNBOUND, model_binding, repo_slug
 
 # Force unbuffered output so CI and MCP tool runners see progress in real-time.
 # Python buffers stdout/stderr when not connected to a TTY (CI, pipes, subprocesses).
@@ -1225,6 +1225,28 @@ def run(
         if run_all:
             header = f"{title} ({mid})" if title else mid
             console.print(f"\n[bold]--- {header} ---[/bold]")
+        # Which repository the model says it describes. A model naming
+        # another repository is skipped outright; one naming this
+        # repository has every coverage gap reported even with no evidence
+        # yet; one naming none is judged by whether any evidence is bound
+        # here (see runner.model_binding).
+        provenance_repo = ""
+        this_repo = runner.repo if isinstance(getattr(runner, "repo", ""), str) else ""
+        if run_all:
+            try:
+                _model = client.get_model(mid)
+                _prov = _model.get("description_provenance") if isinstance(_model, dict) else None
+                _url = _prov.get("repo_url") if isinstance(_prov, dict) else ""
+                provenance_repo = _url if isinstance(_url, str) else ""
+            except Exception:
+                provenance_repo = ""
+        if run_all and model_binding(provenance_repo, this_repo, 1) == BINDING_OTHER_REPO:
+            note = (f"describes {repo_slug(provenance_repo)}, not this repository "
+                    f"({repo_slug(this_repo) or 'unknown'}); skipped")
+            console.print(f"  [dim]{note}[/dim]")
+            if output_format == "github":
+                click.echo(f"::notice title={_model_prefix(mid, title)} Skipped::{note}")
+            continue
         try:
             report = runner.run(mid)
         except AttestationRequiredError as e:
@@ -1239,6 +1261,21 @@ def run(
             continue
 
         report["model_id"] = mid
+        _bound = report.get("repo_bound_assertions", 0)
+        if run_all and model_binding(provenance_repo, this_repo, int(_bound) if isinstance(_bound, int) else 0) == BINDING_UNBOUND:
+            # No evidence bound here and no claim that this repository
+            # implements the model: its coverage gaps are not a finding
+            # about this repository. One line says so; the per-control
+            # warnings are withheld.
+            gaps = int(report.get("suff_insufficient", 0) or 0)
+            report["suff_details"] = []
+            report["suff_insufficient"] = 0
+            report["unbound_note"] = (
+                f"no evidence bound to {repo_slug(this_repo) or 'this repository'}; "
+                f"{gaps} control(s) have coverage gaps that are not reported here. Bind assertions "
+                f"with repo={repo_slug(this_repo) or '<owner/name>'}, or set the model's provenance "
+                f"to this repository, and every gap is reported."
+            )
         all_reports.append(report)
 
         if (
@@ -1583,6 +1620,8 @@ def _text_output(report: dict, verbose: bool, model_title: str | None = None) ->
     console.print(f"  Tier 2: [green]{report.get('tier2_pass', 0)} pass[/green]  "
                   f"[red]{report.get('tier2_fail', 0)} fail[/red]  "
                   f"[yellow]{report.get('tier2_skip', 0)} skip[/yellow]")
+    if report.get("unbound_note"):
+        console.print(f"  [dim]{report['unbound_note']}[/dim]")
 
     suff_total = report.get("suff_sufficient", 0) + report.get("suff_insufficient", 0) + report.get("suff_skip", 0)
     if suff_total > 0:
@@ -1676,6 +1715,9 @@ def _github_output(report: dict, model_title: str | None = None) -> None:
         if t2s:
             click.echo(f"::error title={pfx}Tier 2 Skipped::{t2s} tier2 assertions skipped — no provider configured. Controls cannot reach verified status without tier 2.")
         click.echo(f"::notice title={pfx}Verification Passed::{msg}")
+
+    if report.get("unbound_note"):
+        click.echo(f"::notice title={pfx}Not bound to this repository::{report['unbound_note']}")
 
     # Sufficiency gaps — separate section after verification results
     suff_details = report.get("suff_details", [])

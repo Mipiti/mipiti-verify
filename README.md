@@ -30,7 +30,7 @@ mipiti-verify run <model_id> \
   --project-root .
 ```
 
-API keys are workspace-scoped — `--all` verifies every model accessible by the key.
+API keys are workspace-scoped — `--all` verifies every model accessible by the key that is bound to the repository the verifier runs in: a model whose provenance names another repository is skipped with a notice, one that names this repository has every coverage gap reported, and one that names none is reported only if it has at least one assertion bound here (otherwise a single line says so).
 
 ### `verify` — Check a single assertion locally
 
