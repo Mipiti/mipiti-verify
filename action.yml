@@ -80,6 +80,14 @@ inputs:
     description: "Path to an ECDSA P-256 private key (PEM) used to sign the test-result attestation on CI that has no workload identity. Leave unset on GitHub Actions: the run already mints an OIDC token and the attestation is signed keylessly through Sigstore, which needs no secret and binds the repository, ref and workflow."
     required: false
     default: ""
+  coverage-report:
+    description: "Path to a coverage.py JSON export with contexts (run the tests with --cov-context=test, then 'coverage json --show-contexts'), relative to project-root. Passed to attest-tests --coverage so each recorded test carries the files and lines it reached, which is what a test_attested assertion's 'reached' fact is computed from."
+    required: false
+    default: ""
+  dependence-pairs:
+    description: "Space-separated test=file::symbol pairs (e.g. 'tests/test_auth.py::test_token_required=app/auth.py::require_token'). When set, the action runs 'attest-dependence' before verifying: each named test is run once with its mechanism replaced by a stub, and the outcome is signed into a dependence attestation. This is the one input that RUNS TESTS; it is opt-in and Python-only. Leave unset to keep the action read-only."
+    required: false
+    default: ""
 
 outputs:
   content-hash:
@@ -108,3 +116,5 @@ runs:
     INPUT_JUNIT_REPORT: ${{ inputs.junit-report }}
     INPUT_ATTESTATION_SIGNING_KEY: ${{ inputs.attestation-signing-key }}
     INPUT_ATTESTATION_ENV: ${{ inputs.attestation-env }}
+    INPUT_COVERAGE_REPORT: ${{ inputs.coverage-report }}
+    INPUT_DEPENDENCE_PAIRS: ${{ inputs.dependence-pairs }}

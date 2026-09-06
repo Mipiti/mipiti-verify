@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Test-result attestations carry each test's definition: `attest-tests`
+  locates every recorded test in the checkout and records its `file` and a
+  `definition_sha256` over the definition block (or the file, marked
+  `definition_scope: "file"`, when the block cannot be isolated). The
+  `test_attested` result reports it as `evidence_hash`, so the platform can
+  bind acceptance to the test as written.
+- `attest-tests --coverage <coverage.py JSON with contexts>` records, per
+  test, the files and lines it reached. When a `test_attested` assertion names
+  a `mechanism` (`<file>::<symbol>`), the result reports `reached: true|false`
+  from that record.
+- `attest-dependence`, a new opt-in command for the job that already runs
+  tests: each `(test, mechanism)` pair is run once with the mechanism replaced
+  by a stub and the outcome is signed into a dependence attestation
+  (`predicate.kind = "dependence"`). The `test_attested` result reports
+  `depends: true|false` when such a record names the test and mechanism at
+  the commit under verification. This command runs tests; `run` still
+  executes nothing. Pairs come from `--pair` or `--from-model`.
+- Tier-2 review of a `test_attested` assertion reads the test's definition
+  from the checkout, the named mechanism's definition, and a facts block
+  (definition hash match, reached, fails without); the criterion answers NO
+  when the facts show the test never reached, or does not depend on, the
+  mechanism.
+- Test-backed assertions (`test_attested`, `test_exists`, and
+  `function_exists` / `class_exists` on a test file) are always verified under
+  `--changed-files`: a test's subject is the code it exercises, not its own
+  file.
+- The predicate schema gains the optional per-test fields `file`,
+  `definition_sha256`, `definition_scope`, `reached`, `fails_without` and the
+  optional `kind`. No version bump; absence means "not recorded".
+- Action inputs `coverage-report` and `dependence-pairs`.
 - Each `test_attested` result submitted to the platform carries the signing
   class of the attestation it was checked against (`ci_oidc`, `customer_key`
   or `unsigned`) in a `provenance` field, as data rather than inside the

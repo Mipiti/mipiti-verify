@@ -30,6 +30,18 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
     if [ -n "$INPUT_ATTESTATION_ENV" ]; then
       ATTEST_ARGS+=("--env" "$INPUT_ATTESTATION_ENV")
     fi
+    # Coverage with contexts, so each test records what it reached. Same
+    # resolution as the report: relative to project-root first.
+    if [ -n "${INPUT_COVERAGE_REPORT:-}" ]; then
+      if [ -f "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_PROJECT_ROOT/$INPUT_COVERAGE_REPORT")
+      elif [ -f "$INPUT_COVERAGE_REPORT" ]; then
+        ATTEST_ARGS+=("--coverage" "$INPUT_COVERAGE_REPORT")
+      else
+        echo "::error::coverage-report '$INPUT_COVERAGE_REPORT' not found. Point it at the JSON that 'coverage json --show-contexts' wrote, relative to project-root."
+        exit 1
+      fi
+    fi
     if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
       ATTEST_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
     fi
@@ -41,6 +53,26 @@ if [ -n "$INPUT_JUNIT_REPORT" ]; then
     fi
     mipiti-verify "${ATTEST_ARGS[@]}"
   done
+fi
+
+# Dependence is the one opt-in step that runs tests: each named test once,
+# with its mechanism disabled, in this job. Nothing below this block executes
+# project code.
+if [ -n "${INPUT_DEPENDENCE_PAIRS:-}" ]; then
+  DEP_ARGS=("attest-dependence" "--project-root" "$INPUT_PROJECT_ROOT")
+  for pair in $INPUT_DEPENDENCE_PAIRS; do
+    DEP_ARGS+=("--pair" "$pair")
+  done
+  if [ -n "$INPUT_ATTESTATION_SIGNING_KEY" ]; then
+    DEP_ARGS+=("--signing-key" "$INPUT_ATTESTATION_SIGNING_KEY")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TUF_URL" ]; then
+    DEP_ARGS+=("--sigstore-tuf-url" "$INPUT_SIGSTORE_TUF_URL")
+  fi
+  if [ -n "$INPUT_SIGSTORE_TRUST_CONFIG" ]; then
+    DEP_ARGS+=("--sigstore-trust-config" "$INPUT_SIGSTORE_TRUST_CONFIG")
+  fi
+  mipiti-verify "${DEP_ARGS[@]}"
 fi
 
 ARGS=("run")

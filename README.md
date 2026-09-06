@@ -79,6 +79,16 @@ Independently verifies ECDSA document signatures on exported HTML reports and JS
 
 **Bundle binding.** When an audit package carries a Sigstore bundle, the envelope must also carry `content_integrity.bundle_bind_hash` — the explicit hash the verifier compares against the bundle's in-toto Subject digest (no canonicalisation, no rehashing). Older envelopes that omit this field are rejected. Re-export the audit package from a current Mipiti build to obtain the bundle-bind coverage.
 
+### `attest-tests` / `attest-dependence` — Record test evidence in the test job
+
+```bash
+pytest --junitxml=report.xml --cov --cov-context=test && coverage json --show-contexts -o coverage.json
+mipiti-verify attest-tests --junit report.xml --coverage coverage.json
+mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
+```
+
+`attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` is the one opt-in command that **runs tests**: each named test once with its mechanism disabled, recording whether it fails without it. Both belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested).
+
 ## Audit Envelope Contract
 
 What an auditor running `mipiti-verify audit <report>` actually verifies, and what each check does (or doesn't) defend against. The contract is what makes the verifier defensible without trusting the platform: every claim the audit reports is anchored in either a public-anchor cryptographic chain or an auditor-supplied pin.
@@ -211,7 +221,7 @@ Developer keys skip result submission automatically — no `--dry-run` needed.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--reverify / --no-reverify` | `--reverify` | Re-verify all assertions, not just pending. Catches regressions. |
-| `--changed-files FILE` | none | Only verify assertions referencing listed files. Use `git diff --name-only HEAD~1 > changed.txt`. |
+| `--changed-files FILE` | none | Only verify assertions referencing listed files. Use `git diff --name-only HEAD~1 > changed.txt`. Test-backed assertions are always verified regardless. |
 | `--component ID` | none | Only verify assertions for controls scoped to this component. Use when a model spans multiple repos. |
 | `--concurrency N` | 1 | Max concurrent Tier 2 LLM calls. |
 | `--dry-run` | off | Run verifiers but don't submit results. |
@@ -321,6 +331,28 @@ A `test_attested` assertion is checked against a statement your CI signed about 
 
 **GitLab.** Keyless signing uses the `id_tokens` job keyword; expose the token as `SIGSTORE_ID_TOKEN` with audience `sigstore`. The retired `CI_JOB_JWT_V2` is still honoured.
 
+**What the attestation now carries.** Beyond the run's outcome, each recorded test is bound to its content and, optionally, to what it did:
+
+- *Definition.* `attest-tests` locates each test in the checkout (pytest `classname` → module → file, or the JUnit `file` attribute for other runners) and records `file` and `definition_sha256`, a hash over the definition block from its decorators to the end of its body, whitespace-normalised. A parametrized id (`test_x[case-1]`) resolves to the function; a method's hash covers the method. When only the file can be found the hash covers the file and `definition_scope` is `"file"`; a test that cannot be located carries neither field. The `test_attested` result reports the hash as `evidence_hash`, so a tier-2 acceptance is bound to the definition it was given, and a changed definition is re-judged rather than carried forward.
+- *Reach.* `attest-tests --coverage <report.json>` takes a coverage.py JSON export with contexts (`pytest --cov --cov-context=test`, then `coverage json --show-contexts`) and records, per test, `reached: [{file, lines}]`. When the assertion names a `mechanism`, the result reports `reached: true|false`: whether the run executed a line of that mechanism's definition. An empty `reached` is a fact (the run had coverage and the test touched nothing); a run without `--coverage` leaves it unknown.
+- *Dependence.* `mipiti-verify attest-dependence` runs each `(test, mechanism)` pair once with the mechanism replaced by a stub that returns `None` (a class becomes a stub class whose methods return `None`) and signs the outcome into a second attestation with `predicate.kind = "dependence"`. The result reports `depends: true|false`: a test that fails without the mechanism depends on it; one that still passes does not. **This command runs tests.** It is opt-in, lives in the job that already runs your tests next to `attest-tests`, and is the only command in this package that executes anything; `run` still executes nothing. Pairs come from `--pair <test>=<file>::<symbol>` (repeatable) or `--from-model <id>` (every `test_attested` assertion of the model that names a `mechanism`, fetched with the same credentials `run` uses). Python only: the mechanism is disabled through a pytest plugin loaded for that run.
+
+**The `mechanism` param.** A `test_attested` assertion may name the mechanism the test is meant to exercise as `mechanism: "<file>::<symbol>"` (`Class.method` for a method). It is what reach and dependence are computed against, and what the tier-2 reviewer is shown next to the test.
+
+**Tier 2 reads the closure.** For a `test_attested` review the reviewer is handed the test's definition from the checkout, the named mechanism's definition, and a facts block (definition hash match, reached, fails without). The criterion is YES only if the test as shown exercises the mechanism and asserts the stated outcome; a fact of `reached: no` or `fails without mechanism: no` is a NO whatever the test text says.
+
+**Never skipped under `--changed-files`.** Test-backed assertions (`test_attested`, `test_exists`, and `function_exists` / `class_exists` whose file is a test file) are always verified, in both tiers, when `--changed-files` is set: a test's subject is the code it exercises, so its own file being unchanged says nothing about the claim.
+
+```yaml
+      - run: pytest --junitxml=report.xml --cov --cov-context=test && coverage json --show-contexts -o coverage.json
+      - uses: Mipiti/mipiti-verify@<pinned-sha> # vX.Y.Z
+        with:
+          junit-report: report.xml
+          coverage-report: coverage.json
+          # Opt-in: runs each named test once with its mechanism disabled.
+          dependence-pairs: "tests/test_auth.py::test_token_required=app/auth.py::require_token"
+```
+
 ### Action Inputs
 
 | Input | Required | Default | Description |
@@ -341,6 +373,11 @@ A `test_attested` assertion is checked against a statement your CI signed about 
 | `workspace-signing-key` | No | `""` | PEM ECDSA P-256 private key for workspace-attested submission. Used when no OIDC token is available (Jenkins, Buildkite, self-managed GitLab without ID tokens) or when `signing-prefer=workspace` |
 | `signing-prefer` | No | `sigstore` | When both an OIDC token and a workspace key are available, prefer this signer (`sigstore` or `workspace`) |
 | `require-attestation` | No | `false` | Fail the run when no attestation is produced. Default behaviour is to log a warning and submit unsigned when both Sigstore and workspace-ECDSA signing are unavailable; set to `true` for security-sensitive CI gates that should fail-close on missing attestation |
+| `junit-report` | No | `""` | JUnit XML report(s) your test step wrote, relative to `project-root`; recorded as a signed test-result attestation before verifying |
+| `attestation-env` | No | `""` | Environment variable names the attestation records |
+| `attestation-signing-key` | No | `""` | ECDSA P-256 key (PEM) to sign attestations on CI without a workload identity |
+| `coverage-report` | No | `""` | coverage.py JSON export with contexts, relative to `project-root`; passed to `attest-tests --coverage` so each test records what it reached |
+| `dependence-pairs` | No | `""` | Space-separated `test=file::symbol` pairs. When set, the action runs `attest-dependence` before verifying. **Runs those tests** with the mechanism disabled; opt-in |
 
 ### Action Output
 

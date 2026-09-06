@@ -82,12 +82,19 @@ def parse_junit(report_path: Path) -> dict:
         # distinguish the test that passed from the one that was skipped in
         # the same run, and a claim about a named test needs that distinction:
         # adding a skip is the cheapest way to stop a test failing.
-        tests.append({
+        entry = {
             "id": f"{classname}::{name}" if classname else name,
             "name": name,
             "classname": classname,
             "status": status,
-        })
+        }
+        # Some runners say where the test lives. Kept as a hint for locating
+        # the definition; it is replaced by the resolved path when that
+        # succeeds and dropped when the path is not in the checkout.
+        junit_file = (case.get("file") or "").strip()
+        if junit_file:
+            entry["file"] = junit_file
+        tests.append(entry)
 
     total = len(cases)
     return {
@@ -100,6 +107,254 @@ def parse_junit(report_path: Path) -> dict:
         },
         "tests": tests,
     }
+
+
+# ---------------------------------------------------------------------------
+# Locating each test's definition -- the content the attestation binds
+# ---------------------------------------------------------------------------
+
+# pytest appends the parametrize id to the name: ``test_x[case-1]``. Every
+# case shares one definition, so the id is stripped before lookup.
+_PARAM_SUFFIX = re.compile(r"\[.*$", re.DOTALL)
+
+
+def base_test_name(name: str) -> str:
+    """The function name a recorded test name refers to."""
+    return _PARAM_SUFFIX.sub("", str(name or "")).strip()
+
+
+def normalised_definition(block: str) -> str:
+    """Line endings and trailing whitespace are not part of a definition."""
+    return "\n".join(
+        line.rstrip() for line in block.replace("\r\n", "\n").split("\n")
+    )
+
+
+def definition_sha256(block: str) -> str:
+    return hashlib.sha256(normalised_definition(block).encode("utf-8")).hexdigest()
+
+
+def _relative_posix(project_root: Path, path: Path) -> str:
+    return path.resolve().relative_to(project_root.resolve()).as_posix()
+
+
+def _resolve_in_root(project_root: Path, rel: str) -> Optional[Path]:
+    """``rel`` as a file inside ``project_root``, or ``None``."""
+    if not rel or "\0" in rel:
+        return None
+    try:
+        candidate = (project_root / rel).resolve()
+        root = project_root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _module_file(project_root: Path, dotted: str) -> Optional[Path]:
+    """The file a dotted module path names, as ``a/b/c.py`` or a package."""
+    parts = [p for p in dotted.split(".") if p]
+    if not parts or len(parts) != len(dotted.split(".")):
+        return None
+    if any(p in (".", "..") or "/" in p or "\\" in p for p in parts):
+        return None
+    base = "/".join(parts)
+    for rel in (f"{base}.py", f"{base}/__init__.py"):
+        found = _resolve_in_root(project_root, rel)
+        if found is not None:
+            return found
+    return None
+
+
+def definition_hash_for(
+    project_root: Path, rel_file: str, name: str, owner: str = "",
+) -> Optional[tuple[str, str]]:
+    """``(sha256, scope)`` for ``name`` in ``rel_file``, or ``None``.
+
+    ``scope`` is ``"definition"`` when the block could be isolated -- inside
+    ``owner`` when a class is named -- and ``"file"`` when only the file
+    could be found, in which case the hash covers the whole file. The hash
+    is taken over the untruncated block: the reviewer's copy is bounded,
+    the evidence is not.
+    """
+    from .definition_extract import extract_definition_untruncated
+
+    path = _resolve_in_root(project_root, rel_file)
+    if path is None:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    qualified = f"{owner}.{name}" if owner else name
+    block = extract_definition_untruncated(content, "function", qualified) if name else None
+    if block is not None:
+        return definition_sha256(block), "definition"
+    return definition_sha256(content), "file"
+
+
+def _locate_one(project_root: Path, entry: dict) -> None:
+    name = base_test_name(entry.get("name"))
+    classname = str(entry.get("classname") or "").strip()
+    hint = str(entry.get("file") or "").strip()
+    entry.pop("file", None)
+
+    candidates: list[tuple[Path, str]] = []  # (file, owning class or "")
+    if classname:
+        whole = _module_file(project_root, classname)
+        if whole is not None:
+            candidates.append((whole, ""))
+        owner, _, cls = classname.rpartition(".")
+        if owner and cls:
+            holder = _module_file(project_root, owner)
+            if holder is not None:
+                candidates.append((holder, cls))
+    if hint:
+        hinted = _resolve_in_root(project_root, hint.replace("\\", "/"))
+        if hinted is not None:
+            candidates.append((hinted, ""))
+
+    fallback: Optional[tuple[Path, str]] = None
+    for path, owner in candidates:
+        rel = _relative_posix(project_root, path)
+        if owner:
+            # The class must be defined in that file for the method to be
+            # the definition; otherwise the file is only a location.
+            from .definition_extract import definition_line_span
+
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if definition_line_span(content, "class", owner) is None:
+                # The dotted name's last segment was read as a class and the
+                # file defines none by that name, so this file is not where
+                # the test lives; it is not even a fallback location.
+                continue
+        found = definition_hash_for(project_root, rel, name, owner)
+        if found is None:
+            continue
+        digest, scope = found
+        if scope == "definition":
+            entry["file"] = rel
+            entry["definition_sha256"] = digest
+            return
+        fallback = fallback or (path, "")
+    if fallback is not None:
+        path, _ = fallback
+        found = definition_hash_for(project_root, _relative_posix(project_root, path), "")
+        if found is not None:
+            entry["file"] = _relative_posix(project_root, path)
+            entry["definition_sha256"] = found[0]
+            entry["definition_scope"] = "file"
+
+
+def locate_test_definitions(project_root: Path, tests: list) -> None:
+    """Record, per test, where it is defined and a hash of that definition.
+
+    Adds ``file`` (repository-relative) and ``definition_sha256`` to each
+    entry that resolves; ``definition_scope: "file"`` marks an entry whose
+    function could not be isolated and whose hash covers the file instead.
+    An entry that cannot be resolved is left without the fields: absence
+    means "not resolved", which a reader treats as unknown, never as a
+    match. Nothing here raises.
+    """
+    for entry in tests or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            _locate_one(project_root, entry)
+        except Exception:  # noqa: BLE001
+            entry.pop("file", None)
+            entry.pop("definition_sha256", None)
+            entry.pop("definition_scope", None)
+
+
+# ---------------------------------------------------------------------------
+# Coverage contexts -- what each test reached
+# ---------------------------------------------------------------------------
+
+def _context_test(context: str) -> tuple[str, str]:
+    """``(test file, base test name)`` a coverage context names.
+
+    pytest-cov contexts look like ``tests/test_x.py::test_name|run`` (a
+    class in between for methods); the phase suffix is not part of the
+    identity, and neither is a parametrize id.
+    """
+    ctx = str(context or "").rsplit("|", 1)[0]
+    if "::" not in ctx:
+        return "", ""
+    path, _, rest = ctx.partition("::")
+    leaf = rest.rsplit("::", 1)[-1]
+    return path.replace("\\", "/"), base_test_name(leaf)
+
+
+def merge_coverage(summary: dict, coverage_json: object, project_root: Path) -> None:
+    """Add ``reached: [{file, lines}]`` to each recorded test.
+
+    ``coverage_json`` is a coverage.py JSON export produced with contexts
+    (``coverage json --show-contexts``). A test that no context names gets
+    an explicitly empty list: the run had coverage, and the test touched
+    nothing tracked -- which is a fact, unlike the absence of the field.
+    """
+    if not isinstance(coverage_json, dict) or not isinstance(coverage_json.get("files"), dict):
+        raise AttestationError(
+            "Coverage report is not a coverage.py JSON export: expected a "
+            "top-level 'files' object. Produce it with "
+            "'coverage json --show-contexts'."
+        )
+    root = project_root.resolve()
+    # (test file, test name) -> {source file -> lines}
+    index: dict[tuple[str, str], dict[str, set[int]]] = {}
+    saw_contexts = False
+    for raw_path, data in coverage_json["files"].items():
+        if not isinstance(data, dict):
+            continue
+        contexts = data.get("contexts")
+        if not isinstance(contexts, dict):
+            continue
+        path = Path(str(raw_path))
+        if path.is_absolute():
+            try:
+                rel = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+        else:
+            rel = path.as_posix()
+        for line_str, names in contexts.items():
+            try:
+                line = int(line_str)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(names, list):
+                continue
+            for ctx in names:
+                saw_contexts = True
+                key = _context_test(ctx)
+                if not key[1]:
+                    continue
+                index.setdefault(key, {}).setdefault(rel, set()).add(line)
+    if not saw_contexts:
+        raise AttestationError(
+            "Coverage report carries no contexts, so nothing can be attributed "
+            "to a test. Run the tests with '--cov-context=test' (pytest-cov) "
+            "or 'coverage run --context=test', then 'coverage json "
+            "--show-contexts'."
+        )
+    for entry in summary.get("tests") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = base_test_name(entry.get("name"))
+        known_file = str(entry.get("file") or "")
+        reached: dict[str, set[int]] = {}
+        for (ctx_file, ctx_name), per_file in index.items():
+            if ctx_name != name:
+                continue
+            if known_file and ctx_file and ctx_file != known_file:
+                continue
+            for src, lines in per_file.items():
+                reached.setdefault(src, set()).update(lines)
+        entry["reached"] = [
+            {"file": src, "lines": sorted(lines)} for src, lines in sorted(reached.items())
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +458,14 @@ def build_statement(
     selected_pattern: str = "",
     coverage: Optional[dict] = None,
     environment: Optional[dict] = None,
+    kind: str = "",
 ) -> dict:
-    """Assemble the in-toto statement for one test run."""
+    """Assemble the in-toto statement for one test run.
+
+    ``kind`` distinguishes a second statement shape carried under the same
+    predicate type: absent means a test-result record; ``"dependence"``
+    means each test's entry records how it fared with a mechanism disabled.
+    """
     totals = summary["totals"]
     predicate: dict[str, Any] = {
         "invocation": list(invocation),
@@ -220,6 +481,8 @@ def build_statement(
         "ci": _ci_context(),
         "attested_at": datetime.now(timezone.utc).isoformat(),
     }
+    if kind:
+        predicate["kind"] = kind
     if coverage:
         predicate["coverage"] = coverage
     if environment is not None:

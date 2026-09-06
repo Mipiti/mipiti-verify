@@ -112,10 +112,76 @@
               "skipped",
               "error"
             ]
+          },
+          "file": {
+            "type": "string",
+            "description": "Optional. Repository-relative path of the file the test is defined in, as located in the checkout at attestation time."
+          },
+          "definition_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Optional. SHA-256 over the test's definition block (decorators through the end of the body; CRLF folded to LF, trailing whitespace stripped per line) when it could be isolated, otherwise over the whole file (see definition_scope). Absent when the test could not be located; absence is 'not resolved', never a match."
+          },
+          "definition_scope": {
+            "type": "string",
+            "enum": [
+              "file"
+            ],
+            "description": "Optional. Present, as \"file\", when definition_sha256 covers the whole file because the test's own definition could not be isolated."
+          },
+          "reached": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "file",
+                "lines"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Repository-relative path."
+                },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            },
+            "description": "Optional. Files and lines this test executed, from a coverage report with contexts (`attest-tests --coverage`). An empty array is a fact: the run had coverage and the test touched nothing tracked. Absent means the run recorded no coverage."
+          },
+          "fails_without": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "mechanism",
+                "status"
+              ],
+              "properties": {
+                "mechanism": {
+                  "type": "string",
+                  "description": "<file>::<symbol> that was disabled for the run."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "passed",
+                    "failed",
+                    "error"
+                  ],
+                  "description": "The test's outcome with the mechanism disabled. Anything but passed means the test depends on it; error means the pair could not be run."
+                }
+              }
+            },
+            "description": "Optional; present on dependence records (kind = \"dependence\"). One entry per mechanism the test was run without."
           }
         }
       },
-      "description": "One record per test with its own status. A test_attested assertion names one of these exactly and requires its status to be passed; a skipped test is not evidence."
+      "description": "One record per test with its own status. A test_attested assertion names one of these exactly and requires its status to be passed; a skipped test is not evidence. Optional per-test fields bind the record to the test's definition (file, definition_sha256, definition_scope), what it reached (reached), and what it fails without (fails_without)."
     },
     "ci": {
       "type": "object",
@@ -155,6 +221,13 @@
     "attested_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "dependence"
+      ],
+      "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. A dependence record never evidences that a test ran and passed."
     }
   }
 }

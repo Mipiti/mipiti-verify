@@ -386,6 +386,12 @@ def main() -> None:
               help="Environment key whose value this run should record, e.g. --env FEATURE_AUTH. "
                    "Repeatable. Lets an assertion require that the run ran with a control switched on. "
                    "Credential-looking names are refused.")
+@click.option("--coverage", "coverage_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help=("coverage.py JSON export with contexts (from "
+                    "'coverage json --show-contexts' after a run with "
+                    "'--cov-context=test'); records, per test, the files and "
+                    "lines it reached"))
 @click.option("--pattern", default="", help="Selector the run used, recorded for the reader")
 @click.option("--invocation", default="", help="Command the run executed, recorded for the reader")
 @click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
@@ -398,13 +404,18 @@ def main() -> None:
               type=click.Path(exists=True, dir_okay=False),
               help="Pre-downloaded Sigstore ClientTrustConfig JSON, for air-gapped CI")
 def attest_tests(junit_path: str, project_root: str, commit: str,
-                 env_keys: tuple, pattern: str, invocation: str, key_path: str,
+                 env_keys: tuple, coverage_path: str | None, pattern: str,
+                 invocation: str, key_path: str,
                  key_passphrase: str, sigstore_tuf_url: str,
                  sigstore_trust_config: str) -> None:
     """Record that this CI job's tests ran, as a signed statement.
 
     Reads a report the test run already produced. It does not run tests; the
     workflow step that does is yours, and this command never invokes one.
+
+    Each recorded test carries the path and a hash of its definition as found
+    in the checkout, so the attestation is bound to the test as written. With
+    --coverage it also carries the files and lines the test reached.
 
     Write this into the job that runs the tests, after them:
 
@@ -417,7 +428,8 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
 
     from .attestation import (
         ATTESTATION_DIR, AttestationError, build_statement, collect_environment,
-        head_commit, parse_junit, sign_statement,
+        head_commit, locate_test_definitions, merge_coverage, parse_junit,
+        sign_statement,
     )
     from .runner import _auto_detect_oidc
 
@@ -427,6 +439,22 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     except AttestationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
+
+    locate_test_definitions(root, summary["tests"])
+    if coverage_path:
+        try:
+            coverage_json = _json.loads(_Path(coverage_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            click.echo(
+                f"Error: cannot read coverage report {coverage_path}: {e}. "
+                f"Expected the JSON that 'coverage json --show-contexts' writes.",
+                err=True)
+            raise SystemExit(1)
+        try:
+            merge_coverage(summary, coverage_json, root)
+        except AttestationError as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
 
     resolved_commit = commit.strip() or head_commit(root)
     if not resolved_commit:
@@ -474,10 +502,150 @@ def attest_tests(junit_path: str, project_root: str, commit: str,
     out_path.write_text(attestation, encoding="utf-8")
 
     totals = statement["predicate"]["totals"]
+    located = sum(1 for t in summary["tests"] if t.get("definition_sha256"))
     click.echo(
         f"Attested {totals['total']} test(s) at {resolved_commit[:12]} "
         f"({totals['passed']} passed, {totals['failed']} failed, "
-        f"{totals['skipped']} skipped) -> {out_path}"
+        f"{totals['skipped']} skipped; {located} definition(s) located"
+        f"{'; coverage recorded' if coverage_path else ''}) -> {out_path}"
+    )
+    click.echo(f"Signing identity: {provenance}")
+    if provenance == "unsigned":
+        click.echo(
+            "Note: no CI workload identity and no --signing-key, so this is "
+            "recorded as self-declared evidence.", err=True)
+
+
+@main.command(name="attest-dependence")
+@click.option("--pair", "pair_specs", multiple=True,
+              help=("A test and the mechanism it should depend on, as "
+                    "<test>=<file>::<symbol> (repeatable). The test is a pytest "
+                    "node id or a bare test name."))
+@click.option("--from-model", "model_id", default=None,
+              help=("Take the pairs from this model's test_attested assertions "
+                    "that name a mechanism, fetched with the same credentials "
+                    "'run' uses (MIPITI_API_KEY / MIPITI_BASE_URL)."))
+@click.option("--api-key", envvar="MIPITI_API_KEY", default=None, help="Mipiti API key (with --from-model)")
+@click.option("--base-url", envvar="MIPITI_BASE_URL", default=None, help="API base URL (with --from-model)")
+@click.option("--repo", default="", help="Repository scope for --from-model (default: auto-detected)")
+@click.option("--project-root", type=click.Path(exists=True), default=".",
+              help="Checkout the tests run in (default: .)")
+@click.option("--commit", default="", help="Commit the run covers (default: CI env or .git/HEAD)")
+@click.option("--timeout", default=300, type=int, show_default=True,
+              help="Seconds allowed per pair")
+@click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
+              default="", help="ECDSA P-256 private key (PEM) for CI without a workload identity")
+@click.option("--key-passphrase", envvar="MIPITI_ATTESTATION_KEY_PASSPHRASE",
+              default="", help="Passphrase for --signing-key")
+@click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL")
+@click.option("--sigstore-trust-config", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Pre-downloaded Sigstore ClientTrustConfig JSON")
+def attest_dependence(pair_specs: tuple, model_id: str | None, api_key: str | None,
+                      base_url: str | None, repo: str, project_root: str,
+                      commit: str, timeout: int, key_path: str,
+                      key_passphrase: str, sigstore_tuf_url: str,
+                      sigstore_trust_config: str) -> None:
+    """Record whether each test fails once its mechanism is disabled.
+
+    THIS COMMAND RUNS TESTS. It is opt-in and belongs in the job that already
+    runs your tests, next to attest-tests; verification ('run') still executes
+    nothing. Each pair is run once with the mechanism replaced by a stub, and
+    the outcome is signed into a dependence attestation: a test that fails
+    without the mechanism depends on it; one that still passes does not.
+
+        mipiti-verify attest-dependence --pair tests/test_auth.py::test_token_required=app/auth.py::require_token
+
+    Python projects only: the mechanism is disabled through a pytest plugin.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    from .attestation import (
+        ATTESTATION_DIR, AttestationError, build_statement, head_commit,
+        sign_statement,
+    )
+    from .dependence import pairs_from_assertions, parse_pair, run_dependence
+    from .runner import _auto_detect_oidc, _auto_detect_repo
+
+    root = _Path(project_root)
+    pairs: list[tuple[str, str]] = []
+    try:
+        for spec in pair_specs:
+            pairs.append(parse_pair(spec))
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    if model_id:
+        try:
+            client = MipitiClient(api_key=api_key, base_url=base_url)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
+        try:
+            payload = client.get_all_assertions(
+                model_id, repo=repo or _auto_detect_repo(root))
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"Error: could not fetch assertions for {model_id}: {e}", err=True)
+            raise SystemExit(1)
+        finally:
+            client.close()
+        for pair in pairs_from_assertions(payload):
+            if pair not in pairs:
+                pairs.append(pair)
+
+    if not pairs:
+        click.echo(
+            "Error: nothing to run. Pass --pair <test>=<file>::<symbol> or "
+            "--from-model <id> (whose test_attested assertions name a "
+            "mechanism).", err=True)
+        raise SystemExit(1)
+
+    resolved_commit = commit.strip() or head_commit(root)
+    if not resolved_commit:
+        click.echo(
+            "Error: could not determine the commit this run covers. Pass "
+            "--commit explicitly.", err=True)
+        raise SystemExit(1)
+
+    def _progress(test: str, mechanism: str, status: str) -> None:
+        click.echo(f"  {test} without {mechanism}: {status}")
+
+    click.echo(f"Running {len(pairs)} pair(s) with the mechanism disabled...")
+    try:
+        summary = run_dependence(root, pairs, timeout=timeout, progress=_progress)
+    except AttestationError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=["mipiti-verify", "attest-dependence"],
+        selected_pattern="",
+        kind="dependence",
+    )
+    attestation, provenance = sign_statement(
+        statement,
+        identity_token=_auto_detect_oidc("sigstore"),
+        key_path=key_path,
+        key_passphrase=key_passphrase,
+        tuf_url=sigstore_tuf_url,
+        trust_config_path=sigstore_trust_config,
+    )
+    out_dir = root / ATTESTATION_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = _re.sub(r"[^A-Za-z0-9._-]", "-", model_id or "pairs")[:48]
+    out_path = out_dir / f"tests-{resolved_commit[:12]}-{slug}-dependence.json"
+    out_path.write_text(attestation, encoding="utf-8")
+
+    totals = summary["totals"]
+    click.echo(
+        f"Attested dependence for {totals['total']} pair(s) at "
+        f"{resolved_commit[:12]} ({totals['failed']} depend on their "
+        f"mechanism, {totals['passed']} do not, {totals['errors']} could not "
+        f"be run) -> {out_path}"
     )
     click.echo(f"Signing identity: {provenance}")
     if provenance == "unsigned":

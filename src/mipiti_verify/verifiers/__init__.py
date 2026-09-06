@@ -23,6 +23,15 @@ class VerifierResult:
     passed: bool
     details: str
     provenance: str = ""
+    # Facts a signed-evidence verifier can establish about the evidence
+    # beyond pass/fail, each unknown unless the evidence carries it: the
+    # hash of the definition the evidence binds (``sha256:<hex>``), whether
+    # the recorded run reached the assertion's named mechanism, and whether
+    # the test fails once that mechanism is disabled. ``None`` is "unknown"
+    # and is never reported as either outcome.
+    evidence_hash: str = ""
+    reached: bool | None = None
+    depends: bool | None = None
 
 
 class PathTraversalError(Exception):

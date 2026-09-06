@@ -45,11 +45,7 @@ def extract_definition(content: str, kind: str, name: str) -> str | None:
     ``kind`` is ``"function"`` or ``"class"``. ``None`` means the block could
     not be isolated; the caller falls back to the enclosing file.
     """
-    if not content or not name:
-        return None
-    block = _extract_python(content, kind, name)
-    if block is None:
-        block = _extract_by_lines(content, kind, name)
+    block = extract_definition_untruncated(content, kind, name)
     if block is None:
         return None
     if len(block) > MAX_DEFINITION_CHARS:
@@ -57,36 +53,100 @@ def extract_definition(content: str, kind: str, name: str) -> str | None:
     return block
 
 
-def _extract_python(content: str, kind: str, name: str) -> str | None:
+def extract_definition_untruncated(content: str, kind: str, name: str) -> str | None:
+    """The whole definition block, however long.
+
+    The reviewer's copy is bounded by ``MAX_DEFINITION_CHARS``; a hash taken
+    over a definition must cover all of it, or two definitions that differ
+    only past the cut would hash the same.
+    """
+    if not content or not name:
+        return None
+    span = definition_line_span(content, kind, name)
+    if span is None:
+        return None
+    start, end = span
+    return "\n".join(content.splitlines()[start - 1:end])
+
+
+def definition_line_span(content: str, kind: str, name: str) -> tuple[int, int] | None:
+    """1-based inclusive ``(start, end)`` line span of ``name``, or ``None``.
+
+    ``kind`` is ``"function"`` or ``"class"``. A dotted ``Class.method`` name
+    resolves to the method defined inside that class, so a method is not
+    confused with a same-named function elsewhere in the file. Python is cut
+    by ``ast``; other languages by the line heuristic the reviewer's copy
+    already uses.
+    """
+    if not content or not name:
+        return None
+    parsed, span = _python_span(content, kind, name)
+    if parsed:
+        # The source is Python and the ast is authoritative: a name it does
+        # not define is absent, and the line heuristic must not find a
+        # look-alike that the parser did not.
+        return span
+    return _line_span_by_lines(content, kind, name.rsplit(".", 1)[-1])
+
+
+def _python_span(content: str, kind: str, name: str) -> tuple[bool, tuple[int, int] | None]:
+    """``(parsed, span)``: whether the source parsed as Python, and the span."""
     try:
         tree = ast.parse(content)
     except (SyntaxError, ValueError):
-        return None
+        return False, None
     if kind == "function":
         wanted = (ast.FunctionDef, ast.AsyncFunctionDef)
     else:
         wanted = (ast.ClassDef,)
-    for node in ast.walk(tree):
-        if isinstance(node, wanted) and node.name == name:
+    owner, _, leaf = name.rpartition(".")
+    scope: ast.AST = tree
+    if owner:
+        holder = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == owner:
+                holder = node
+                break
+        if holder is None:
+            return True, None
+        scope = holder
+    for node in ast.walk(scope):
+        if isinstance(node, wanted) and node.name == leaf:
             start = node.lineno
             for deco in getattr(node, "decorator_list", ()):
                 start = min(start, deco.lineno)
             end = getattr(node, "end_lineno", None)
             if end is None:
-                return None
-            lines = content.splitlines()
-            return "\n".join(lines[start - 1:end])
-    return None
+                return True, None
+            return True, (start, end)
+    return True, None
+
+
+def _extract_python(content: str, kind: str, name: str) -> str | None:
+    _, span = _python_span(content, kind, name)
+    if span is None:
+        return None
+    start, end = span
+    return "\n".join(content.splitlines()[start - 1:end])
 
 
 def _extract_by_lines(content: str, kind: str, name: str) -> str | None:
+    span = _line_span_by_lines(content, kind, name)
+    if span is None:
+        return None
+    start, end = span
+    return "\n".join(content.splitlines()[start - 1:end])
+
+
+def _line_span_by_lines(content: str, kind: str, name: str) -> tuple[int, int] | None:
     escaped = re.escape(name)
     patterns = _FUNCTION_LINE_PATTERNS if kind == "function" else _CLASS_LINE_PATTERNS
     lines = content.splitlines()
     for idx, line in enumerate(lines):
         for template in patterns:
             if re.search(template.format(name=escaped), line):
-                return _block_from(lines, idx)
+                block = _block_from(lines, idx)
+                return idx + 1, idx + len(block.split("\n"))
     return None
 
 
