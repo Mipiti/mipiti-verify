@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `attest-dependence` stubs a Verilog / SystemVerilog `module` declared in
+  the non-ANSI style (`module m(a, y); input a; output y; ...`): the
+  header is kept, the body's port declarations are re-emitted verbatim
+  (directions, `wire` / `reg` / `logic`, packed ranges, `signed`, comma
+  lists), every `output` is driven to `x` (`assign` for a net, an
+  `always_comb` / `always @*` block for a variable), and the stub ends
+  with `endmodule`. The declarations are read with the grammar when the
+  `[ast]` extra is installed and by the keyword scanner otherwise. A port
+  the header names without a declaration in the body, or a declaration
+  naming a port the header does not list, is `error` with the reason.
+
 - `no_plaintext_secret` refuses an empty or omitted `patterns` list: an
   absence check names what it checked for, or it establishes nothing.
 

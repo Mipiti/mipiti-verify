@@ -74,7 +74,7 @@ from mipiti_verify.coverage_readers import read_coverage  # noqa: E402
 from mipiti_verify.dependence import run_pair  # noqa: E402
 
 from tests.test_adapters_registry import (  # noqa: E402
-    C, CPP, CSHARP, GO, JAVA, KOTLIN, RUST, SV, SWIFT, VHDL,
+    C, CPP, CSHARP, GO, JAVA, KOTLIN, NONANSI_V, RUST, SV, SWIFT, VHDL,
 )
 from tests.test_languages_definitions import CASES, HDL_CASES, SOURCES  # noqa: E402
 
@@ -96,6 +96,7 @@ FIXTURES: dict[str, tuple[str, str]] = {
     "csharp": ("a.cs", CSHARP),
     "swift": ("a.swift", SWIFT),
     "systemverilog": ("g.sv", SV),
+    "verilog": ("n.v", NONANSI_V),
     "vhdl": ("g.vhd", VHDL),
 }
 
@@ -132,6 +133,9 @@ MUTATION_CASES = [
     # or the file no longer elaborates; the instantiation is on line 24.
     ("systemverilog", "g.sv::property:p_stable", (21, 23), (24,), ("property", "p_stable")),
     ("systemverilog", "g.sv::assert:a_ok", (25, 25), (), ("assert", "a_ok")),
+    # A non-ANSI module: the stub keeps the header and the body's port
+    # declarations, so the change is within the module's own lines.
+    ("verilog", "n.v::module:guard", (1, 17), (), ("module", "guard")),
     ("vhdl", "g.vhd::rtl", (2, 18), (), ("architecture", "rtl")),
     ("vhdl", "g.vhd::process:upd", (11, 16), (), ("process", "upd")),
     ("vhdl", "g.vhd::clamp", (3, 8), (), ("function", "clamp")),
@@ -148,13 +152,14 @@ ADAPTERS_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
     "cpp": ("command",),
     "swift": ("command",),
     "systemverilog": ("command", "pytest"),
+    "verilog": ("command",),
     "vhdl": ("command", "pytest"),
 }
 DRIVE_MECHANISM: dict[str, str] = {
     "go": "a.go::Guard", "rust": "a.rs::guard", "java": "A.java::guard",
     "kotlin": "a.kt::guard", "csharp": "a.cs::Other", "c": "a.c::guard",
     "cpp": "a.cpp::Guard.check", "swift": "a.swift::guardToken",
-    "systemverilog": "g.sv::clamp", "vhdl": "g.vhd::clamp",
+    "systemverilog": "g.sv::clamp", "verilog": "n.v::module:guard", "vhdl": "g.vhd::clamp",
 }
 
 

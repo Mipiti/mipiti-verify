@@ -314,6 +314,27 @@ SV = '''module guard #(parameter W = 8) (
 endmodule
 '''
 
+# A non-ANSI module: directions, ranges, kinds and comma lists are declared
+# in the body, and a task carries a port declaration of its own.
+NONANSI_V = '''module guard #(parameter W = 8) (clk, a, b, y, ok, z, q, io);
+  input clk;
+  input wire [W-1:0] a, b;
+  output y;
+  output reg [W-1:0] z, q;  // "output fake;" in a comment
+  output signed [3:0] ok;
+  inout io;
+  task check;
+    input x;
+    begin
+      if (x) $display("x");
+    end
+  endtask
+  assign y = a[0] ^ b[0];
+  assign ok = 4'sd1;
+  always @(posedge clk) begin z <= a; q <= b; end
+endmodule
+'''
+
 VHDL = '''-- comment with begin end
 architecture rtl of guard is
   function clamp(v : integer) return integer is
@@ -335,6 +356,35 @@ end architecture rtl;
 '''
 
 
+class _parser_off:
+    """The optional parser extra is unimportable inside the block."""
+
+    def __enter__(self):
+        from unittest.mock import patch
+
+        from mipiti_verify.languages import definitions as D
+
+        self._patch = patch.dict("sys.modules", {"tree_sitter_language_pack": None})
+        self._patch.__enter__()
+        D._get_parser.cache_clear()
+        return self
+
+    def __exit__(self, *exc):
+        from mipiti_verify.languages import definitions as D
+
+        self._patch.__exit__(*exc)
+        D._get_parser.cache_clear()
+        return False
+
+
+class _parser_on:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TestHdlMutation:
     def test_module_stub_keeps_the_header_and_drives_outputs_x(self):
         out = mutate_verilog(SV, parse_mechanism("g.sv::module:guard"))
@@ -342,10 +392,63 @@ class TestHdlMutation:
         assert "  initial y = 'bx;\n  assign ok = 'bx;\nendmodule" in out
         assert "clamp" not in out and "always_ff" not in out
 
-    def test_non_ansi_module_is_refused(self):
-        src = "module m(a, y);\n  input a;\n  output y;\n  assign y = a;\nendmodule\n"
-        with pytest.raises(DisableError, match="non-ANSI"):
-            mutate_verilog(src, parse_mechanism("m.v::m"))
+    NONANSI_STUB = (
+        "module guard #(parameter W = 8) (clk, a, b, y, ok, z, q, io);\n"
+        "  input clk;\n"
+        "  input wire [W-1:0] a, b;\n"
+        "  output y;\n"
+        "  output reg [W-1:0] z, q;\n"
+        "  output signed [3:0] ok;\n"
+        "  inout io;\n"
+        "  assign y = 'bx;\n"
+        "  {driver} z = 'bx;\n"
+        "  {driver} q = 'bx;\n"
+        "  assign ok = 'bx;\n"
+        "endmodule\n"
+    )
+
+    @pytest.mark.parametrize("parser", ["tree-sitter", "keyword scanner"])
+    def test_non_ansi_module_keeps_its_port_declarations_and_drives_outputs_x(self, parser):
+        from mipiti_verify.languages import definitions as D
+
+        with _parser_off() if parser == "keyword scanner" else _parser_on():
+            if parser == "tree-sitter" and not D.tree_sitter_available("verilog"):
+                pytest.skip("tree-sitter-language-pack is not installed")
+            out_v = mutate_verilog(NONANSI_V, parse_mechanism("n.v::module:guard"))
+            out_sv = mutate_verilog(NONANSI_V, parse_mechanism("n.sv::guard"))
+        assert out_v == self.NONANSI_STUB.format(driver="always @*")
+        assert out_sv == self.NONANSI_STUB.format(driver="always_comb")
+        assert "task check" not in out_v and "input x;" not in out_v
+
+    def test_ansi_module_stub_is_unchanged(self):
+        out = mutate_verilog(SV, parse_mechanism("g.sv::module:guard"))
+        assert out == "module guard #(parameter W = 8) (\n  input  logic          clk,\n" \
+            "  input  logic [W-1:0]  a, b,\n  output logic [W-1:0]  y,\n  output                ok\n" \
+            ");\n  initial y = 'bx;\n  assign ok = 'bx;\nendmodule\n"
+
+    @pytest.mark.parametrize("parser", ["tree-sitter", "keyword scanner"])
+    def test_non_ansi_header_and_body_must_agree(self, parser):
+        from mipiti_verify.languages import definitions as D
+
+        with _parser_off() if parser == "keyword scanner" else _parser_on():
+            if parser == "tree-sitter" and not D.tree_sitter_available("verilog"):
+                pytest.skip("tree-sitter-language-pack is not installed")
+            undeclared = "module m(a, y);\n  input a;\n  assign y = a;\nendmodule\n"
+            with pytest.raises(DisableError, match="names y in its header without a port declaration"):
+                mutate_verilog(undeclared, parse_mechanism("m.v::m"))
+            unlisted = "module m(a);\n  input a;\n  output y;\n  assign y = a;\nendmodule\n"
+            with pytest.raises(DisableError, match="declares y as a port in the body but does not name it"):
+                mutate_verilog(unlisted, parse_mechanism("m.v::m"))
+            twice = "module m(a);\n  input a;\n  input a;\nendmodule\n"
+            with pytest.raises(DisableError, match="declared more than once"):
+                mutate_verilog(twice, parse_mechanism("m.v::m"))
+            expression = "module m(.a(x), y);\n  input x;\n  output y;\nendmodule\n"
+            with pytest.raises(DisableError, match="not a plain identifier"):
+                mutate_verilog(expression, parse_mechanism("m.v::m"))
+
+    def test_port_less_module_stub_is_header_and_endmodule(self):
+        out = mutate_verilog("module m;\n  initial $display(1);\nendmodule\n", parse_mechanism("m.v::m"))
+        assert out == "module m;\nendmodule\n"
 
     def test_function_and_task_bodies_become_fatal(self):
         out = mutate_verilog(SV, parse_mechanism("g.sv::clamp"))

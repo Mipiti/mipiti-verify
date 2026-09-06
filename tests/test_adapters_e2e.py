@@ -246,6 +246,40 @@ class TestIcarus:
         assert (tmp_path / "guard.v").read_text() == self.FILES["guard.v"]
 
 
+@needs_iverilog
+class TestIcarusNonAnsi:
+    """A non-ANSI module: the stub re-emits the body port declarations, so
+    the mutated file still elaborates through the lint gate, and every
+    output reads ``x`` in the simulation."""
+
+    FILES = {
+        "guard.v": (
+            "module guard(clk, a, y, z);\n  input clk;\n  input a;\n  output y;\n"
+            "  output reg z;\n  assign y = ~a;\n  always @(posedge clk) z <= a;\nendmodule\n"
+        ),
+        "tb.v": (
+            "module tb;\n  reg clk, a; wire y, z;\n  guard dut(.clk(clk), .a(a), .y(y), .z(z));\n"
+            "  initial begin\n    clk = 0; a = 1'b1; #1 clk = 1; #1;\n"
+            "    if ($test$plusargs(\"unrelated\")) begin $display(\"PASS\"); $finish; end\n"
+            "    if (y === 1'bx || z === 1'bx) $fatal(1, \"an output is x\");\n"
+            "    if (y !== 1'b0 || z !== 1'b1) $fatal(1, \"an output is wrong\");\n"
+            "    $display(\"PASS\"); $finish;\n  end\nendmodule\n"
+        ),
+    }
+
+    def test_dependence_through_icarus(self, tmp_path):
+        _checkout(tmp_path, self.FILES)
+        adapter = detect_adapter(
+            tmp_path, run_cmd='sh -c "iverilog -g2012 -o sim.vvp tb.v guard.v && vvp -N sim.vvp +{test} || exit 1"')
+        summary = run_dependence(tmp_path, [
+            ("tb_guard", "guard.v::module:guard"),
+            ("unrelated", "guard.v::guard"),
+        ], adapter=adapter, timeout=300)
+        assert _facts(summary) == {"tb_guard": "failed", "unrelated": "passed"}
+        assert _reasons(summary) == {"tb_guard": "", "unrelated": ""}
+        assert (tmp_path / "guard.v").read_text() == self.FILES["guard.v"]
+
+
 @needs_vitest
 class TestVitest:
     FILES = {

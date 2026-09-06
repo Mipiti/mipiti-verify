@@ -1,7 +1,8 @@
 """Source mutation for hardware description languages.
 
 Verilog / SystemVerilog: a ``module`` becomes a stub with the same header
-whose outputs are driven to ``x``; a ``function`` or ``task`` body becomes
+whose outputs are driven to ``x`` (a non-ANSI module keeps its body port
+declarations, re-emitted verbatim); a ``function`` or ``task`` body becomes
 ``$fatal``; a labelled ``always`` / ``initial`` block, a ``property``, a
 ``sequence`` or a labelled assertion is removed. VHDL: an ``architecture``
 body is emptied (outputs undriven), a labelled ``process`` is removed, a
@@ -236,7 +237,7 @@ def _verilog_ports(header: str) -> list[tuple[str, str, str]]:
     return ports
 
 
-def _verilog_module(content: str, masked: str, name: str) -> str:
+def _verilog_module(content: str, masked: str, name: str, language: str = "systemverilog") -> str:
     m = re.search(rf"\bmodule\s+{re.escape(name)}\b", masked)
     if m is None:
         raise DisableError(f"module {name} is not defined in the file")
@@ -249,9 +250,7 @@ def _verilog_module(content: str, masked: str, name: str) -> str:
     header = content[m.start():semi + 1]
     ports = _verilog_ports(masked[m.start():semi + 1])
     if not any(d for d, _, _ in ports):
-        raise DisableError(
-            f"module {name} declares its ports in the non-ANSI style; only "
-            f"an ANSI header can be stubbed")
+        return _verilog_module_nonansi(content, masked, name, m.start(), semi, end, language)
     lines = [header]
     for direction, net, port in ports:
         if direction != "output":
@@ -262,6 +261,201 @@ def _verilog_module(content: str, masked: str, name: str) -> str:
             lines.append(f"  assign {port} = 'bx;")
     lines.append("endmodule")
     return content[:m.start()] + "\n".join(lines) + content[end:]
+
+
+# ---------------------------------------------------------------------------
+# Non-ANSI modules: ``module m(a, b); input a; output b; ... endmodule``
+# ---------------------------------------------------------------------------
+
+_V_VARIABLE_WORDS = frozenset({"reg", "logic", "bit", "integer", "int", "byte", "shortint",
+                               "longint", "var", "real", "realtime", "time", "shortreal"})
+_V_PORT_DECL = re.compile(r"\b(input|output|inout)\b")
+# Constructs whose bodies may carry their own ``input`` / ``output``
+# declarations (a task's non-ANSI ports) and so are skipped when the
+# module's port declarations are collected.
+_V_NESTED_SCOPES = ("function", "task", "class", "property", "sequence", "clocking",
+                    "covergroup", "checker", "interface", "program", "package", "module")
+_TS_NESTED_TYPES = frozenset({
+    "function_declaration", "task_declaration", "class_declaration", "property_declaration",
+    "sequence_declaration", "clocking_declaration", "covergroup_declaration",
+    "checker_declaration", "interface_declaration", "program_declaration",
+    "package_declaration", "module_declaration",
+})
+
+
+def _header_port_names(masked_header: str) -> list[str]:
+    """The identifiers a non-ANSI header lists, in order."""
+    m = re.search(r"\(", masked_header)
+    if m is None:
+        return []
+    open_idx = m.start()
+    hash_idx = masked_header.find("#")
+    if 0 <= hash_idx < open_idx:
+        close = _match_paren(masked_header, open_idx)
+        open_idx = masked_header.find("(", close + 1)
+        if open_idx < 0:
+            return []
+    close = _match_paren(masked_header, open_idx)
+    if close < 0:
+        raise DisableError("module port list does not close")
+    names: list[str] = []
+    for chunk in masked_header[open_idx + 1:close].split(","):
+        text = chunk.strip()
+        if not text:
+            continue
+        if not re.fullmatch(r"[A-Za-z_][\w$]*", text):
+            raise DisableError(
+                f"port {text!r} is not a plain identifier; a non-ANSI header "
+                f"with port expressions cannot be stubbed")
+        names.append(text)
+    return names
+
+
+def _declaration_names(text: str) -> tuple[str, list[str]]:
+    """``(direction, [identifiers])`` a body port declaration names."""
+    body = re.sub(r"[;]\s*$", "", text.strip())
+    direction = ""
+    names: list[str] = []
+    for chunk in body.split(","):
+        chunk = re.sub(r"=.*$", "", chunk, flags=re.S).strip()
+        words = re.findall(r"\[[^\]]*\]|[\w$]+", chunk)
+        if not words:
+            continue
+        if words[0] in ("input", "output", "inout"):
+            direction = words[0]
+            words = words[1:]
+        idents = [w for w in words if not w.startswith("[") and w not in _V_NET_WORDS
+                  and w not in _V_VARIABLE_WORDS]
+        if idents:
+            names.append(idents[-1])
+            if len(idents) > 1:
+                # ``output my_t x``: a user type reads as a name. Refused
+                # below as an identifier the header does not list.
+                names.extend(idents[:-1])
+    return direction, names
+
+
+def _scan_port_declarations(masked: str, body_start: int, body_end: int) -> list[tuple[int, int]]:
+    """``(start, end)`` offsets of every port declaration statement in the
+    module body, by keyword scan; nested scopes with their own ports are
+    stepped over."""
+    body = masked[body_start:body_end]
+    # Blank the nested scopes so their declarations are not seen.
+    for kw in _V_NESTED_SCOPES:
+        pattern = re.compile(rf"\b{kw}\b")
+        pos = 0
+        while True:
+            m = pattern.search(body, pos)
+            if m is None:
+                break
+            close = _find_keyword_end(body, m.start(), kw, f"end{kw}")
+            if close < 0:
+                pos = m.end()
+                continue
+            body = body[:m.start()] + re.sub(r"[^\n]", " ", body[m.start():close]) + body[close:]
+            pos = close
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _V_PORT_DECL.search(body, pos)
+        if m is None:
+            break
+        semi = body.find(";", m.end())
+        if semi < 0:
+            raise DisableError("a port declaration does not end")
+        spans.append((body_start + m.start(), body_start + semi + 1))
+        pos = semi + 1
+    return spans
+
+
+def _tree_sitter_port_declarations(content: str, name: str, language: str) -> Optional[list[tuple[int, int]]]:
+    """The same spans from the grammar, or ``None`` when no parser is
+    installed, the module is not found, or its parse carries errors."""
+    from ..definitions import _get_parser, _sv_name
+
+    parser = _get_parser(language)
+    if parser is None:
+        return None
+    data = content.encode("utf-8")
+    try:
+        tree = parser.parse(data)
+    except Exception:  # noqa: BLE001 - no parser is "no parser"
+        return None
+    module = None
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "module_declaration" and _sv_name(node) == name:
+            module = node
+            break
+        stack.extend(reversed(node.children))
+    if module is None or module.has_error:
+        return None
+    # Byte offsets map to str offsets only for ASCII; decode the prefix.
+    spans: list[tuple[int, int]] = []
+    stack = list(reversed(module.children))
+    while stack:
+        node = stack.pop()
+        if node.type == "port_declaration":
+            start = len(data[:node.start_byte].decode("utf-8", errors="replace"))
+            end = len(data[:node.end_byte].decode("utf-8", errors="replace"))
+            # The grammar's node stops before the ';'.
+            if end < len(content) and content[end] == ";":
+                end += 1
+            spans.append((start, end))
+            continue
+        if node.type in _TS_NESTED_TYPES:
+            continue
+        stack.extend(reversed(node.children))
+    return spans
+
+
+def _verilog_module_nonansi(content: str, masked: str, name: str, start: int, semi: int,
+                            end: int, language: str) -> str:
+    header = content[start:semi + 1]
+    header_names = _header_port_names(masked[start:semi + 1])
+    end_kw = masked.rfind("endmodule", semi, end)
+    spans = _tree_sitter_port_declarations(content, name, language)
+    if spans is None:
+        spans = _scan_port_declarations(masked, semi + 1, end_kw)
+    declarations: list[tuple[str, str, list[str]]] = []
+    declared: dict[str, str] = {}
+    for s, e in spans:
+        text = content[s:e].strip()
+        direction, names = _declaration_names(masked[s:e])
+        if not direction or not names:
+            raise DisableError(f"cannot read the port declaration {text!r} of module {name}")
+        for port in names:
+            if port in declared:
+                raise DisableError(f"port {port} of module {name} is declared more than once")
+            declared[port] = text
+        declarations.append((direction, text, names))
+    missing = [p for p in header_names if p not in declared]
+    if missing:
+        raise DisableError(
+            f"module {name} names {', '.join(missing)} in its header without a "
+            f"port declaration in the body; the stub would have to guess the direction")
+    extra = [p for p in declared if p not in header_names]
+    if extra:
+        raise DisableError(
+            f"module {name} declares {', '.join(extra)} as a port in the body but "
+            f"does not name it in the header")
+    lines = [header]
+    for _direction, text, _names in declarations:
+        lines.append("  " + text)
+    driver = "always_comb" if language == "systemverilog" else "always @*"
+    for direction, text, names in declarations:
+        if direction != "output":
+            continue
+        words = set(re.findall(r"[\w$]+", text))
+        variable = bool(words & _V_VARIABLE_WORDS)
+        for port in names:
+            if variable:
+                lines.append(f"  {driver} {port} = 'bx;")
+            else:
+                lines.append(f"  assign {port} = 'bx;")
+    lines.append("endmodule")
+    return content[:start] + "\n".join(lines) + content[end:]
 
 
 def _verilog_routine(content: str, masked: str, kind: str, name: str) -> str:
@@ -343,8 +537,9 @@ def mutate_verilog(content: str, mechanism: Mechanism) -> str:
     masked = mask_verilog(content)
     name = mechanism.name
     kind = mechanism.kind
+    language = mechanism.language or "systemverilog"
     if kind == "module":
-        return _verilog_module(content, masked, name)
+        return _verilog_module(content, masked, name, language)
     if kind in ("function", "task"):
         return _verilog_routine(content, masked, kind, name)
     if kind in ("always", "initial"):
@@ -366,7 +561,7 @@ def mutate_verilog(content: str, mechanism: Mechanism) -> str:
         raise DisableError(f"{kind} is not a Verilog construct this adapter can disable")
     # No kind given: the first construct of that name, most structural first.
     if re.search(rf"\bmodule\s+{re.escape(name)}\b", masked):
-        return _verilog_module(content, masked, name)
+        return _verilog_module(content, masked, name, language)
     for routine in ("function", "task"):
         if re.search(rf"\b{routine}\b[^;]*?\b{re.escape(name)}\b\s*[;(]", masked):
             return _verilog_routine(content, masked, routine, name)
