@@ -169,10 +169,10 @@ class TestSuiteRun:
         ], suite_cmd=f"{sys.executable} -m pytest -q --junitxml=report.xml",
             suite_junit="report.xml", adapter=adapter, timeout=300)
         by = {t["id"]: t["fails_without"][0] for t in summary["tests"]}
-        # pytest ids in the report are classname::name; a node id is not in it.
-        assert by["tests/test_guard.py::test_refuses"]["reason"] == REASON_NOT_IN_REPORT
+        # pytest ids in the report are classname::name; a node id maps to it.
+        assert by["tests/test_guard.py::test_refuses"]["status"] == "failed"
         assert by["test_refuses"] == {"mechanism": "app/guard.py::require_token", "status": "failed"}
-        assert by["tests/test_guard.py::test_unrelated"]["reason"] == REASON_NOT_IN_REPORT
+        assert by["tests/test_guard.py::test_unrelated"]["status"] == "passed"
 
     def test_end_to_end_bare_names(self, tmp_path, monkeypatch):
         for name, body in {
@@ -261,3 +261,23 @@ def _null_disable(self, mechanism):
 def _failing_disable(self, mechanism):
     raise DisableError("mutated tree does not compile: nope")
     yield
+
+
+class TestNodeIdBridge:
+    def test_node_id_maps_to_junit_classname(self):
+        from mipiti_verify.dependence import _junit_ids_for
+        assert _junit_ids_for("tests/test_guard.py::test_x")[0] == "tests.test_guard::test_x"
+        assert _junit_ids_for("tests/test_guard.py::TestAuth::test_x")[0] == "tests.test_guard.TestAuth::test_x"
+        assert _junit_ids_for("tests/test_guard.py::test_x[case-1]")[0] == "tests.test_guard::test_x"
+        assert _junit_ids_for("test_x") == ["test_x"]
+
+    def test_report_status_prefers_exact_then_classname_then_bare(self):
+        from mipiti_verify.dependence import _report_status
+        summary = {"tests": [
+            {"id": "tests.test_guard::test_x", "name": "test_x", "status": "failed"},
+            {"id": "tests.test_other::test_x", "name": "test_x", "status": "passed"},
+        ]}
+        assert _report_status(summary, "tests/test_guard.py::test_x") == ("failed", "")
+        assert _report_status(summary, "tests/test_other.py::test_x") == ("passed", "")
+        assert _report_status(summary, "test_x")[1] != ""  # ambiguous by bare name
+        assert _report_status(summary, "tests/test_none.py::test_x")[1] != ""

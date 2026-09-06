@@ -287,16 +287,48 @@ def suite_outcome(report_status: Optional[str]) -> tuple[str, str]:
     return OUTCOME_ERROR, REASON_NOT_IN_REPORT
 
 
+def _junit_ids_for(test: str) -> list[str]:
+    """The JUnit ``classname::name`` forms a pytest node id may appear under.
+
+    A pair is nominated the way a person or an agent writes it, as a node id
+    (``tests/test_guard.py::TestX::test_y``); pytest's JUnit report records
+    the same test as ``tests.test_guard.TestX::test_y``. Exact forms only: the
+    module path with ``/`` as ``.`` and the suffix dropped, with any class
+    segments joined by ``.`` and the last segment as the name. A bare name is
+    returned as itself.
+    """
+    if "::" not in test:
+        return [test]
+    path, *rest = test.split("::")
+    if not rest:
+        return [test]
+    name = rest[-1].split("[", 1)[0]
+    module = path
+    for ext in (".py",):
+        if module.endswith(ext):
+            module = module[: -len(ext)]
+    module = module.replace("\\", "/").strip("/").replace("/", ".")
+    classes = ".".join(rest[:-1])
+    classname = f"{module}.{classes}" if classes else module
+    return [f"{classname}::{name}", test, name]
+
+
 def _report_status(summary: dict, test: str) -> tuple[Optional[str], str]:
-    """The named test's status in a parsed report, or ``(None, reason)``."""
+    """The named test's status in a parsed report, or ``(None, reason)``.
+
+    Matched exactly on the nominated form first, then on the JUnit id a
+    pytest node id maps to; a bare name last, so a node id never widens to
+    every test of that name in another module unless nothing else matched."""
     from .verifiers.tests import _names_test
 
-    matched = [t for t in summary.get("tests") or [] if _names_test(t, test)]
-    if not matched:
-        return None, REASON_NOT_IN_REPORT
-    if len(matched) > 1:
-        return None, REASON_AMBIGUOUS
-    return str(matched[0].get("status") or ""), ""
+    entries = summary.get("tests") or []
+    for candidate in _junit_ids_for(test):
+        matched = [t for t in entries if _names_test(t, candidate)]
+        if len(matched) > 1:
+            return None, REASON_AMBIGUOUS
+        if matched:
+            return str(matched[0].get("status") or ""), ""
+    return None, REASON_NOT_IN_REPORT
 
 
 def run_suite_dependence(
