@@ -19,11 +19,16 @@ across two TLC configurations:
   per-`(pkg, pins)`-row predicate and `key_source` is a property of
   the row. See **"Config-1 per-`key_source` sub-split (lossless)"**
   below for the per-invariant × per-sub-config coverage argument.
-- **`audit_bundle_bind.cfg`** — explores the full `bundle_bind_*` cross-
+- **`audit_bind_<class>.cfg`** (five files, one per non-customer_dsse
+  `key_source` class) — together explore the full `bundle_bind_*` cross-
   product AND the full `ws_sig` variation (V1/V2's preconditions
-  require `ws_sig` present with specific `key_source` values). Pins
+  require `ws_sig` present with specific `key_source` values). Pin
   all auditor pins to `NONE`, since V1/V2's premises require this and
-  I8/I14 are pin-independent. Verifies I8, I14, V1, V2.
+  I8/I14 are pin-independent. Verify I8, I14, V1, V2. Formerly one
+  `audit_bundle_bind.cfg`; split the same way as Config 1 (see
+  "Config-2 per-`key_source` sub-split" below) because TLC computes
+  initial states on one thread and the single enumeration set the CI
+  wall clock.
 
 The conjunction of both configs' invariants is logically equivalent to
 the un-split `audit.cfg`'s `SecurityInvariants`, *if* the partition
@@ -261,8 +266,9 @@ enumeration: each `key_source` value multiplies the WSSig × Package
 cross-product, and the AuditView only collapses *observation* — it
 does not reduce *generation*.
 
-Config 1 is partitioned by `pkg.ws_sig.key_source` into five
-sub-configs, each invoked with the same `ConfigMainInvariants`,
+Config 1 is partitioned by `pkg.ws_sig.key_source` into six
+sub-configs (orphan and legacy were one file until the enumeration
+time of the combined slice set the CI wall clock), each invoked with the same `ConfigMainInvariants`,
 `AuditView`, and bundle_bind pinning as the original
 `audit_main.cfg`:
 
@@ -272,7 +278,8 @@ sub-configs, each invoked with the same `ConfigMainInvariants`,
 | `audit_main_platform.cfg`           | `{KS_PLATFORM}`                   |
 | `audit_main_workspace.cfg`          | `{KS_WORKSPACE}`                  |
 | `audit_main_cdsse.cfg`              | `{KS_CUSTOMER_DSSE}`              |
-| `audit_main_orphan_legacy.cfg`      | `{KS_ORPHAN, KS_LEGACY}`          |
+| `audit_main_orphan.cfg`             | `{KS_ORPHAN}`                     |
+| `audit_main_legacy.cfg`             | `{KS_LEGACY}`                     |
 
 Each `audit_main_<class>.cfg` selects a `Spec_main_<class>` →
 `Init_main_<class>`, which calls `InitBaseFor(<allowedKS>)`.
@@ -376,6 +383,28 @@ The mechanical totality + disjointness check + the per-row invariant
 property are what make the sub-split sound; re-running the aggregate
 would only duplicate work the partition already provably covers.
 
+## Config-2 per-`key_source` sub-split (lossless)
+
+`audit_bundle_bind.cfg` enumerated every non-customer_dsse package in
+one `Init_bind`. TLC computes initial states on a single thread, and
+this spec has no transitions (`Next == UNCHANGED vars`), so the whole
+run was that one enumeration: ~5 min locally, ~12 min on the CI runner,
+symmetry or not. It is now five sub-configs, `audit_bind_<class>.cfg`
+⇒ `Spec_bind_<class>` ⇒ `Init_bind_<class> == InitBaseFor({KS_<CLASS>})
+/\ PinsNone`, one per class in `KeySources \ {KS_CUSTOMER_DSSE}`, run
+as independent CI matrix jobs.
+
+The argument is Config 1's: every Config-2 invariant (I8, I14, V1, V2,
+V4, TypeOK) is a per-`(pkg, pins)`-row predicate and `key_source` is a
+property of the row, so restricting `allowedKS` enumerates a subset of
+rows and checks every invariant on each of them; the union of the five
+subsets is exactly the set `Init_bind` enumerated. `ws_sig = ABSENT`
+rows appear in every sub-config (harmless overlap). Totality and
+disjointness are asserted by `check_audit_partition_total.py`
+(`_check_bind_partition`), the customer_dsse exclusion is the lossless
+one argued above, and `check_audit_view_faithful.py` reads every
+`audit_bind_*.cfg`.
+
 ## Scenario-knob slices (V6..V12)
 
 Three new state variables — `has_orphan_results`, `is_model_only`,
@@ -441,10 +470,12 @@ The audit-spec TLC work runs in a **dedicated `audit-tlc` job** in
 `test-spec-invariants`:
 
 - `audit-tlc` owns the `check_audit_view_faithful.py` AST-proof gate
-  (it certifies the lossless `AuditView` reduction these two configs
-  depend on), the TLC download, and the two `audit.tla` configs
-  (`audit_main.cfg` Config 1 + `audit_bundle_bind.cfg` Config 2),
-  both with `-workers auto`.
+  (it certifies the lossless `AuditView` reduction the configs depend
+  on), the TLC download, and one `audit.tla` config per matrix
+  instance: the six Config-1 sub-configs, the five Config-2
+  sub-configs, the scenario-knob slices and the two manifest configs.
+  Wall clock is the longest single enumeration, since TLC computes
+  initial states on one thread and these specs have no transitions.
 - `test` keeps the Python BFS cross-check and the
   `VerificationPipeline` / `KeySourceResolver` TLC runs.
 

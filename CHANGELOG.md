@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Formal checks in CI take a third of the time. `audit_bundle_bind.cfg`
+  and `audit_main_orphan_legacy.cfg` are split per `key_source` class
+  (`audit_bind_*.cfg`, `audit_main_orphan.cfg`, `audit_main_legacy.cfg`),
+  each its own matrix job, since TLC enumerates a spec's initial states
+  on one thread; the partition checker asserts the Config-2 split is total
+  and disjoint. The audit-spec implementation sweep runs its rows across a
+  fork pool and hands every row a pinned Sigstore trust root instead of
+  refreshing it per row.
+
 ### Fixed
 
 - A dependence pair that recorded no outcome now says why in the verifier's

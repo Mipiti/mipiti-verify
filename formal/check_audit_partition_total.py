@@ -256,6 +256,51 @@ def _extract_init_operators(tla_text: str) -> dict[str, set[str]]:
 
 
 _SPEC_PATTERN = re.compile(r"^\s*SPECIFICATION\s+(Spec_main_\w+)\s*$", re.MULTILINE)
+_BIND_SPEC_PATTERN = re.compile(r"^\s*SPECIFICATION\s+(Spec_bind_\w+)\s*$", re.MULTILINE)
+_BIND_INIT_PATTERN = re.compile(
+    r"^(Init_bind_\w+)\s*==\s*/\\\s*InitBaseFor\s*\(\s*\{([^}]*)\}\s*\)",
+    re.MULTILINE,
+)
+
+
+def _check_bind_partition(tla_text: str, key_sources: set[str]) -> None:
+    """Config 2's per-key_source sub-split (audit_bind_*.cfg ⇒
+    Spec_bind_<class> ⇒ Init_bind_<class> == InitBaseFor({...}) /\ PinsNone)
+    is total over KeySources \ {KS_CUSTOMER_DSSE} and pairwise disjoint.
+    customer_dsse is excluded losslessly (COMPOSITION.md, "Config-2
+    customer_dsse exclusion")."""
+    inits: dict[str, set[str]] = {}
+    for m in _BIND_INIT_PATTERN.finditer(tla_text):
+        literals = {tok.strip() for tok in m.group(2).split(",") if tok.strip()}
+        if not literals:
+            _die(f"{m.group(1)} calls InitBaseFor with empty set")
+        inits[m.group(1)] = literals
+    cfg_to_ks: dict[str, set[str]] = {}
+    for cfg in sorted(FORMAL_DIR.glob("audit_bind_*.cfg")):
+        m = _BIND_SPEC_PATTERN.search(cfg.read_text(encoding="utf-8"))
+        if not m:
+            _die(f"{cfg.name}: no SPECIFICATION Spec_bind_<class> line found")
+        init = m.group(1).replace("Spec_bind_", "Init_bind_", 1)
+        if init not in inits:
+            _die(f"{cfg.name}: SPECIFICATION {m.group(1)} ⇒ {init}, which audit.tla does not declare "
+                 f"as `{init} == /\\ InitBaseFor({{ ... }})`")
+        cfg_to_ks[cfg.name] = inits[init]
+    if not cfg_to_ks:
+        _die("no audit_bind_*.cfg sub-configs found")
+    expected = key_sources - {"KS_CUSTOMER_DSSE"}
+    union: set[str] = set()
+    for ks in cfg_to_ks.values():
+        union |= ks
+    if expected - union:
+        _die(f"CONFIG-2 TOTALITY VIOLATED — {sorted(expected - union)} covered by no audit_bind_*.cfg")
+    if union - expected:
+        _die(f"CONFIG-2 BAD allowedKS — {sorted(union - expected)} outside KeySources \ {{KS_CUSTOMER_DSSE}}")
+    names = sorted(cfg_to_ks)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if cfg_to_ks[a] & cfg_to_ks[b]:
+                _die(f"CONFIG-2 OVERLAP — {a} ∩ {b} = {sorted(cfg_to_ks[a] & cfg_to_ks[b])}")
+    print(f"Config-2 partition: {len(cfg_to_ks)} sub-configs, total over {sorted(expected)}, disjoint")
 
 
 def _spec_to_init(spec: str) -> str:
@@ -290,6 +335,7 @@ def main() -> None:
     tla_text = AUDIT_TLA.read_text(encoding="utf-8")
 
     key_sources = _extract_key_sources(tla_text)
+    _check_bind_partition(tla_text, key_sources)
     init_operators = _extract_init_operators(tla_text)
     subconfig_specs = _extract_subconfig_specs()
 

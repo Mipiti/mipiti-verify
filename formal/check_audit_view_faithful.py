@@ -3,7 +3,7 @@
 `audit.tla`'s state space exploded after the customer-keyed offline
 DSSE modeling added three `WSSig` fields. `AuditView` (defined in
 `audit.tla`, wired via `VIEW AuditView` in `audit_main.cfg` /
-`audit_bundle_bind.cfg`) collapses the customer_dsse-specific
+`audit_bind_*.cfg`) collapses the customer_dsse-specific
 cross-product:
 
   * `customer_key_fp_match`        — BOOLEAN, kept verbatim;
@@ -80,9 +80,14 @@ _CFGS = (
     "audit_main_platform.cfg",
     "audit_main_workspace.cfg",
     "audit_main_cdsse.cfg",
-    "audit_main_orphan_legacy.cfg",
-    # Config 2.
-    "audit_bundle_bind.cfg",
+    "audit_main_orphan.cfg",
+    "audit_main_legacy.cfg",
+    # Config 2, per key_source class.
+    "audit_bind_sigstore.cfg",
+    "audit_bind_platform.cfg",
+    "audit_bind_workspace.cfg",
+    "audit_bind_orphan.cfg",
+    "audit_bind_legacy.cfg",
 )
 
 # Scenario-knob sub-configs (gap #249 / #254 / #258 backfill) do NOT
@@ -699,7 +704,7 @@ def main() -> int:
     print()
     print("=" * 70)
     print("AUDITVIEW FAITHFULNESS PROVEN")
-    print("  Every invariant in audit_main.cfg / audit_bundle_bind.cfg —")
+    print("  Every invariant in audit_main_*.cfg / audit_bind_*.cfg —")
     print("  transitively through Audit and all helpers — observes")
     print("  dsse_predicate_model_id / dsse_predicate_commit_sha /")
     print("  the Sigstore bundle predicate_model_id / predicate_commit_sha /")
