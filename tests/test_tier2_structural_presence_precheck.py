@@ -192,3 +192,74 @@ class TestPrecheckCoversDeclarationTypesBeyondSymbols:
                 "repo": "acme/widgets",
             })
         assert called["called"] is True, "the semantic tier was wrongly skipped"
+
+
+class TestAbsenceTypesAreJudgedNotDiscarded:
+    """For an absence assertion the structural check passes when the target is
+    NOT there. A "not found" refusal is then a restatement of that fact, not a
+    contradiction of it, so the verdict stands as the quality judgment it is:
+    setting it aside would leave tier 2 pending forever on every assertion
+    whose evidence is a lack.
+    """
+
+    def _runner(self, tmp_path):
+        (tmp_path / "Markdown.tsx").write_text(
+            "import ReactMarkdown from 'react-markdown';\n"
+            "export const Md = ({t}) => <ReactMarkdown>{t}</ReactMarkdown>;\n",
+            encoding="utf-8")
+        (tmp_path / "config.py").write_text("DEBUG = False\n", encoding="utf-8")
+        return Runner(client=MagicMock(), project_root=str(tmp_path),
+                      tier2_provider="anthropic", repo="acme/widgets")
+
+    def _verify(self, runner, provider, assertion):
+        with patch("mipiti_verify.tier2.get_provider", return_value=provider):
+            return runner._verify_tier2(assertion)
+
+    _PATTERN_ABSENT = {
+        "id": "asrt_a", "type": "pattern_absent",
+        "params": {"file": "Markdown.tsx", "pattern": r"rehype-?[Rr]aw"},
+        "repo": "acme/widgets",
+    }
+    _NO_SECRET = {
+        "id": "asrt_b", "type": "no_plaintext_secret",
+        "params": {"file": "config.py", "patterns": [r"AKIA[0-9A-Z]{16}"]},
+        "repo": "acme/widgets",
+    }
+
+    def test_a_not_found_refusal_on_pattern_absent_is_a_fail_not_a_skip(self, tmp_path):
+        runner = self._runner(tmp_path)
+        result = self._verify(runner, _RefusingProvider("NOT_FOUND"), self._PATTERN_ABSENT)
+        assert result["status"] == "fail", (
+            "an absence assertion's refusal was discarded as if 'not found' "
+            "contradicted the structural check; for this type it IS the "
+            "structural result, and the verdict must stand"
+        )
+
+    def test_a_not_found_refusal_on_no_plaintext_secret_is_a_fail_not_a_skip(self, tmp_path):
+        runner = self._runner(tmp_path)
+        result = self._verify(runner, _RefusingProvider("NOT_FOUND"), self._NO_SECRET)
+        assert result["status"] == "fail"
+
+    def test_a_quality_refusal_on_pattern_absent_stands(self, tmp_path):
+        runner = self._runner(tmp_path)
+        result = self._verify(runner, _RefusingProvider("QUALITY"), self._PATTERN_ABSENT)
+        assert result["status"] == "fail"
+
+    def test_a_pass_on_pattern_absent_is_recorded(self, tmp_path):
+        runner = self._runner(tmp_path)
+        called = {}
+        result = self._verify(runner, _FakeYesProvider(called), self._PATTERN_ABSENT)
+        assert called.get("called") is True
+        assert result["status"] == "pass"
+
+    def test_a_present_pattern_never_reaches_the_llm(self, tmp_path):
+        """The other direction is unchanged: when the pattern IS there the
+        structural check fails and tier 2 refuses without a model call."""
+        (tmp_path / "Markdown.tsx").write_text(
+            "import rehypeRaw from 'rehype-raw';\n", encoding="utf-8")
+        runner = Runner(client=MagicMock(), project_root=str(tmp_path),
+                        tier2_provider="anthropic", repo="acme/widgets")
+        called = {}
+        result = self._verify(runner, _FakeYesProvider(called), self._PATTERN_ABSENT)
+        assert called.get("called") is None
+        assert result["status"] == "fail"

@@ -19,7 +19,7 @@ from .customer_dsse_signer import (
     sign_verification_statement as sign_customer_dsse_statement,
 )
 from .sigstore_signer import sign_verification_statement
-from .tier2 import SUBJECT_FEATURE_DESCRIPTION, SUBJECT_REPOSITORY_FILE
+from .tier2 import ABSENCE_TYPES, SUBJECT_FEATURE_DESCRIPTION, SUBJECT_REPOSITORY_FILE
 from .verifiers import get_verifier
 from .workspace_key_signer import WorkspaceKeySigner
 
@@ -1356,6 +1356,10 @@ class Runner:
                 not passed
                 and structural_verdict is not None
                 and structural_verdict.passed
+                # For an absence type a "not found" refusal restates the structural
+                # result rather than contradicting it, so it stands as the
+                # quality judgment it is (see tier2.ABSENCE_TYPES).
+                and a_type not in ABSENCE_TYPES
                 and _declared_not_found(reasoning)
             ):
                 # The structural tier holds and the semantic tier declined on

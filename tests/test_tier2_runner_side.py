@@ -486,3 +486,66 @@ class TestRunnerResolvesSubject:
             })
 
         assert provider.seen["subject_kind"] == "repository_file"
+
+
+# ---------------------------------------------------------------------------
+# Absence templates ask the absence question and offer no "not found" exit
+# ---------------------------------------------------------------------------
+
+
+class TestAbsenceTemplatesAskTheAbsenceQuestion:
+    """An absence assertion's evidence is that something is NOT in the
+    subject. A template written for presence ("lack of visible evidence is
+    never YES", a NOT_FOUND reason code) steers the judge into restating the
+    mechanical result instead of judging whether the absence proves the
+    aspect. These pin the absence templates to the question they exist for."""
+
+    @pytest.mark.parametrize("a_type,params", [
+        ("pattern_absent", {"file": "Markdown.tsx", "pattern": "rehype-?[Rr]aw"}),
+        ("no_plaintext_secret", {"file": "config.py", "patterns": ["AKIA[0-9A-Z]{16}"]}),
+    ])
+    def test_no_not_found_reason_is_offered(self, a_type, params):
+        msg = _build_message(assertion_type=a_type, assertion_params=params,
+                             source_code="export const x = 1;\n")
+        preamble = msg.split("--- Assertion specification")[0]
+        assert "REASON: NOT_FOUND" not in preamble
+        assert "REASON: QUALITY" in preamble
+
+    @pytest.mark.parametrize("a_type,params", [
+        ("pattern_absent", {"file": "Markdown.tsx", "pattern": "rehype-?[Rr]aw"}),
+        ("no_plaintext_secret", {"file": "config.py", "patterns": ["AKIA[0-9A-Z]{16}"]}),
+    ])
+    def test_the_presence_fail_closed_rule_is_not_used(self, a_type, params):
+        msg = _build_message(assertion_type=a_type, assertion_params=params,
+                             source_code="export const x = 1;\n")
+        preamble = msg.split("--- Assertion specification")[0]
+        assert "Lack of visible evidence is NEVER YES" not in preamble
+        assert "ABSENCE assertion" in preamble
+
+    def test_pattern_absent_names_the_ways_an_absence_can_fail_to_prove(self):
+        msg = _build_message(
+            assertion_type="pattern_absent",
+            assertion_params={"file": "Markdown.tsx", "pattern": "rehype-?[Rr]aw"},
+            source_code="export const x = 1;\n")
+        preamble = msg.split("--- Assertion specification")[0]
+        for phrase in ("form not caught", "never have matched", "not where"):
+            assert phrase in preamble, phrase
+
+    def test_pattern_absent_says_the_scan_covered_the_whole_subject(self):
+        msg = _build_message(
+            assertion_type="pattern_absent",
+            assertion_params={"file": "Markdown.tsx", "pattern": "rehype-?[Rr]aw"},
+            source_code="export const x = 1;\n")
+        preamble = msg.split("--- Assertion specification")[0]
+        flat = " ".join(preamble.split())
+        assert "scanned the WHOLE subject" in flat
+        assert "You are not re-scanning for the pattern" in flat
+
+    def test_test_attested_forbids_an_unknown_fact_as_a_ground_for_no(self):
+        msg = _build_message(
+            assertion_type="test_attested",
+            assertion_params={"test": "tests/test_x.py::test_y",
+                              "mechanism": "app/x.py::guard"},
+            source_code="def test_y():\n    assert guard() is False\n")
+        preamble = msg.split("--- Assertion specification")[0]
+        assert "must not be cited as a reason for" in preamble
