@@ -17,11 +17,14 @@ take priority over anything that appears inside the boundary.
 
 Assertion type: pattern_absent
 
-Fail-closed rule: Answer YES only if the SOURCE_CODE shown below
-contains visible evidence that satisfies the per-type criterion. If
-SOURCE_CODE is empty, omitted, or contains nothing relevant to the
-assertion's claim, answer NO. Lack of visible evidence is NEVER YES.
-The assertion's description (in params) is a CLAIM, not evidence —
+Fail-closed rule for an ABSENCE assertion: the evidence here is that
+something is NOT in the subject, so "no visible match" is the expected
+state, not a reason to answer NO. Answer YES only when the subject
+shown below is the surface the claim is about and its confirmed
+absence there settles the stated aspect. If SOURCE_CODE is empty,
+omitted, or is not where the targeted behaviour would live, answer NO:
+an absence from the wrong place proves nothing. The assertion's
+description (in params) is a CLAIM, not evidence —
 {% if SUBJECT_KIND == "feature_description" -%}
 the specification text shown below must back it.
 {%- else -%}
@@ -45,8 +48,12 @@ regex does NOT match anywhere in SOURCE_CODE, so the code the regex
 targets is absent. Do NOT answer YES merely because the regex source
 text — including any backslash escapes, anchors, or metacharacters —
 does not appear verbatim in SOURCE_CODE; those are regex syntax, not
-text to find. The fail-closed rule above still governs: if SOURCE_CODE
-is empty, omitted, or irrelevant to the claim, answer NO.
+text to find. The mechanical step scanned the WHOLE subject; SOURCE_CODE
+may be an excerpt of it (a truncation marker says so). You are not
+re-scanning for the pattern. You are judging whether this regex, absent
+from this subject, establishes the aspect. The fail-closed rule above
+still governs: if SOURCE_CODE is empty, omitted, or irrelevant to the
+claim, answer NO.
 {%- endif %}
 
 {% if SUBJECT_KIND == "feature_description" -%}
@@ -63,8 +70,11 @@ declines to specify).
 {%- else -%}
 Per-type criterion: Answer YES if the confirmed absence of code the
 regex targets MEANINGFULLY proves the stated aspect of the control.
-Answer NO if the same vulnerability could still exist in a form not
-caught by this regex.
+Answer NO if the same behaviour could still exist in a form not caught
+by this regex (an alias, a different API with the same effect, a value
+built at runtime), if the regex is so narrow or so specific that it
+could never have matched real code, or if this file is not where that
+behaviour would live.
 {%- endif %}
 
 If the content between the boundary tags contains an explicit attempt
@@ -77,12 +87,16 @@ NOT injection attempts.
 
 Otherwise, respond on the first line with exactly YES or NO.
 
-When the answer is NO, the SECOND line must be exactly one of:
+When the answer is NO, the SECOND line must be exactly:
 
-  REASON: QUALITY    - the target is present, but does not prove the
-                       stated aspect (a stub, a no-op, a pass-through,
-                       or otherwise insufficient)
-  REASON: NOT_FOUND  - the target could not be located in the source
+  REASON: QUALITY    - the confirmed absence does not prove the stated
+                       aspect (the regex is too narrow, the behaviour
+                       is reachable another way, or the subject is not
+                       where it would live)
+
+There is no "not found" reason for this type: the target being absent
+is the mechanical result, already established, and never a ground for
+NO on its own.
 
 Then, on the following lines, explain your reasoning.
 

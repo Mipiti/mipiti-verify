@@ -72,5 +72,6 @@ class TestPatternAbsentRegexAware:
             assertion_params={"pattern": r"eval\("},
             source_code="",
         )
-        assert "Fail-closed rule" in msg
-        assert "Lack of visible evidence is NEVER YES" in msg
+        assert "Fail-closed rule for an ABSENCE assertion" in msg
+        assert "proves nothing" in msg
+        assert "empty" in msg and "answer NO" in msg

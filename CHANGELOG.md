@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An absence assertion (`pattern_absent`, `no_plaintext_secret`) can pass
+  tier 2. Its templates asked the presence question ("lack of visible
+  evidence is never YES") and offered a `NOT_FOUND` reason that, for a
+  target expected to be absent, restated the structural result; the
+  runner then set the verdict aside as a contradiction and the assertion
+  stayed pending, so a control whose clause is provable only by an
+  absence could never reach verified. The templates now ask whether the
+  confirmed absence proves the aspect (the regex could be too narrow, the
+  behaviour reachable another way, the file the wrong place), offer only
+  a `QUALITY` reason, and say the scan covered the whole subject when the
+  judge sees an excerpt. Absence types are exempt from the not-found
+  discard, so a stray one is a plain refusal rather than a permanent skip.
+- The `test_attested` template says outright that an unmeasured fact
+  ("reached mechanism: unknown") is never a ground for NO.
+
 ### Changed
 
 - Formal checks in CI take a third of the time. `audit_bundle_bind.cfg`

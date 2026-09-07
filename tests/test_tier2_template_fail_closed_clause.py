@@ -25,9 +25,11 @@ from pathlib import Path
 import pytest
 
 from mipiti_verify.tier2 import (
+    ABSENCE_TYPES,
     SUBJECT_FEATURE_DESCRIPTION,
     SUBJECT_REPOSITORY_FILE,
     _build_message,
+    fail_closed_phrases,
 )
 
 TEMPLATES_DIR = (
@@ -37,13 +39,16 @@ TEMPLATES_DIR = (
     / "templates"
 )
 
-REQUIRED_PHRASES: tuple[str, ...] = (
-    "Fail-closed rule",
-    "SOURCE_CODE",
-    "Lack of visible evidence is NEVER YES",
+# The family-specific phrases come from ``tier2.fail_closed_phrases``; the
+# two below are common to both families (the description is a CLAIM).
+COMMON_PHRASES: tuple[str, ...] = (
     "description",  # references the assertion's description as a CLAIM
     "claim",  # case-insensitive check below
 )
+
+
+def _required_phrases(assertion_type: str) -> tuple[str, ...]:
+    return tuple(fail_closed_phrases(assertion_type)) + COMMON_PHRASES
 
 # Every subject a template may be rendered for. The runner settles the
 # subject when it loads the content; each value it can settle on
@@ -93,7 +98,7 @@ def test_rendered_prompt_contains_fail_closed_clause(
 ) -> None:
     """The clause reaches the LLM for every type, on every subject."""
     rendered = _render(assertion_type, subject_kind)
-    for phrase in REQUIRED_PHRASES:
+    for phrase in _required_phrases(assertion_type):
         # Match case-insensitively for prose phrases; the literal token
         # "SOURCE_CODE" must appear verbatim.
         if phrase == "SOURCE_CODE":

@@ -49,6 +49,29 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 SUBJECT_REPOSITORY_FILE = "repository_file"
 SUBJECT_FEATURE_DESCRIPTION = "feature_description"
 
+# Types whose structural check passes when the target is ABSENT. Their
+# templates ask a different fail-closed question from the presence
+# templates: "no visible match" is the expected state, so the clause that
+# closes the false-pass class for them is that an absence from an empty,
+# missing, or irrelevant subject proves nothing. Read by the runner (a
+# "not found" refusal on these types is a restatement of the structural
+# result, never a contradiction of it) and by the template contract checks.
+ABSENCE_TYPES = frozenset({"pattern_absent", "no_plaintext_secret"})
+
+# The phrases every rendered prompt must carry, per template family. Each
+# closes the same false-pass class (YES rationalised from the assertion's
+# own description, with nothing in SOURCE_CODE to back it); the wording
+# differs because the evidence a presence template judges is something
+# shown, and the evidence an absence template judges is something not
+# there.
+FAIL_CLOSED_PHRASES_PRESENCE = ("Fail-closed rule", "Lack of visible evidence is NEVER YES", "SOURCE_CODE")
+FAIL_CLOSED_PHRASES_ABSENCE = ("Fail-closed rule for an ABSENCE assertion", "proves nothing", "SOURCE_CODE")
+
+
+def fail_closed_phrases(assertion_type: str) -> tuple:
+    """The fail-closed phrases a rendered prompt for this type must carry."""
+    return FAIL_CLOSED_PHRASES_ABSENCE if assertion_type in ABSENCE_TYPES else FAIL_CLOSED_PHRASES_PRESENCE
+
 _SUBJECT_LABELS: Mapping[str, str] = {
     SUBJECT_REPOSITORY_FILE: "the repository file under verification",
     SUBJECT_FEATURE_DESCRIPTION: (

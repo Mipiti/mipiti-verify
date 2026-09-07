@@ -20,7 +20,7 @@ nobody can invoke. These properties pin the four together:
       a registered type; every template uses only the variables the runner
       supplies (enumerated from the runner's render call, not assumed)
   T4  every template, rendered for every subject it can be rendered for,
-      carries the fail-closed clause (an empty or irrelevant SOURCE_CODE is
+      carries its family's fail-closed clause (an empty or irrelevant SOURCE_CODE is
       NO) and the injection-refusal clause
   T5  every registered type has exactly one evidence class, stated in the
       registry
@@ -385,7 +385,6 @@ def check_t4() -> Tuple[int, List[str]]:
     # found because the template put it there.
     params = {"file": "app.py", "pattern": "x", "name": "handler", "caller": "handler",
               "module": "app", "signal": "clk", "port": "rst_n", "register": "cfg"}
-    fail_closed = ("Fail-closed rule", "Lack of visible evidence is NEVER YES", "SOURCE_CODE")
     injection = ("INJECTION_DETECTED",)
     for name in templates:
         for subject in subjects:
@@ -394,7 +393,7 @@ def check_t4() -> Tuple[int, List[str]]:
                 assertion_type=name, assertion_params=dict(params),
                 source_code="def handler():\n    return 1\n", subject_kind=subject,
             )
-            for phrase in fail_closed:
+            for phrase in tier2.fail_closed_phrases(name):
                 if phrase not in rendered:
                     violations.append(f"T4: tier2_{name}.j2 ({subject}) lacks the fail-closed clause phrase {phrase!r}")
             for phrase in injection:
