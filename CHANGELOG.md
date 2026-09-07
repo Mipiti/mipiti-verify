@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The semantic judge is no longer asked to locate what the mechanical tier
+  already located. A `test_attested` assertion whose mechanism is imported
+  rather than defined (a framework middleware class, say) showed the judge
+  a mechanism section reading "not found", and the judge answered in kind;
+  it now shows the sites in the file that reference and configure the
+  symbol. Every presence-type prompt ends with the mechanical tier's own
+  finding ("defined at line 131", "pattern found"). When a not-found
+  refusal is still set aside, the recorded details carry the structural
+  finding and the judge's reasoning, so the cause is readable instead of
+  a bare "unanswered".
+
+### Fixed
+
 - An absence assertion (`pattern_absent`, `no_plaintext_secret`) can pass
   tier 2. Its templates asked the presence question ("lack of visible
   evidence is never YES") and offered a `NOT_FOUND` reason that, for a

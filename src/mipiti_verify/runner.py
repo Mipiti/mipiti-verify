@@ -173,17 +173,7 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
         # name, ``Class.method``, or ``kind:name`` such as ``module:alu``)
         # in the language the file's extension names, so an HDL mechanism
         # shows the judge its definition too.
-        content = _read(mech_file)
-        block = None
-        if content:
-            span = mechanism_line_span(project_root, mech_file, symbol)
-            if span is not None:
-                start, end = span
-                block = "\n".join(content.splitlines()[start - 1:end])[:MAX_DEFINITION_CHARS]
-        sections.append(
-            f"--- Mechanism {mech_file}::{symbol} ---\n"
-            + (block if block is not None else "(definition not found in the checkout)")
-        )
+        sections.append(_mechanism_section(project_root, mech_file, symbol, _read(mech_file)))
 
     # The facts the mechanical tier established, restated for the judge.
     matches = definition_matches_checkout(project_root, entry) if entry else None
@@ -207,6 +197,65 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
         facts.append(f"fails without mechanism: {_yes_no_unknown(depends)}")
     sections.append("--- Facts ---\n" + "\n".join(facts))
     return "\n\n".join(sections)[:16000]
+
+
+def _reference_sites(content: str, name: str, *, context: int = 3, limit: int = 6) -> str:
+    """The lines of ``content`` that name ``name``, each with ``context``
+    lines either side and a line number, at most ``limit`` sites. Empty when
+    nothing names it."""
+    import re as _re
+    lines = content.splitlines()
+    hits = [i for i, line in enumerate(lines) if _re.search(rf"\b{_re.escape(name)}\b", line)]
+    if not hits:
+        return ""
+    out: list[str] = []
+    last_end = -1
+    for i in hits[:limit]:
+        start, end = max(0, i - context), min(len(lines), i + context + 1)
+        if start > last_end + 1 and out:
+            out.append("...")
+        for j in range(max(start, last_end + 1), end):
+            out.append(f"{j + 1:5d}  {lines[j]}")
+        last_end = end - 1
+    if len(hits) > limit:
+        out.append(f"... ({len(hits) - limit} more site(s) not shown)")
+    return "\n".join(out)[:MAX_DEFINITION_CHARS_FOR_SITES]
+
+
+MAX_DEFINITION_CHARS_FOR_SITES = 6000
+
+
+def _mechanism_section(project_root: Path, mech_file: str, symbol: str, content: str) -> str:
+    """The ``--- Mechanism ---`` section of a ``test_attested`` review.
+
+    The mechanism's definition when the checkout defines it. When it does
+    not (the symbol is imported, or provided by a library such as a
+    framework middleware class), the sites in the file that reference it,
+    since that is where the mechanism is configured and the only surface the
+    judge can hold the test against. The judge is told which of the two it is
+    looking at; a bare "not found" would read as the mechanism being absent,
+    which the mechanical tier never established.
+    """
+    from .definition_extract import MAX_DEFINITION_CHARS
+    from .verifiers.tests import mechanism_kinds, mechanism_line_span
+
+    header = f"--- Mechanism {mech_file}::{symbol} ---\n"
+    if content:
+        span = mechanism_line_span(project_root, mech_file, symbol)
+        if span is not None:
+            start, end = span
+            return header + "\n".join(content.splitlines()[start - 1:end])[:MAX_DEFINITION_CHARS]
+        _kinds, name = mechanism_kinds(symbol)
+        sites = _reference_sites(content, name) if name else ""
+        if sites:
+            return (
+                header
+                + "(no definition in this file: the symbol is imported or provided by a "
+                "library. These are the sites in the file that reference it; the "
+                "mechanism is configured here, and this is the surface to hold the "
+                "test against.)\n" + sites
+            )
+    return header + "(definition not found in the checkout)"
 
 
 # Path shapes that mark a file as a test. A test-backed assertion's subject is
@@ -1330,6 +1379,24 @@ class Runner:
                     ),
                 }
 
+        # The mechanical tier's own finding travels with the source for the
+        # presence types: where the target is, in tier 1's words. Existence is
+        # settled outside the boundary; the judge is shown the settled fact so
+        # the only question left in front of it is the quality one. Absence
+        # types state theirs in the template, and test_attested carries its
+        # own facts block.
+        if (
+            structural_verdict is not None
+            and structural_verdict.passed
+            and a_type not in ABSENCE_TYPES
+            and a_type != "test_attested"
+            and structural_verdict.details
+        ):
+            source_code = (
+                f"{source_code}\n\n--- Facts (established by the mechanical tier) ---\n"
+                f"the target is present: {structural_verdict.details}"
+            )
+
         try:
             from .tier2 import get_provider
 
@@ -1376,7 +1443,8 @@ class Runner:
                         "while the structural check confirms the target is "
                         "present. Existence is settled structurally; tier-2 "
                         "may only judge quality. The quality question is "
-                        "unanswered."
+                        f"unanswered. Structural check: {structural_verdict.details}. "
+                        f"Judge's reasoning: {(reasoning or '').strip()[:1500]}"
                     ),
                     "reasoning": reasoning,
                     "reviewer": reviewer,
