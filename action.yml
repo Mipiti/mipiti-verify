@@ -32,6 +32,10 @@ inputs:
     description: Provider API key (OpenAI or Anthropic)
     required: false
     default: ""
+  tier2-consistency-n:
+    description: "Tier-2 self-consistency: judgments per fresh evidence; a PASS needs all N to agree (default 3)"
+    required: false
+    default: ""
   project-root:
     description: Project root directory
     required: false
@@ -141,6 +145,7 @@ runs:
     INPUT_PROJECT_ROOT: ${{ inputs.project-root }}
     INPUT_TIER2_PROVIDER: ${{ inputs.tier2-provider }}
     INPUT_TIER2_MODEL: ${{ inputs.tier2-model }}
+    INPUT_TIER2_CONSISTENCY_N: ${{ inputs.tier2-consistency-n }}
     INPUT_REVERIFY: ${{ inputs.reverify }}
     INPUT_DRY_RUN: ${{ inputs.dry-run }}
     INPUT_CONCURRENCY: ${{ inputs.concurrency }}

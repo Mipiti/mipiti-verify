@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tier-2 self-consistency and evidence-keyed verdict reuse, so a nondeterministic judge cannot flicker a control's verified status between runs. Each fresh evidence is judged N times (N=3 default; `--tier2-consistency-n` / `tier2-consistency-n` input / `MIPITI_TIER2_CONSISTENCY_N`) and the spread decides: a PASS requires every judgment to agree, a unanimous fail is a confident fail, an all-inconclusive vote is skipped, and anything else is a split — reported not verified and deliberately not cached, so a borderline verdict is never frozen into a lucky green. Each verdict is keyed by a hash of exactly what the judge is shown (assertion type, params, assembled source, subject kind, the per-type template bytes, provider and model); when the platform returns a stored verdict for an unchanged hash the runner reuses it with no judge call. A confident assertion converges to a cached pass over a run or two; a genuinely borderline one never caches green.
+
 ### Fixed
 
 - The semantic judge is no longer asked to locate what the mechanical tier

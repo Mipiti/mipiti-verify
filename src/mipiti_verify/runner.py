@@ -453,6 +453,7 @@ class Runner:
         component_id: str | None = None,
         auto_component_path: bool = True,
         test_file_pattern: str | None = None,
+        tier2_consistency_n: int | None = None,
     ) -> None:
         self.client = client
         # Extra test-file identification, on top of the layout heuristic.
@@ -476,6 +477,16 @@ class Runner:
         self.tier2_model = tier2_model
         self.tier2_api_key = tier2_api_key
         self.ollama_url = ollama_url
+        # Self-consistency sample count for tier-2 (N judgments per fresh
+        # evidence; a PASS requires all N to agree). Default 3; override via the
+        # constructor or MIPITI_TIER2_CONSISTENCY_N. Clamped to >= 1.
+        _n_env = os.environ.get("MIPITI_TIER2_CONSISTENCY_N", "").strip()
+        if tier2_consistency_n is not None:
+            self.tier2_consistency_n = max(1, int(tier2_consistency_n))
+        elif _n_env.isdigit():
+            self.tier2_consistency_n = max(1, int(_n_env))
+        else:
+            self.tier2_consistency_n = 3
         # The raw OIDC token is used only locally to mint a Sigstore bundle
         # (see _sign_with_sigstore); it is never transmitted to Mipiti. For
         # Sigstore signing, the token MUST have `aud=sigstore` — Fulcio
@@ -1400,59 +1411,116 @@ class Runner:
         try:
             from .tier2 import get_provider
 
+            ev_hash = _tier2_evidence_hash(
+                a_type, a_params, source_code, subject_kind,
+                self.tier2_provider_name, self.tier2_model,
+            )
+            reviewer = f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}"
+
+            # Reuse a stored verdict when the evidence is unchanged: the verdict
+            # is a function of the evidence, so an unchanged hash needs no judge
+            # call — this is what stops a nondeterministic judge from flickering
+            # a control's status between runs. The cached verdict rides on the
+            # assertion pulled from the platform; absent it (older platform, or
+            # a first sighting of this evidence), fall through and judge. Only
+            # DECISIVE verdicts are ever cached (see the aggregation below).
+            cached = assertion.get("tier2_cached") if isinstance(assertion, dict) else None
+            if (
+                isinstance(cached, dict)
+                and cached.get("evidence_hash") == ev_hash
+                and cached.get("status") in ("pass", "fail")
+            ):
+                return {
+                    "status": cached["status"],
+                    "details": "Reused the stored tier-2 verdict; the evidence is unchanged.",
+                    "reasoning": str(cached.get("reasoning", "")),
+                    "reviewer": "cache",
+                    "tier2_evidence_hash": ev_hash,
+                }
+
             provider = get_provider(
                 self.tier2_provider_name,
                 model=self.tier2_model,
                 api_key=self.tier2_api_key,
                 ollama_url=self.ollama_url,
             )
-            # Single-path runner-side rendering. The runner loads its
-            # own per-type Jinja template from ``templates/`` and
-            # renders it with a fresh per-call boundary token (see
-            # ``tier2._build_message`` and ``_prompt_renderer``).
-            # The token is minted at the call site, never crosses the
-            # network, and is never persisted.
-            passed, reasoning = provider.evaluate(
-                assertion_type=a_type,
-                assertion_params=a_params,
-                source_code=source_code,
-                subject_kind=subject_kind,
-            )
-            reviewer = f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}"
-            if (
-                not passed
-                and structural_verdict is not None
-                and structural_verdict.passed
-                # For an absence type a "not found" refusal restates the structural
-                # result rather than contradicting it, so it stands as the
-                # quality judgment it is (see tier2.ABSENCE_TYPES).
-                and a_type not in ABSENCE_TYPES
-                and _declared_not_found(reasoning)
-            ):
-                # The structural tier holds and the semantic tier declined on
-                # the ground that it could not find the target. Those cannot
-                # both be true, and existence is not the semantic tier's to
-                # decide, so the verdict is discarded rather than recorded.
-                # Inconclusive, not a pass: the quality question went
-                # unanswered, and inventing a pass would be the same boundary
-                # violation in the opposite direction.
+            # Self-consistency: run N judgments and let the SPREAD decide, so a
+            # single flip cannot verify or un-verify a control. Each call loads
+            # the per-type template and renders it with a fresh per-call
+            # boundary token (semantically identical content). A vote is a
+            # "discard" when the semantic tier declined on NOT_FOUND against a
+            # passing structural check — a boundary artifact, not a quality
+            # fail; existence is settled structurally, not by tier 2.
+            n = self.tier2_consistency_n
+            npass = nfail = ndiscard = 0
+            last_pass = last_fail = last_discard = ""
+            for _ in range(n):
+                passed_i, reasoning_i = provider.evaluate(
+                    assertion_type=a_type,
+                    assertion_params=a_params,
+                    source_code=source_code,
+                    subject_kind=subject_kind,
+                )
+                if passed_i:
+                    npass += 1
+                    last_pass = reasoning_i
+                elif (
+                    structural_verdict is not None
+                    and structural_verdict.passed
+                    and a_type not in ABSENCE_TYPES
+                    and _declared_not_found(reasoning_i)
+                ):
+                    ndiscard += 1
+                    last_discard = reasoning_i
+                else:
+                    nfail += 1
+                    last_fail = reasoning_i
+
+            # Aggregate. A PASS requires EVERY judgment to pass: a cached green
+            # only ever comes from a unanimous vote, so a split can never verify
+            # a control (soundness). A unanimous fail is a confident fail; both
+            # decisive outcomes carry the evidence hash and are cached. All
+            # judgments discarding is the boundary case the single evaluation
+            # discarded. Anything else is a SPLIT: reported not verified and
+            # deliberately NOT cached (no evidence hash), so it is re-judged next
+            # run rather than freezing a borderline verdict — a confident
+            # assertion converges to a cached pass over a run or two; a genuinely
+            # borderline one never caches green.
+            if npass == n:
+                return {"status": "pass", "details": last_pass, "reasoning": last_pass,
+                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash}
+            if nfail == n:
+                return {"status": "fail", "details": last_fail, "reasoning": last_fail,
+                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash}
+            if ndiscard == n:
                 return {
                     "status": "skipped",
                     "details": (
-                        "Tier-2 verdict discarded: it declined on NOT_FOUND "
-                        "while the structural check confirms the target is "
-                        "present. Existence is settled structurally; tier-2 "
-                        "may only judge quality. The quality question is "
-                        f"unanswered. Structural check: {structural_verdict.details}. "
-                        f"Judge's reasoning: {(reasoning or '').strip()[:1500]}"
+                        "Tier-2 verdict discarded: every judgment declined on "
+                        "NOT_FOUND while the structural check confirms the target "
+                        "is present. Existence is settled structurally; tier-2 "
+                        "may only judge quality. The quality question is unanswered."
+                        + (f" Structural check: {structural_verdict.details}."
+                           if structural_verdict is not None else "")
+                        + (f" Judge's reasoning: {last_discard.strip()[:1500]}"
+                           if last_discard else "")
                     ),
-                    "reasoning": reasoning,
+                    "reasoning": last_discard,
                     "reviewer": reviewer,
                 }
             return {
-                "status": "pass" if passed else "fail",
-                "details": reasoning,
-                "reasoning": reasoning,
+                "status": "fail",
+                "details": (
+                    f"REASON: BORDERLINE - {n} judgments did not unanimously affirm "
+                    f"this evidence ({npass} pass / {nfail} fail"
+                    + (f" / {ndiscard} inconclusive" if ndiscard else "")
+                    + "). The semantic check could not confidently affirm it, so it "
+                    "is recorded as not verified and re-judged on the next run "
+                    "rather than caching a borderline verdict."
+                    + (f" Last reasoning: {(last_fail or last_pass).strip()[:800]}"
+                       if (last_fail or last_pass) else "")
+                ),
+                "reasoning": last_fail or last_pass,
                 "reviewer": reviewer,
             }
         except ImportError as e:
@@ -1572,6 +1640,39 @@ def _auto_detect_repo(project_root: Path) -> str:
     return ""
 
 
+_TIER2_HASH_SCHEMA = "t2v1"
+
+
+def _tier2_evidence_hash(a_type, a_params, source_code, subject_kind, provider_name, model):
+    """A stable hash of exactly what the tier-2 judge is shown, so a verdict can
+    be keyed by its evidence and reused when the evidence is unchanged. Hashes
+    the semantic inputs — assertion type, canonical params, the assembled
+    SOURCE_CODE, subject kind — plus the template bytes for this type (a
+    template edit re-opens the verdict), the provider and model (a judge change
+    re-opens it), and a schema version. NOT the rendered prompt, which carries a
+    fresh per-call boundary token and so is never equal twice."""
+    import hashlib
+    tmpl = ""
+    try:
+        tp = Path(__file__).resolve().parent / "templates" / f"tier2_{a_type}.j2"
+        if tp.is_file():
+            tmpl = tp.read_text(encoding="utf-8")
+    except OSError:
+        tmpl = ""
+    payload = {
+        "schema": _TIER2_HASH_SCHEMA,
+        "type": a_type,
+        "params": a_params if isinstance(a_params, dict) else {},
+        "source": source_code or "",
+        "subject_kind": subject_kind,
+        "template": tmpl,
+        "provider": provider_name or "",
+        "model": model or "",
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
     """One submitted result. ``provenance`` rides along only when a verifier
     set it (signed-evidence types), as data rather than inside ``details``,
@@ -1589,6 +1690,8 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
         row["provenance"] = result["provenance"]
     if result.get("evidence_hash"):
         row["evidence_hash"] = result["evidence_hash"]
+    if result.get("tier2_evidence_hash"):
+        row["tier2_evidence_hash"] = result["tier2_evidence_hash"]
     for fact in ("reached", "depends"):
         if result.get(fact) is not None:
             row[fact] = result[fact]

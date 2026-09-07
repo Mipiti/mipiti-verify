@@ -1084,6 +1084,7 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
                     "--changed-files; use this for tests that live outside the conventional "
                     "layouts, e.g. '^specs/'."))
 @click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
+@click.option("--tier2-consistency-n", default=None, type=int, help="Tier-2 self-consistency: number of judgments per fresh evidence; a PASS requires all N to agree (default 3, or MIPITI_TIER2_CONSISTENCY_N).")
 @click.option("--component", "component_id", default=None, help="Component ID to scope verification (only verify assertions for controls in this component). Auto-detect from git remote if not specified.")
 @click.option(
     "--component-path/--no-component-path",
@@ -1123,6 +1124,7 @@ def run(
     changed_files_path: str | None,
     test_file_pattern: str | None,
     concurrency: int,
+    tier2_consistency_n: int | None,
     component_id: str | None,
     auto_component_path: bool,
 ) -> None:
@@ -1207,6 +1209,7 @@ def run(
             changed_files=changed_files,
             test_file_pattern=test_file_pattern,
             concurrency=concurrency,
+            tier2_consistency_n=tier2_consistency_n,
             component_id=component_id,
             auto_component_path=auto_component_path,
         )

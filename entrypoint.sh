@@ -155,6 +155,10 @@ if [ -n "$INPUT_TIER2_MODEL" ]; then
   ARGS+=("--tier2-model" "$INPUT_TIER2_MODEL")
 fi
 
+if [ -n "$INPUT_TIER2_CONSISTENCY_N" ]; then
+  ARGS+=("--tier2-consistency-n" "$INPUT_TIER2_CONSISTENCY_N")
+fi
+
 # The provider key is handed only to the SDK of the provider selected:
 # each SDK reads its own variable, and the one for a provider that is
 # not in use has no reader in this process.
