@@ -37,7 +37,8 @@ class _CapturingProvider:
 
 def _verify(tmp_path, provider, a_type, name, filename="svc.py"):
     runner = Runner(client=MagicMock(), project_root=str(tmp_path),
-                    tier2_provider="anthropic", repo="acme/widgets")
+                    tier2_provider="anthropic", repo="acme/widgets",
+                    tier2_consistency_n=1)
     with patch("mipiti_verify.tier2.get_provider", return_value=provider):
         return runner._verify_tier2({
             "id": "asrt_x", "type": a_type,
@@ -234,7 +235,8 @@ class TestRunnerHandsReviewerTheDefinition:
         (tmp_path / "svc.py").write_text(PY_SRC, encoding="utf-8")
         p = _CapturingProvider()
         runner = Runner(client=MagicMock(), project_root=str(tmp_path),
-                        tier2_provider="anthropic", repo="acme/widgets")
+                        tier2_provider="anthropic", repo="acme/widgets",
+                        tier2_consistency_n=1)
         with patch("mipiti_verify.tier2.get_provider", return_value=p):
             runner._verify_tier2({
                 "id": "asrt_y", "type": "pattern_matches",
