@@ -32,6 +32,12 @@ Every template receives the same variable set:
   Always wrapped in `| untrusted` as a JSON-serialized blob.
 - `SOURCE_CODE` — text of the source-under-review excerpt. Always
   wrapped in `| untrusted`.
+  For a presence type whose structural check passed, the excerpt ends
+  with a `--- Facts (established by the mechanical tier) ---` block
+  restating where tier 1 found the target, so the judge is never asked
+  to locate it. `test_attested` builds its own sections (test
+  definition, mechanism definition or, for an imported symbol, its
+  reference sites, then a facts block).
 - `SUBJECT_KIND` — what `SOURCE_CODE` actually is: `repository_file`
   or `feature_description` (see the `SUBJECT_*` constants in
   `tier2.py`). NOT wrapped in `| untrusted` — the runner settles it
