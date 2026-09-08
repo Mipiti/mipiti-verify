@@ -632,6 +632,8 @@ These two are the only types whose pass is a statement about EVERY site in a sco
 
 `typed_boundary` — every guarded sink position receives a value whose static form is a construction of `boundary_type` through one of the declared `constructors`, and every construction site of that type in scope receives only literal or named-constant arguments, or is allowlisted.
 
+A verdict of either type reports, beside the pass or fail, how many sites of the declared sinks the run decided and how many of those stand on a reviewed exception rather than on a form it admitted. A claim about every site is worth exactly what the enumeration behind it is worth, so the run states the size of that enumeration as data a reader can act on rather than as a sentence a reader has to trust. Every run of these types states both, a refused one included: a run that decided nothing reports nothing decided, so a later run is never read against an earlier run's numbers. Neither is ever read from the assertion — a count of what a run examined is a fact only that run holds — and a check that enumerates no scope states neither.
+
 What makes the verdict worth something is what the check REFUSES:
 
 - A scope that matches nothing, a file it cannot read, a file whose extension names no language, a file the language's parser rejects, and a file in a language this install has no parser for are all failures. A pass never comes from an empty enumeration, and never from a search that saw a name without seeing what was handed to it. Reading a language other than Python needs the parsers: install `mipiti-verify[ast]` (the GitHub Action image already carries them). The refusal names the remedy.

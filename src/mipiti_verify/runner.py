@@ -44,6 +44,23 @@ _PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists"})
 # stated property could be violated in the code the inventory shows.
 _SCOPE_TYPES: frozenset[str] = SCOPE_TYPES
 
+# What a tier-1 result forwards beside its verdict, declared once and read
+# by both the verifier call and the row that is submitted, so a name on the
+# wire cannot be carried by one and dropped by the other.
+#
+# ``_RESULT_FACTS`` are the per-evidence facts a verifier establishes about
+# a run it was shown. ``_RESULT_COUNTS`` are the two numbers only a run that
+# ENUMERATED a scope holds: how many sites of the declared sinks it examined,
+# and how many of those stand on a reviewed exception rather than on a form
+# it admitted. A reader deciding whether a claim about every site rests on an
+# enumeration that actually happened needs those two as data; left inside the
+# prose of ``details`` they are not a fact anyone can act on. Neither is ever
+# read from an assertion's params: a count of what a run examined is a fact
+# only that run holds, so a number a submitter supplied would be a claim
+# about a run, dressed as its result.
+_RESULT_FACTS: tuple[str, ...] = ("reached", "depends", "mechanism_found")
+_RESULT_COUNTS: tuple[str, ...] = ("sites", "allowlisted")
+
 # Tier-2 source-loading: types whose tier-2 criterion may legitimately
 # be evaluated with empty SOURCE_CODE. The conservative default is the
 # empty set — every type requires source-code evidence and the pre-LLM
@@ -1135,10 +1152,18 @@ class Runner:
                 out["provenance"] = result.provenance
             if getattr(result, "evidence_hash", ""):
                 out["evidence_hash"] = result.evidence_hash
-            for fact in ("reached", "depends", "mechanism_found"):
+            for fact in _RESULT_FACTS:
                 value = getattr(result, fact, None)
                 if value is not None:
                     out[fact] = bool(value)
+            # The counts come from the engine's own report of the run and
+            # from nowhere else: a verifier that enumerated nothing states
+            # none, and no other verifier states them at all.
+            established = getattr(result, "facts", None) or {}
+            for count in _RESULT_COUNTS:
+                value = established.get(count)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    out[count] = value
             return out
         except Exception as e:
             return {"status": "fail", "details": f"Verifier error: {e}"}
@@ -1755,7 +1780,11 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
     """One submitted result. ``provenance`` rides along only when a verifier
     set it (signed-evidence types), as data rather than inside ``details``,
     so the platform's audit envelope and sufficiency inputs can carry the
-    signing class without parsing prose."""
+    signing class without parsing prose. The two enumeration counts ride
+    along the same way, and for the same reason: a claim about every site in
+    a scope is worth a reader's trust only if some run says how many sites
+    it decided, and a number stated in prose is not something a reader can
+    act on."""
     row = {
         "assertion_id": a_id,
         "tier": tier,
@@ -1770,7 +1799,7 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
         row["evidence_hash"] = result["evidence_hash"]
     if result.get("tier2_evidence_hash"):
         row["tier2_evidence_hash"] = result["tier2_evidence_hash"]
-    for fact in ("reached", "depends", "mechanism_found"):
+    for fact in (*_RESULT_FACTS, *_RESULT_COUNTS):
         if result.get(fact) is not None:
             row[fact] = result[fact]
     return row

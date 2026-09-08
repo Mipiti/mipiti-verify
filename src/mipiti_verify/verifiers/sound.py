@@ -315,6 +315,21 @@ class EngineReport:
     spec: Optional[EngineSpec] = None
 
 
+def baseline_facts() -> dict:
+    """The counts a run holds before it has examined anything.
+
+    Every report carries them, a refusal included. The counts are how a
+    reader tells an enumeration that happened from one that did not, and a
+    run that examined nothing has to say so: staying silent about a scope it
+    never read would leave whatever an earlier run reported standing in for
+    a run that established nothing.
+    """
+    return {"files": 0, "sites": 0, "safe_by_form": {}, "allowlisted": 0,
+            "violations": 0, "unclassifiable": 0, "stale_allowlist": 0,
+            "wrappers_discovered": 0, "parser_by_file": {}, "assumptions": {},
+            "escapes": 0, "constructions": 0}
+
+
 # ---------------------------------------------------------------------------
 # Params
 # ---------------------------------------------------------------------------
@@ -1272,9 +1287,7 @@ class SinkEngine:
     def run(self) -> EngineReport:
         spec = self.spec
         files, problem = self._scope()
-        facts: dict = {"files": 0, "sites": 0, "safe_by_form": {}, "allowlisted": 0, "violations": 0,
-                       "unclassifiable": 0, "stale_allowlist": 0, "wrappers_discovered": 0,
-                       "parser_by_file": {}, "assumptions": {}, "escapes": 0, "constructions": 0}
+        facts: dict = baseline_facts()
         if problem:
             return EngineReport(False, _within_details_bound(f"{spec.mode} FAIL: {problem}"),
                                 facts, "", [], [problem], spec)
@@ -1759,7 +1772,11 @@ def run_engine(params: dict, project_root: Path, mode: str) -> EngineReport:
     """
     spec, problem = _engine_params(params, mode)
     if spec is None:
-        return EngineReport(False, _within_details_bound(f"{mode} FAIL: {problem}"), {}, "", [], [problem], None)
+        # A declaration this reader could not make sense of is a run that
+        # examined nothing, and it reports that as the counts it holds --
+        # zero sites, zero exceptions -- rather than as silence.
+        return EngineReport(False, _within_details_bound(f"{mode} FAIL: {problem}"),
+                            baseline_facts(), "", [], [problem], None)
     return SinkEngine(project_root, spec).run()
 
 

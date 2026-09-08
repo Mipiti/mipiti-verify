@@ -826,3 +826,117 @@ class TestMechanismFound:
 
         row = _result_row("a1", "function_exists", 1, {"status": "pass", "details": "d"})
         assert "mechanism_found" not in row
+
+
+# ---------------------------------------------------------------------------
+# I. The enumeration counts travel on the submitted row
+# ---------------------------------------------------------------------------
+
+# Every name a consumer can read off the tier-1 submission of a sound
+# witness. A count that reaches no further than the details string, or than
+# the structured facts a submission does not carry, is a count no reader can
+# act on: a consumer deciding whether a claim about EVERY site rests on an
+# enumeration that happened would have nothing to read but prose, and prose
+# is not a fact. This set is that contract, held here so a name can never be
+# required at the far end without a run stating it.
+ROW_NAMES_FOR_A_SOUND_WITNESS = {
+    "assertion_id", "tier", "result", "details", "reasoning", "reviewer",
+    "evidence_hash", "sites", "allowlisted",
+}
+
+
+def _sound_row(project: Path, params: dict, a_type: str = "sink_default_deny") -> dict:
+    """The row a run over ``project`` actually submits."""
+    from mipiti_verify.runner import Runner, _result_row
+
+    runner = Runner(client=MagicMock(), project_root=str(project), repo="acme/widgets")
+    out = runner._verify_tier1({"id": "a1", "type": a_type, "params": params})
+    return _result_row("a1", a_type, 1, out)
+
+
+class TestEnumerationCountsOnTheRow:
+    def test_the_row_carries_every_name_a_consumer_reads_and_no_other(self, project):
+        row = _sound_row(project, _params())
+        assert set(row) == ROW_NAMES_FOR_A_SOUND_WITNESS
+        assert row["result"] == "pass"
+        assert row["sites"] == 1
+        assert row["allowlisted"] == 0
+
+    def test_the_counts_on_the_row_are_the_ones_the_run_established(self, project):
+        from mipiti_verify.verifiers.sound import run_engine
+
+        report = run_engine(_params(), project, "sink_default_deny")
+        row = _sound_row(project, _params())
+        assert (row["sites"], row["allowlisted"]) == (
+            report.facts["sites"], report.facts["allowlisted"])
+
+    def test_a_run_that_refused_still_reports_what_it_examined(self, project):
+        """A later run that says nothing about the counts must not be read
+        against an earlier run's numbers, so every run of these types states
+        its own -- the ones it refused on included."""
+        _write(project, "src/db.py",
+               "def go(conn, name):\n    conn.execute(name)\n")
+        row = _sound_row(project, _params())
+        assert row["result"] == "fail"
+        assert row["sites"] == 1 and row["allowlisted"] == 0
+
+    def test_a_run_that_examined_nothing_says_zero_rather_than_nothing(self, project):
+        row = _sound_row(project, _params(sinks=[]))
+        assert row["result"] == "fail"
+        assert row["sites"] == 0 and row["allowlisted"] == 0
+
+    def test_an_allowlisted_site_is_counted_apart_from_the_sites(self, project):
+        _write(project, "src/db.py",
+               "def go(conn, name):\n    conn.execute(name)\n\n\n"
+               f"def fixed(conn):\n    conn.execute({SAFE_SQL!r})\n")
+        entry = {"file": "src/db.py", "site": "2", "callee": "execute",
+                 "reason": "the caller passes a value from a closed enum",
+                 "reviewed_by": "a.reviewer"}
+        row = _sound_row(project, _params(allowlist=[entry]))
+        assert row["result"] == "pass"
+        assert row["sites"] == 2 and row["allowlisted"] == 1
+
+    def test_a_verifier_that_enumerated_nothing_states_no_count(self, project):
+        _write(project, "src/app.py", "def handler():\n    return 1\n")
+        row = _sound_row(project, {"file": "src/app.py", "name": "handler"},
+                         a_type="function_exists")
+        assert row["result"] == "pass"
+        assert "sites" not in row and "allowlisted" not in row
+
+    def test_a_count_supplied_with_the_assertion_is_not_a_count_the_run_made(self, project):
+        """The number is a fact about a run, so only the run states it: a
+        value carried in with the declaration is ignored, whichever way it
+        would move the verdict at the far end."""
+        row = _sound_row(project, _params(sites=4096, allowlisted=0))
+        assert row["sites"] == 1
+        row = _sound_row(project, _params(sinks=[], sites=4096, allowlisted=0))
+        assert row["sites"] == 0
+
+    def test_only_a_scope_enumeration_can_state_a_count(self):
+        """The counts are read off a result's established facts, so what
+        holds ``never invented`` is not that nothing else sets them today
+        but that every result the package builds is accounted for. This
+        walks each construction of a result and each write into an
+        established fact, and names the one module a count can enter
+        through. It reads constructions written literally, which is how
+        every verifier in the package builds its result."""
+        import ast
+
+        import mipiti_verify
+
+        root = Path(mipiti_verify.__file__).parent
+        writers: set = set()
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            rel = path.relative_to(root).as_posix()
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call)
+                        and getattr(node.func, "id", "") == "VerifierResult"
+                        and any(k.arg == "facts" for k in node.keywords)):
+                    writers.add(rel)
+                if (isinstance(node, ast.Subscript)
+                        and isinstance(node.value, ast.Attribute)
+                        and node.value.attr == "facts"
+                        and isinstance(getattr(node, "ctx", None), ast.Store)):
+                    writers.add(rel)
+        assert writers == {"verifiers/sound.py"}

@@ -49,8 +49,17 @@ class VerifierResult:
     mechanism_found: bool | None = None
     # Counted facts a verifier established beside the verdict (the sink
     # engine's per-form, per-file and per-assumption counts). What the
-    # details state in prose, as data a reader can index; the submitted
-    # result row carries the details, never this.
+    # details state in prose, as data a reader can index.
+    #
+    # Two of them travel further than the rest. How many sites of the
+    # declared sinks a run examined, and how many of those stand on a
+    # reviewed exception, are what separate a claim about every site in a
+    # scope from a claim about a scope nothing was found in, so they are
+    # forwarded as fields of the submitted result row rather than being
+    # left for a reader to parse out of ``details``. Only a run that
+    # enumerated a scope states them; every other verifier leaves them
+    # absent, and absent is not zero -- it is a question this run did not
+    # answer.
     facts: dict = field(default_factory=dict)
 
 

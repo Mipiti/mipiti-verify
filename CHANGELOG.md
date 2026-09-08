@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope is read and parsed once for both the verdict and the inventory the
   semantic tier is shown.
 
+  Two of those counts travel further than the details. How many sites of the
+  declared sinks a run decided, and how many of those stand on a reviewed
+  exception rather than on a form it admitted, are reported as data on the
+  submitted result of every tier-1 run of these two types. A claim about every
+  site in a scope is worth what its enumeration is worth, so a reader deciding
+  whether to rely on one is handed the size of it rather than a sentence to
+  take on trust. A refused run states them too -- a run that examined nothing
+  reports nothing examined, so an earlier run's numbers can never stand in for
+  a later run that established none -- and neither number is ever read from
+  the assertion, since a count of what a run examined is a fact only that run
+  holds. Every other type states neither: absent is not zero, it is a question
+  that run did not answer.
+
 - `attest-construction` and `attest-allowlist-review`: two signed statements
   for the facts a repository cannot settle on its own. The first compiles
   probes that build a boundary type from something that is not a literal and
