@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Two assertion types whose pass is a statement about EVERY site in a declared
+  scope rather than about one place. `sink_default_deny`: over every source
+  file in `scope`, every site of a declared sink receives, at each guarded
+  position, only a form the declared `safe_forms` vocabulary accepts, or is an
+  allowlisted site with a reviewed reason. `typed_boundary`: every guarded sink
+  position receives a value built through a declared constructor of
+  `boundary_type`, and every construction site of that type takes only literal
+  or named-constant arguments. A sink is a call, a constructor, a macro
+  invocation, a store to a named target or a module instantiation, so a
+  hardware description is read by the same rules as a software source
+  (Verilog, SystemVerilog and VHDL alongside Python, JavaScript, TypeScript,
+  Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP and Swift).
+
+  What makes the verdict worth something is what the check refuses. A scope
+  that matches nothing, a file it cannot read, a file whose extension names no
+  language, and a file the parser rejects each fail the run: a pass never
+  comes from an empty enumeration. Every site it could not classify counts as
+  a violation, as does reflection, dynamic evaluation, a macro body naming a
+  sink, a shell invocation built from a variable, and a sink handed on as a
+  value. Import and assignment aliases, and in-scope wrappers that forward a
+  parameter into a guarded position, are sinks themselves, closed to a
+  fixpoint. An allowlist entry must name a file, a site, a callee, a reason and
+  a reviewer and must match a site the check actually flagged; a stale entry
+  fails the run, and the allowlist content sits inside the evidence hash, so
+  editing it reopens review. The one residual -- a sink reached under a name
+  in neither `sinks` nor `wrappers` -- is stated in the result and is what the
+  semantic tier reviews, over the inventory the mechanical tier built rather
+  than by re-scanning.
+
+- `attest-construction` and `attest-allowlist-review`: two signed statements
+  for the facts a repository cannot settle on its own. The first compiles
+  probes that build a boundary type from something that is not a literal and
+  records the ones the toolchain refused (a probe that compiles writes
+  nothing and exits non-zero; probes are compiled, never run). The second
+  records the reviewed exceptions and who stands behind them at this commit.
+  Neither changes a verdict; each replaces "on the author's word" with "in a
+  signed statement" in the facts a reader sees. Both kinds are declared in
+  `schemas/test-result-v1.schema.json`, and neither evidences that a test ran.
+
+- Every assertion type now declares the CLASS of fact its verdict reports --
+  `presence`, `under_approximating_scan`, `existential_witness`,
+  `sound_over_approximation` or `by_construction` -- at the one place the type
+  is registered, so no reader infers strength from a type's name, its
+  parameters or a file path. A test file existing, and a symbol inside one,
+  are `presence`: they prove something exists, never that it ran. The
+  vocabulary and the per-type class are held equal to the assertion-type
+  catalogue by `formal/check_types.py` (T5, T7), and `formal/check_sound.py`
+  proves over a grammar of programs that the sound engine's flagged set
+  contains every unsafe site, self-validating that each of its enumeration
+  features is load-bearing.
+
+- A `mechanism_found` fact on a `test_attested` result, and in the facts block
+  the semantic tier is shown: whether the named mechanism resolves to a
+  definition in the checkout. A mechanism that cannot be located leaves every
+  claim about it unresolvable, which now reads as a stated fact rather than as
+  two unexplained unknowns.
+
 - Tier-2 self-consistency and evidence-keyed verdict reuse, so a nondeterministic judge cannot flicker a control's verified status between runs. Each fresh evidence is judged N times (N=3 default; `--tier2-consistency-n` / `tier2-consistency-n` input / `MIPITI_TIER2_CONSISTENCY_N`) and the spread decides: a PASS requires every judgment to agree, a unanimous fail is a confident fail, an all-inconclusive vote is skipped, and anything else is a split — reported not verified and deliberately not cached, so a borderline verdict is never frozen into a lucky green. Each verdict is keyed by a hash of exactly what the judge is shown (assertion type, params, assembled source, subject kind, the per-type template bytes, provider and model); when the platform returns a stored verdict for an unchanged hash the runner reuses it with no judge call. A confident assertion converges to a cached pass over a run or two; a genuinely borderline one never caches green.
 
 ### Fixed
