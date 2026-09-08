@@ -26,11 +26,16 @@ nobody can invoke. These properties pin the four together:
       registry, and it is one of the declared vocabulary
   T7  the class the registry states for a type is the class the catalogue
       declares for it
+  T8  the sink vocabulary is one vocabulary: the safe forms a value may
+      take at a guarded position and the kinds of site a sink may be
+      declared as are the same names in the catalogue and in the verifier,
+      the params the catalogue publishes offer exactly those names, and the
+      verifier's own reader accepts each of them and refuses a name outside
 
-T1, T2 and T7 need the catalogue (``mipiti_mcp.assertion_types``); when it
-is not installed those are reported as not established and the exit status
-still reflects only what was checked. T3-T5 need nothing beyond this
-package.
+T1, T2, T6, T7 and T8 need the catalogue (``mipiti_mcp.assertion_types``);
+when it is not installed, or predates a vocabulary, those are reported as
+not established and the exit status still reflects only what was checked.
+T3-T5 need nothing beyond this package.
 
 Usage:
     python formal/check_types.py
@@ -517,6 +522,84 @@ def check_t6(catalogue) -> Tuple[int, List[str]]:
     return count, violations
 
 
+def check_t8(catalogue) -> Tuple[int, List[str]]:
+    """T8: one sink vocabulary, and a reader that holds to it.
+
+    A safe form and a sink kind are declared twice: in the catalogue, which
+    decides what a caller may submit, and in the verifier, which decides
+    what tier 1 does with it. A name in one and not the other is a
+    submission accepted at the door and refused at the check, or a form the
+    engine admits that no caller can ask for. Both directions are held
+    equal here as sets, the published params are checked to offer exactly
+    those names, and each name is put through the engine's own params
+    reader so the agreement is over what the code does, not over two
+    tuples that happen to match.
+    """
+    from mipiti_verify.languages import calls as C
+    from mipiti_verify.verifiers.sound import MODE_DEFAULT_DENY, _engine_params
+
+    violations: List[str] = []
+    count = 0
+    for label, ours, theirs in (
+        ("safe form", set(C.SAFE_FORMS), set(catalogue.SAFE_FORMS)),
+        ("sink kind", set(C.SINK_KINDS), set(catalogue.SINK_KINDS)),
+    ):
+        count += 1
+        if ours != theirs:
+            violations.append(
+                f"T8 {label} vocabulary differs: verifier-only={sorted(ours - theirs)} "
+                f"catalogue-only={sorted(theirs - ours)}")
+
+    def _params(**over) -> dict:
+        params = {"scope": ["src"], "sinks": [{"callee": "execute"}],
+                  "safe_forms": list(C.SAFE_FORMS), "property": "A stated property."}
+        params.update(over)
+        return params
+
+    for form in catalogue.SAFE_FORMS:
+        count += 1
+        spec, problem = _engine_params(_params(safe_forms=[form]), MODE_DEFAULT_DENY)
+        if spec is None or spec.safe_forms != (form,):
+            violations.append(f"T8 the verifier's params reader refuses safe form {form!r} ({problem})")
+    count += 1
+    spec, _problem = _engine_params(_params(safe_forms=["anything_goes"]), MODE_DEFAULT_DENY)
+    if spec is not None:
+        violations.append("T8 the verifier's params reader accepts a safe form outside the vocabulary")
+
+    for kind in catalogue.SINK_KINDS:
+        count += 1
+        spec, problem = _engine_params(
+            _params(sinks=[{"callee": "execute", "kind": kind}]), MODE_DEFAULT_DENY)
+        if spec is None or spec.sinks[0].kind != kind:
+            violations.append(f"T8 the verifier's params reader refuses sink kind {kind!r} ({problem})")
+    count += 1
+    spec, _problem = _engine_params(
+        _params(sinks=[{"callee": "execute", "kind": "invented"}]), MODE_DEFAULT_DENY)
+    if spec is not None:
+        violations.append("T8 the verifier's params reader accepts a sink kind outside the vocabulary")
+
+    # What a caller is offered: the published param schema names the same
+    # vocabulary, so a form cannot be added to one side alone and reach a
+    # submission through the other.
+    by_name = {t.name: t for t in catalogue.ASSERTION_TYPES}
+    spec_type = by_name.get("sink_default_deny")
+    if spec_type is not None:
+        count += 1
+        param = next((p for p in spec_type.params if p.name == "safe_forms"), None)
+        if param is None or tuple(getattr(param, "enum", ()) or ()) != tuple(catalogue.SAFE_FORMS):
+            violations.append("T8 the published 'safe_forms' param does not offer the safe-form vocabulary")
+    for name in ("sink_default_deny", "typed_boundary"):
+        spec_type = by_name.get(name)
+        if spec_type is None:
+            continue
+        count += 1
+        param = next((p for p in spec_type.params if p.name == "sinks"), None)
+        kinds = dict(getattr(param, "key_enums", ()) or ()).get("kind", ()) if param else ()
+        if tuple(kinds) != tuple(catalogue.SINK_KINDS):
+            violations.append(f"T8 the published 'sinks' param of {name!r} does not offer the sink kinds")
+    return count, violations
+
+
 def _report(label: str, count: int, violations: List[str]) -> bool:
     print(f"{label} ({count} checks): ", end="")
     if violations:
@@ -543,7 +626,8 @@ def main() -> int:
         print("T2 param spec agreement:    NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
         print("T6 mechanism-kind vocabulary: NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
         print("T7 soundness class:           NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
-        not_established += ["T1", "T2", "T6", "T7"]
+        print("T8 sink vocabulary:           NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
+        not_established += ["T1", "T2", "T6", "T7", "T8"]
     else:
         print(f"\nCatalogue: {len(catalogue.ASSERTION_TYPES)} types; registry: {len(VERIFIER_REGISTRY)} verifiers")
         c, v = check_t1(catalogue)
@@ -566,6 +650,13 @@ def main() -> int:
         else:
             print("T7 soundness class:           NOT ESTABLISHED (catalogue predates SOUNDNESS_CLASSES)")
             not_established.append("T7")
+        if getattr(catalogue, "SAFE_FORMS", None) and getattr(catalogue, "SINK_KINDS", None):
+            c, v = check_t8(catalogue)
+            all_pass &= _report("T8 sink vocabulary registry == catalogue", c, v)
+            established.append("T8")
+        else:
+            print("T8 sink vocabulary:           NOT ESTABLISHED (catalogue predates SAFE_FORMS)")
+            not_established.append("T8")
 
     c, v = check_t3()
     all_pass &= _report("T3 templates", c, v)
