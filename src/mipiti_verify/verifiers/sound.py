@@ -56,11 +56,15 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import re
 from collections import OrderedDict
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Optional
+
+# Patterns are built here and matched through the package's RE2 helper: the
+# linear-time engine, never Python's backtracking one, so a name taken from
+# a source file cannot cost the run more than the text it scans.
+import re2
 
 from . import (
     SOUNDNESS_BY_CONSTRUCTION,
@@ -69,6 +73,7 @@ from . import (
     VerifierResult,
     register,
     resolve_scope_files,
+    safe_regex_search,
 )
 from ..languages import calls as C
 from ..languages.definitions import hash_of, language_of
@@ -936,7 +941,7 @@ class _TreeSitterBackend:
                 body = C.field(node, "value")
                 body_text = C.text(body) if body is not None else ""
                 for leaf in sorted(leaves):
-                    if re.search(rf"\b{re.escape(leaf)}\b", body_text):
+                    if safe_regex_search(rf"\b{re2.escape(leaf)}\b", body_text):
                         report.escapes.append(SiteRecord(
                             self.rel, C.line_of(node), "escape", leaf, C.text(name).strip() if name else "",
                             category="escape", note=f"macro body names sink '{leaf}'",

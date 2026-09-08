@@ -528,6 +528,22 @@ class TestAdmittedForms:
         assert declared.passed, declared.details
 
 
+class TestMetaprogramming:
+    def test_a_macro_body_naming_a_sink_is_an_escape(self, project):
+        """A macro body is text the grammar hands over whole, so the sink
+        inside it is found by matching the declared name in that text --
+        through the linear-time engine, like every other pattern this
+        package runs -- and the definition is flagged as an escape."""
+        _write(project, "src/a.c",
+               "#define RUN(x) query(x)\n\nvoid go(const char *name) {\n  RUN(name);\n}\n")
+        result = get_verifier("sink_default_deny").verify(
+            _params(scope=["src/a.c"], sinks=[{"callee": "query"}], safe_forms=["literal"]),
+            project)
+        assert not result.passed, result.details
+        assert result.facts["escapes"] == 1
+        assert "macro body names sink 'query'" in result.details
+
+
 # ---------------------------------------------------------------------------
 # E3. An exception excepts a site; it never stands in for the check
 # ---------------------------------------------------------------------------
