@@ -317,6 +317,16 @@ class Verifier(Protocol):
 # Registry populated by submodule imports
 VERIFIER_REGISTRY: dict[str, Verifier] = {}
 
+# Whether every verifier module has been imported. The registry being
+# non-empty does NOT answer that question: importing any single verifier
+# module -- directly, or as a side effect of a module-level import
+# elsewhere in the package -- registers its own types and leaves the rest
+# absent. A lookup that used emptiness as the signal would then report
+# "no verifier" for every type whose module had not happened to load, and
+# a run would submit a skipped result for evidence that verifies fine.
+# The completion of the import pass is its own fact, recorded here.
+_ALL_LOADED = False
+
 # What a type's evidence IS, stated once per registered type as the FACT the
 # verdict reports, never inferred from the type's name, a param or a path.
 #
@@ -427,8 +437,7 @@ EVIDENCE_CLASS: dict[str, str] = {}
 
 def evidence_class(assertion_type: str) -> str:
     """The evidence class of a registered type, or ``""`` when unregistered."""
-    if not VERIFIER_REGISTRY:
-        _load_all()
+    _load_all()
     return EVIDENCE_CLASS.get(assertion_type, "")
 
 
@@ -456,12 +465,20 @@ def register(assertion_type: str, *, soundness: str):
 
 def get_verifier(assertion_type: str) -> Verifier | None:
     """Look up a verifier by assertion type string."""
-    # Lazy import all verifier modules to populate registry
-    if not VERIFIER_REGISTRY:
-        _load_all()
+    _load_all()
     return VERIFIER_REGISTRY.get(assertion_type)
 
 
 def _load_all() -> None:
-    """Import all verifier modules to trigger registration."""
+    """Import every verifier module, so the registry holds every type.
+
+    Idempotent and unconditional: it runs once per process and is a no-op
+    after that. It is called on every lookup rather than only when the
+    registry looks empty, so a partially populated registry cannot be
+    mistaken for a complete one.
+    """
+    global _ALL_LOADED
+    if _ALL_LOADED:
+        return
     from . import file_based, code_structure, config, dependencies, tests, semantic, rtl, sound  # noqa: F401
+    _ALL_LOADED = True
