@@ -426,6 +426,159 @@ class TestUnreadableSites:
             project)
         assert not result.passed and "matches no flagged site" in result.details
 
+    def test_a_malformed_exception_list_refusal_stays_inside_the_field_bound(self, project):
+        """The reasons a refusal gives follow the submission, not the scope.
+        One malformed entry per exception would otherwise write a refusal
+        longer than the field it is submitted in, and one oversized row
+        rejects every result in the batch with it."""
+        result = get_verifier("sink_default_deny").verify(
+            _params(allowlist=[{"file": "", "site": "0", "callee": ""} for _ in range(400)]),
+            project)
+        assert not result.passed
+        assert len(result.details) <= 5000, len(result.details)
+        assert "must name file, site" in result.details
+        assert "further reason(s) not listed" in result.details
+
+
+# ---------------------------------------------------------------------------
+# E2. A form is admitted by what the value is, never by where it sits
+# ---------------------------------------------------------------------------
+
+class TestAdmittedForms:
+    """``parameter_binding`` names a data structure written at the site. A
+    structure carries its elements into the callee, so what decides is what
+    it was written with -- and never that a neighbouring argument looks like
+    a statement, which says nothing about what the callee runs.
+    """
+
+    def _run(self, root: Path, **over):
+        return get_verifier("sink_default_deny").verify(
+            _params(scope=["src"], sinks=[{"callee": "execv"}],
+                    safe_forms=["literal", "named_constant", "parameter_binding"],
+                    property="No command is built from data.", **over), root)
+
+    def test_a_structure_holding_a_built_statement_is_a_violation(self, project):
+        _write(project, "src/run.py",
+               "import os\n\n\ndef go(user):\n"
+               "    os.execv(\"/bin/sh\", [\"sh\", \"-c\", \"rm -rf \" + user])\n")
+        result = self._run(project)
+        assert not result.passed, result.details
+        assert result.facts["violations"] == 1
+        assert "src/run.py:5" in result.details
+        assert "concatenation with an unsafe operand" in result.details
+
+    def test_a_structure_holding_a_runtime_value_is_a_violation(self, project):
+        _write(project, "src/run.py",
+               "import os\n\n\ndef go(user):\n"
+               "    os.execv(\"/bin/sh\", [\"sh\", \"-c\", user])\n")
+        result = self._run(project)
+        assert not result.passed, result.details
+        assert "identifier 'user' is not a named constant" in result.details
+
+    def test_a_structure_inside_a_structure_is_not_read_through(self, project):
+        _write(project, "src/run.py",
+               "import os\n\n\ndef go(user):\n"
+               "    os.execv(\"/bin/sh\", [\"sh\", [\"-c\", user]])\n")
+        result = self._run(project)
+        assert not result.passed, result.details
+
+    def test_a_structure_whose_elements_are_all_admitted_is_bound_data(self, project):
+        _write(project, "src/run.py",
+               "import os\n\nSHELL = \"/bin/sh\"\nSCRIPT = \"/opt/run.sh\"\n\n\n"
+               "def go():\n    os.execv(SHELL, [SHELL, SCRIPT])\n")
+        result = self._run(project)
+        assert result.passed, result.details
+        assert result.facts["safe_by_form"].get("parameter_binding") == 1
+
+    def test_the_residual_is_stated_where_the_reviewer_reads_it(self, project):
+        """What the engine does NOT read -- what a callee does with a value
+        it accepts -- travels with the verdict, in the facts and in the
+        block the semantic tier is shown, rather than only in prose
+        somewhere else."""
+        from mipiti_verify.verifiers.sound import render_facts, run_engine
+
+        _write(project, "src/run.py",
+               "import os\n\nSHELL = \"/bin/sh\"\n\n\ndef go():\n    os.execv(SHELL, [SHELL])\n")
+        report = run_engine(
+            _params(scope=["src"], sinks=[{"callee": "execv"}],
+                    safe_forms=["literal", "named_constant", "parameter_binding"],
+                    property="No command is built from data."),
+            project, "sink_default_deny")
+        residual = report.facts["assumptions"]["value_forms"]
+        assert "never from the position it sits in" in residual
+        assert "a property of the callee and is not read here" in residual
+        assert residual in report.details and residual in render_facts(report)
+        exceptions = report.facts["assumptions"]["review_exceptions"]
+        assert "0 site(s) stand on a reviewed exception" in exceptions
+
+    def test_the_refusal_names_the_declaration_that_states_the_shape(self, project):
+        """A sink that takes bound values in a later argument is declared by
+        naming the statement position, which leaves the data positions
+        unguarded -- a statement about the sink the submitter makes, rather
+        than one the engine infers from an argument's neighbours."""
+        _write(project, "src/db.py",
+               "def go(conn, uid):\n    conn.execute(\"SELECT ?\", (uid,))\n")
+        refused = get_verifier("sink_default_deny").verify(
+            _params(sinks=[{"callee": "execute"}],
+                    safe_forms=["literal", "parameter_binding"]), project)
+        assert not refused.passed, refused.details
+        assert "name the statement position in 'positions'" in refused.details
+        declared = get_verifier("sink_default_deny").verify(
+            _params(safe_forms=["literal"]), project)
+        assert declared.passed, declared.details
+
+
+# ---------------------------------------------------------------------------
+# E3. An exception excepts a site; it never stands in for the check
+# ---------------------------------------------------------------------------
+
+class TestReviewExceptions:
+    def _entry(self, line: int, **over) -> dict:
+        entry = {"file": "src/db.py", "site": str(line), "callee": "execute",
+                 "reason": "the caller passes a value from a closed enum",
+                 "reviewed_by": "a.reviewer"}
+        entry.update(over)
+        return entry
+
+    def test_a_run_whose_every_flagged_site_is_an_exception_establishes_nothing(self, project):
+        """Excepting every site the run flagged, with nothing admitted by
+        form anywhere in the scope, leaves the reviewer's word carrying the
+        whole witness -- the same vacuity as a scope the sinks never occur
+        in, and refused for the same reason."""
+        _write(project, "src/db.py",
+               "def one(conn, u):\n    conn.execute(\"SELECT \" + u)\n\n\n"
+               "def two(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        result = get_verifier("sink_default_deny").verify(
+            _params(allowlist=[self._entry(2), self._entry(6)]), project)
+        assert not result.passed, result.details
+        assert "establishes nothing over this scope" in result.details
+        assert result.facts["allowlisted"] == 2 and result.facts["safe_by_form"] == {}
+
+    def test_an_exception_beside_sites_admitted_by_form_still_passes(self, project):
+        _write(project, "src/db.py",
+               "def one(conn, u):\n    conn.execute(\"SELECT \" + u)\n\n\n"
+               f"def two(conn):\n    conn.execute({SAFE_SQL!r})\n")
+        result = get_verifier("sink_default_deny").verify(
+            _params(allowlist=[self._entry(2)]), project)
+        assert result.passed, result.details
+        assert result.facts["allowlisted"] == 1
+
+    def test_more_exceptions_than_sites_examined_is_refused(self, project):
+        _write(project, "src/db.py", "def one(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        result = get_verifier("sink_default_deny").verify(
+            _params(allowlist=[self._entry(2), self._entry(2, callee="conn.execute")]), project)
+        assert not result.passed, result.details
+        assert "cannot be longer than the sites in scope" in result.details
+
+    def test_an_exception_list_past_the_review_bound_is_refused(self, project):
+        from mipiti_verify.verifiers.sound import _MAX_ALLOWLIST_ENTRIES
+
+        result = get_verifier("sink_default_deny").verify(
+            _params(allowlist=[self._entry(2) for _ in range(_MAX_ALLOWLIST_ENTRIES + 1)]),
+            project)
+        assert not result.passed, result.details
+        assert "a reviewed exception list is bounded at" in result.details
+
 
 # ---------------------------------------------------------------------------
 # F. The runner hands tier 2 the inventory, not the files
@@ -607,7 +760,9 @@ class TestSignedResiduals:
 
         commit = "d" * 40
         monkeypatch.setenv("GITHUB_SHA", commit)
-        _write(project, "src/db.py", "def go(conn, name):\n    conn.execute(name)\n")
+        _write(project, "src/db.py",
+               "def go(conn, name):\n    conn.execute(name)\n\n\n"
+               f"def fixed(conn):\n    conn.execute({SAFE_SQL!r})\n")
         entry = {"file": "src/db.py", "site": "2", "callee": "execute",
                  "reason": "the caller passes a value from a closed enum",
                  "reviewed_by": "a.reviewer"}

@@ -19,10 +19,17 @@ construction -- and the checker asserts:
 
   S1  every ground-truth site is flagged                      (soundness)
   S2  the verdict is PASS exactly on the programs whose ground truth is
-      empty and whose scope the engine can read                (usefulness)
+      empty, whose scope the engine can read, and whose safety does not
+      rest on a fact the engine does not read                  (usefulness)
   S3  a refusal says which of the fixed refusal reasons it is  (no silent
       pass through an unreadable scope, a vacuous sink list, or a stale
       allowlist entry)
+  S4  a program that is safe only by a fact about the callee -- what it
+      does with a value it accepts -- is refused, and the report says
+      what to declare instead. These programs are named here so the
+      conservatism is a stated property: a build that starts passing one
+      of them has moved the decision from the value to the position, and
+      this checker fails.
 
 and then self-validates: each of the engine's four enumeration features
 (alias tracking, wrapper discovery, escape hatches, stores to a named
@@ -67,13 +74,16 @@ class Case:
     ``unsafe`` is the set of ``file:line`` sites that are unsafe by
     construction of the program -- written by the author of the fixture,
     never read back from the engine. ``expect`` is the verdict; ``refusal``
-    is a phrase a refusal must state. ``needs`` names the enumeration
-    features without which the ground truth cannot be reached, which is what
-    the self-validation pass uses.
+    is a phrase a refusal must state. ``over_approximated`` marks a program
+    that is safe by construction and is still not passed, and carries the
+    sentence the report must give the operator instead; S4 holds those
+    three facts together. ``needs`` names the enumeration features without
+    which the ground truth cannot be reached, which is what the
+    self-validation pass uses.
     """
 
     def __init__(self, label, files, params, *, mode=MODE_DEFAULT_DENY, unsafe=(),
-                 expect="fail", refusal="", needs=(), language=""):
+                 expect="fail", refusal="", over_approximated="", needs=(), language=""):
         self.label = label
         self.files = files
         self.params = params
@@ -81,6 +91,7 @@ class Case:
         self.unsafe = set(unsafe)
         self.expect = expect
         self.refusal = refusal
+        self.over_approximated = over_approximated
         self.needs = tuple(needs)
         self.language = language
 
@@ -135,12 +146,60 @@ def _cases() -> List[Case]:
             unsafe={"src/a.py:2"},
         ),
         Case(
-            "python: data bound beside a literal statement",
+            # Safe against a driver that binds its second argument, unsafe
+            # against a callee that runs an element of it. Which one this is
+            # is a fact about the callee, and the engine reads programs, not
+            # callees, so it refuses and says how to declare the shape.
+            "python: a runtime value inside a structure at a guarded position",
             {"src/a.py": "def go(conn, uid):\n    conn.execute(\"SELECT ?\", (uid,))\n"},
             {"scope": ["src/a.py"], "sinks": [_sink("execute")],
              "safe_forms": ["literal", "parameter_binding"],
              "property": "Data is bound, never interpolated."},
+            over_approximated="name the statement position in 'positions'",
+        ),
+        Case(
+            "python: the same sink with the statement position declared",
+            {"src/a.py": "def go(conn, uid):\n    conn.execute(\"SELECT ?\", (uid,))\n"},
+            {"scope": ["src/a.py"], "sinks": _PY_SINKS,
+             "safe_forms": ["literal"],
+             "property": "Every statement is a literal."},
             expect="pass",
+        ),
+        Case(
+            "python: a structure of constants at a guarded position",
+            {"src/a.py": "SHELL = \"/bin/sh\"\nFLAG = \"-c\"\n\n"
+                         "def go(runner):\n    runner.spawn([SHELL, FLAG])\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("spawn")],
+             "safe_forms": ["named_constant", "parameter_binding"],
+             "property": "Only fixed arguments are spawned."},
+            expect="pass",
+        ),
+        Case(
+            "python: an argument vector holding a statement built from a parameter",
+            {"src/a.py": "import os\n\n"
+                         "def go(user):\n    os.execv(\"/bin/sh\", [\"sh\", \"-c\", \"rm -rf \" + user])\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("execv")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "No command is built from data."},
+            unsafe={"src/a.py:4"},
+        ),
+        Case(
+            "python: an argument vector holding a bare parameter",
+            {"src/a.py": "import os\n\n"
+                         "def go(user):\n    os.execv(\"/bin/sh\", [\"sh\", \"-c\", user])\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("execv")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "No command is built from data."},
+            unsafe={"src/a.py:4"},
+        ),
+        Case(
+            "python: a structure nested inside a structure",
+            {"src/a.py": "import os\n\n"
+                         "def go(user):\n    os.execv(\"/bin/sh\", [\"sh\", [\"-c\", user]])\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("execv")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "No command is built from data."},
+            unsafe={"src/a.py:4"},
         ),
         Case(
             "python: a statement fragment beside a literal statement",
@@ -212,14 +271,35 @@ def _cases() -> List[Case]:
             unsafe={"src/a.py:3"}, needs=(FEATURE_ESCAPES,),
         ),
         Case(
-            "python: a reviewed exception",
-            {"src/a.py": "def go(conn, name):\n    conn.execute(name)\n"},
+            "python: a reviewed exception beside sites the run admits",
+            {"src/a.py": "def go(conn, name):\n    conn.execute(name)\n\n"
+                         "def fixed(conn):\n    conn.execute(\"SELECT 1\")\n"},
             {"scope": ["src/a.py"], "sinks": _PY_SINKS, "safe_forms": ["literal"],
              "property": "Every statement is a literal.",
              "allowlist": [{"file": "src/a.py", "site": "2", "callee": "execute",
                             "reason": "the caller passes a value from a closed enum",
                             "reviewed_by": "a.reviewer"}]},
             expect="pass",
+        ),
+        Case(
+            "python: every flagged site is a reviewed exception",
+            {"src/a.py": "def go(conn, name):\n    conn.execute(name)\n"},
+            {"scope": ["src/a.py"], "sinks": _PY_SINKS, "safe_forms": ["literal"],
+             "property": "Every statement is a literal.",
+             "allowlist": [{"file": "src/a.py", "site": "2", "callee": "execute",
+                            "reason": "the caller passes a value from a closed enum",
+                            "reviewed_by": "a.reviewer"}]},
+            refusal="establishes nothing over this scope",
+        ),
+        Case(
+            "python: more exceptions than sites examined",
+            {"src/a.py": "def go(conn, name):\n    conn.execute(name)\n"},
+            {"scope": ["src/a.py"], "sinks": _PY_SINKS, "safe_forms": ["literal"],
+             "property": "Every statement is a literal.",
+             "allowlist": [{"file": "src/a.py", "site": "2", "callee": callee,
+                            "reason": "reviewed once", "reviewed_by": "a.reviewer"}
+                           for callee in ("execute", "conn.execute")]},
+            refusal="cannot be longer than the sites in scope",
         ),
         Case(
             "python: an exception that matches no flagged site",
@@ -345,11 +425,29 @@ def _cases() -> List[Case]:
             expect="pass", language="javascript",
         ),
         Case(
-            "javascript: values bound in an array beside a literal statement",
+            "javascript: a runtime value inside an array at a guarded position",
             {"src/a.js": "function go(db, uid) {\n  db.query(\"SELECT ?\", [uid]);\n}\n"},
             {"scope": ["src/a.js"], "sinks": [_sink("query")],
              "safe_forms": ["literal", "parameter_binding"],
              "property": "Data is bound, never interpolated."},
+            over_approximated="name the statement position in 'positions'",
+            language="javascript",
+        ),
+        Case(
+            "javascript: an array holding a statement built from a parameter",
+            {"src/a.js": "function go(runner, user) {\n"
+                         "  runner.spawn([\"sh\", \"-c\", \"rm -rf \" + user]);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("spawn")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "No command is built from data."},
+            unsafe={"src/a.js:2"}, language="javascript",
+        ),
+        Case(
+            "javascript: an array of literals at a guarded position",
+            {"src/a.js": "function go(runner) {\n  runner.spawn([\"ls\", \"-l\"]);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("spawn")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "Only fixed arguments are spawned."},
             expect="pass", language="javascript",
         ),
         Case(
@@ -494,6 +592,20 @@ def check_cases(cases: List[Case]) -> Tuple[int, List[str]]:
                 violations.append(
                     f"S3 {case.label}: refusal does not state {case.refusal!r} "
                     f"({report.details.splitlines()[0]})")
+        if case.over_approximated:
+            checked += 3
+            if case.unsafe:
+                violations.append(
+                    f"S4 {case.label}: declared an over-approximation but carries ground truth "
+                    f"{sorted(case.unsafe)}; a program with an unsafe site is covered by S1")
+            if report.passed:
+                violations.append(
+                    f"S4 {case.label}: passed a program whose safety rests on what the callee "
+                    f"does with the value; the decision has moved off the value")
+            if case.over_approximated not in report.details:
+                violations.append(
+                    f"S4 {case.label}: the report does not say {case.over_approximated!r} "
+                    f"({report.details.splitlines()[0]})")
     return checked, violations
 
 
@@ -536,7 +648,7 @@ def main() -> int:
 
     all_pass = True
     count, violations = check_cases(cases)
-    print(f"S1-S3 superset, verdict, refusal ({count} checks): ", end="")
+    print(f"S1-S4 superset, verdict, refusal, over-approximation ({count} checks): ", end="")
     if violations:
         all_pass = False
         print(f"FAILED ({len(violations)})")

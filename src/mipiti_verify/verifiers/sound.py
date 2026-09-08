@@ -11,7 +11,9 @@ inferred from a name, a path or a description.
 ``sink_default_deny``
     Over every source file in ``scope``, every site of a declared sink
     receives, at each guarded position, only a form the safe-form
-    vocabulary accepts, or is an allowlisted site with a reviewed reason.
+    vocabulary accepts -- decided from the value written there, and for a
+    data structure from every element it was written with -- or is an
+    allowlisted site with a reviewed reason.
     Every site the engine could not classify counts as a violation. A
     scope that matches nothing, a file it cannot read, parse or name a
     language for, and a declared sink that never occurs are refusals: the
@@ -37,7 +39,11 @@ unexamined is a refusal and never a caveat on a pass: a file with no
 parser for its language, a link in the region a scope entry searches, a
 scope larger than the run can hold, and a forwarding chain that had not
 closed when the discovery budget ran out. An allowlist excepts a site the
-run flagged; it never excuses a part of the scope the run did not read.
+run flagged; it never excuses a part of the scope the run did not read,
+it is bounded by the sites the run examined, and a run whose every
+flagged site is an exception -- with no value anywhere in the scope
+admitted by form -- has decided nothing mechanically and is a refusal
+too.
 
 Each language is read through ``languages.calls``: Python by its own
 ``ast``, every other tabled grammar (Verilog, SystemVerilog and VHDL
@@ -127,6 +133,41 @@ _MAX_DETAILS_CHARS = 4000
 # thing that overruns it.
 _OMISSION_ROOM = 100
 
+# How many reviewed exceptions one witness may carry. Each entry is a
+# reviewer's statement about one site, so the list is short by nature; a
+# list past this length is not one a person went through site by site, and
+# it is also the one part of the params whose size the reasons reported
+# back would otherwise follow.
+_MAX_ALLOWLIST_ENTRIES = 500
+
+# How many reasons a refusal states before it reports the rest as a count.
+# A malformed submission can hold one reason per entry, and the refusal is
+# a submitted field with a size limit of its own.
+_MAX_PROBLEMS_REPORTED = 20
+
+
+def _refusal(problems: list) -> str:
+    """The reasons a submission cannot be evaluated, as one bounded string."""
+    shown = problems[:_MAX_PROBLEMS_REPORTED]
+    rest = len(problems) - len(shown)
+    text = "; ".join(shown)
+    if rest > 0:
+        text += f"; ... ({rest} further reason(s) not listed)"
+    return _within_details_bound(text)
+
+
+def _within_details_bound(text: str) -> str:
+    """``text`` cut to the size the receiving side accepts.
+
+    Every detail string a verdict carries passes through here, so no input
+    -- a scope of any width, a params list of any length, a parser's own
+    message -- can produce a row that rejects the batch it is submitted in.
+    """
+    if len(text) <= _MAX_DETAILS_CHARS:
+        return text
+    marker = "\n... (truncated to the submitted-field bound)"
+    return text[:_MAX_DETAILS_CHARS - len(marker)] + marker
+
 
 def _os_reason(error: OSError) -> str:
     """Why a filesystem read failed, without where the checkout sits.
@@ -204,10 +245,12 @@ class ArgRecord:
     boundary: str = ""
     allowlisted: str = ""       # the reviewed reason when allowlisted
     # Whether the value is a data structure written at the site (an array,
-    # list, tuple, map or dictionary literal), and so cannot be the
-    # statement a sink runs. Read only where a form is proved from the
-    # value itself; never a licence granted by an argument's position.
+    # list, tuple, map or dictionary literal), and the static form of each
+    # element it was written with. A form is proved from the value itself:
+    # being a structure is what makes the elements the thing to judge, and
+    # an argument's position never licenses either.
     aggregate: bool = False
+    elements: tuple = dc_field(default_factory=tuple)
 
 
 @dataclass
@@ -335,6 +378,10 @@ def _engine_params(params: dict, mode: str):
     if allowlist_raw is not None:
         if not isinstance(allowlist_raw, list):
             problems.append("'allowlist' must be a list of {file, site, callee, reason, reviewed_by}")
+        elif len(allowlist_raw) > _MAX_ALLOWLIST_ENTRIES:
+            problems.append(
+                f"'allowlist' carries {len(allowlist_raw)} entries; a reviewed exception list is "
+                f"bounded at {_MAX_ALLOWLIST_ENTRIES}, so narrow the scope or fix the sites")
         else:
             for i, entry in enumerate(allowlist_raw):
                 if not isinstance(entry, dict):
@@ -365,7 +412,7 @@ def _engine_params(params: dict, mode: str):
         else:
             wrappers = [w.strip().replace("::", ".").replace("->", ".") for w in wrappers_raw]
     if problems:
-        return None, "; ".join(problems)
+        return None, _refusal(problems)
     return EngineSpec(mode=mode, scope=[s.strip() for s in scope], sinks=sinks, safe_forms=safe_forms,
                       allowlist=allowlist, wrappers=wrappers, boundary_type=boundary_type,
                       constructors=constructors), ""
@@ -548,9 +595,18 @@ class _PythonBackend:
             return C.Form(C.FORM_VIOLATION, "unpacked positional arguments", "")
         if isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set)):
             # A data structure written at the site: an unadmitted value at a
-            # guarded position, and not a string, so it cannot be the
-            # statement the sink runs whatever it holds.
-            return C.Form(C.FORM_VIOLATION, f"{type(node).__name__} expression", "", True)
+            # guarded position, carrying the form of each element it was
+            # written with. An element reaches the sink inside the structure,
+            # so it is the elements that decide, never the container.
+            if isinstance(node, ast.Dict):
+                parts = [n for pair in zip(node.keys, node.values) for n in pair]
+            else:
+                parts = list(node.elts)
+            elements = tuple(
+                self._classify(p, boundary) if p is not None
+                else C.Form(C.FORM_VIOLATION, "unpacked into a dictionary", "")
+                for p in parts)
+            return C.Form(C.FORM_VIOLATION, f"{type(node).__name__} expression", "", True, elements)
         return C.Form(C.FORM_VIOLATION, f"{type(node).__name__} expression", "")
 
     def _bound_constructions(self, ctors: set) -> dict:
@@ -594,7 +650,7 @@ class _PythonBackend:
                         else:
                             form = self._classify(expr, boundary)
                         site.args.append(ArgRecord(index, name, guarded, form.form, form.reason,
-                                                   form.boundary, aggregate=form.aggregate))
+                                                   form.boundary, aggregate=form.aggregate, elements=form.elements))
                     report.sites.append(site)
                     if isinstance(node.func, ast.Attribute) and not isinstance(node.func.value, ast.Name):
                         report.receiver_unknown += 1
@@ -622,7 +678,7 @@ class _PythonBackend:
                     site = SiteRecord(self.rel, node.lineno, C.KIND_ASSIGN, leaf, path, declared=spec.declared)
                     form = self._classify(value, boundary)
                     site.args.append(ArgRecord(0, "", spec.guards(0, ""), form.form, form.reason,
-                                               form.boundary, aggregate=form.aggregate))
+                                               form.boundary, aggregate=form.aggregate, elements=form.elements))
                     report.sites.append(site)
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 value = node.value
@@ -825,7 +881,7 @@ class _TreeSitterBackend:
                         form = C.classify_value(arg.node, t, self.constants, boundary)
                         site.args.append(ArgRecord(arg.index, arg.name, spec.guards(arg.index, arg.name),
                                                    form.form, form.reason, form.boundary,
-                                                   aggregate=form.aggregate))
+                                                   aggregate=form.aggregate, elements=form.elements))
                     report.sites.append(site)
                     if callee is not None and C.named_children(callee) and not all(
                             n.type in t.identifiers for n in C.walk(callee)
@@ -857,7 +913,7 @@ class _TreeSitterBackend:
                 for index, value in enumerate(values):
                     form = C.classify_value(value, t, self.constants, boundary)
                     site.args.append(ArgRecord(index, "", spec.guards(index, ""), form.form, form.reason,
-                                               form.boundary, aggregate=form.aggregate))
+                                               form.boundary, aggregate=form.aggregate, elements=form.elements))
                 report.sites.append(site)
             elif nt in t.instantiations:
                 found = C.instantiation_of(node, t)
@@ -873,7 +929,7 @@ class _TreeSitterBackend:
                     form = C.classify_value(arg.node, t, self.constants, boundary)
                     site.args.append(ArgRecord(arg.index, arg.name, spec.guards(arg.index, arg.name),
                                                form.form, form.reason, form.boundary,
-                                               aggregate=form.aggregate))
+                                               aggregate=form.aggregate, elements=form.elements))
                 report.sites.append(site)
             elif nt in t.macro_definitions and FEATURE_ESCAPES not in self.features:
                 name = C.field(node, "name")
@@ -1215,7 +1271,8 @@ class SinkEngine:
                        "unclassifiable": 0, "stale_allowlist": 0, "wrappers_discovered": 0,
                        "parser_by_file": {}, "assumptions": {}, "escapes": 0, "constructions": 0}
         if problem:
-            return EngineReport(False, f"{spec.mode} FAIL: {problem}", facts, "", [], [problem], spec)
+            return EngineReport(False, _within_details_bound(f"{spec.mode} FAIL: {problem}"),
+                                facts, "", [], [problem], spec)
         evidence_hash = self._evidence_hash(files)
         signed = _signed_notes(self.root, spec)
         # The scope is read on every call, so the report is always a
@@ -1234,7 +1291,8 @@ class SinkEngine:
             backend, err = _parse_backend(rel, language, content, self.features)
             if err:
                 facts["parser_by_file"][rel] = "none"
-                return EngineReport(False, f"{spec.mode} FAIL: {err}", facts, evidence_hash, [], [err], spec)
+                return EngineReport(False, _within_details_bound(f"{spec.mode} FAIL: {err}"),
+                                    facts, evidence_hash, [], [err], spec)
             backends.append(backend)
             facts["parser_by_file"][rel] = backend.parser
         facts["files"] = len(files)
@@ -1274,8 +1332,8 @@ class SinkEngine:
                 f"{_MAX_WRAPPER_ROUNDS} hops, so the sink set did not close over this scope; "
                 f"declare the outermost of them in 'wrappers', or narrow the scope")
             facts["files"] = len(files)
-            return EngineReport(False, f"{spec.mode} FAIL: {problem}", facts, evidence_hash,
-                                [], [problem], spec)
+            return EngineReport(False, _within_details_bound(f"{spec.mode} FAIL: {problem}"),
+                                facts, evidence_hash, [], [problem], spec)
         facts["wrappers_discovered"] = len(discovered)
 
         reports: list = []
@@ -1305,7 +1363,6 @@ class SinkEngine:
                         0, "", True, C.FORM_UNCLASSIFIABLE,
                         "no guarded argument could be read at this site"))
                     guarded = [site.args[-1]]
-                first_ok = guarded[0].form in (C.FORM_LITERAL, C.FORM_NAMED_CONSTANT, C.FORM_LITERAL_CONCAT)
                 for a in guarded:
                     if spec.mode == MODE_TYPED_BOUNDARY:
                         if a.form == C.FORM_CONSTRUCTED and a.boundary == spec.boundary_type:
@@ -1320,17 +1377,34 @@ class SinkEngine:
                         # A safe form the assertion did not admit.
                         a.form, a.reason = C.FORM_VIOLATION, f"{a.form} is not an admitted safe form ({a.reason})"
                         continue
-                    if C.FORM_PARAMETER_BINDING in safe and first_ok and a is not guarded[0] and a.aggregate:
-                        # Data bound beside a literal statement. Recorded from
-                        # the value's own structure -- a data structure written
-                        # at the site, which is not a string and so cannot be
-                        # the statement -- never from the position it sits in.
-                        # A guarded position holding anything else stays a
-                        # violation however safe its neighbours are; an operator
+                    if C.FORM_PARAMETER_BINDING in safe and a.aggregate:
+                        # A data structure written at the site, judged by what
+                        # it was written with: every element must itself be a
+                        # form this assertion admits, since an element reaches
+                        # the sink inside the structure exactly as a value at
+                        # the position does. A structure holding a value built
+                        # from anything else -- an interpolation, a name that
+                        # is not a constant, a call, a nested structure -- is a
+                        # violation, and so is one no element could be read
+                        # from: whether the callee treats such a value as data
+                        # or as the statement it runs is a fact about the
+                        # callee, which this engine does not read. An operator
                         # whose sink takes bound values one per argument names
-                        # the statement position in ``positions`` instead.
-                        a.form, a.reason = C.FORM_PARAMETER_BINDING, \
-                            f"data bound beside a literal statement ({a.reason})"
+                        # the statement position in ``positions`` instead, so
+                        # the data positions are not guarded at all.
+                        admitted = safe - {C.FORM_PARAMETER_BINDING}
+                        unadmitted = next((e for e in a.elements if e.form not in admitted), None)
+                        if a.elements and unadmitted is None:
+                            seen = tuple(dict.fromkeys(e.form for e in a.elements))
+                            a.form, a.reason = C.FORM_PARAMETER_BINDING, (
+                                f"a data structure whose {len(a.elements)} element(s) are each an "
+                                f"admitted form ({', '.join(seen)})")
+                            continue
+                        detail = (f"holds {unadmitted.reason}" if unadmitted is not None
+                                  else "was written with no element this build could read")
+                        a.form, a.reason = C.FORM_VIOLATION, (
+                            f"a data structure at a guarded position that {detail}; name the "
+                            f"statement position in 'positions' if the callee takes bound data here")
                         continue
                     if a.form != C.FORM_VIOLATION:
                         a.form, a.reason = C.FORM_VIOLATION, f"{a.form} is not an admitted safe form ({a.reason})"
@@ -1436,6 +1510,15 @@ class SinkEngine:
                     f"whose type is not read; a differently named method fronting a sink is visible only "
                     f"through 'wrappers'"),
                 "wrapper_closure": "wrappers discovered by fixpoint within the scope",
+                "value_forms": (
+                    "every form is decided from the value written at the site, never from the "
+                    "position it sits in; a data structure is admitted only where every element "
+                    "it was written with is itself an admitted form. What a callee then does "
+                    "with a value it accepts is a property of the callee and is not read here"),
+                "review_exceptions": (
+                    f"{allowlisted_sites} site(s) stand on a reviewed exception rather than on a "
+                    f"form the run admitted; a run in which no site was admitted by form "
+                    f"establishes nothing and is refused"),
                 "metaprogramming": f"{escapes_total} escape site(s) (reflection, dynamic evaluation, macro bodies, sinks as values) counted as violations unless allowlisted",
                 "parser_fidelity": "; ".join(
                     f"{parser}:{sum(1 for p in facts['parser_by_file'].values() if p == parser)}"
@@ -1448,6 +1531,27 @@ class SinkEngine:
             problems.append("declared sinks do not occur in scope (no site and no reference to their names)")
         if spec.mode == MODE_TYPED_BOUNDARY and constructions_total == 0 and constructor_references == 0:
             problems.append(f"declared constructors of {spec.boundary_type} do not occur in scope")
+        # An exception excepts a site the run examined and flagged; it is a
+        # reviewer's statement, not a thing the run established. A run whose
+        # every flagged site is an exception, with no value anywhere in the
+        # scope admitted by form, has mechanically decided nothing -- the
+        # same vacuity as a scope the declared sinks never occur in, reached
+        # by excepting the sites instead of by missing them.
+        if allowlisted_sites and not safe_by_form:
+            problems.append(
+                f"every site this run flagged is a reviewed exception ({allowlisted_sites}) and no "
+                f"value at a guarded position was admitted by form, so the run establishes nothing "
+                f"over this scope")
+        # The exception list is bounded by the sites it excepts: an entry
+        # beyond that count cannot be pointing at a site this run examined,
+        # and a list nobody could have reviewed site by site is not a
+        # reviewed list.
+        examined = sites_total + escapes_total + constructions_total
+        if len(spec.allowlist) > examined:
+            problems.append(
+                f"{len(spec.allowlist)} reviewed exception(s) over {examined} site(s) examined; an "
+                f"exception names a site this run flagged, so the list cannot be longer than the "
+                f"sites in scope")
         passed = not violations and not unclassifiable and not stale and not problems
         details = self._render(passed, facts, violations, unclassifiable, stale, problems)
         report = EngineReport(passed, details, facts, evidence_hash, reports, problems, spec)
@@ -1505,7 +1609,10 @@ class SinkEngine:
                 listed += 1
         if omitted:
             listing.append(f"  ... ({omitted} further site(s) not listed; the counts above are complete)")
-        return "\n".join(lines + listing)
+        # The listing gives way first, above; this is the backstop for the
+        # head itself, whose length follows the declaration (the refusal
+        # reasons, the assumptions) rather than the scope.
+        return _within_details_bound("\n".join(lines + listing))
 
 
 def flagged_sites(report: EngineReport) -> set:
@@ -1647,7 +1754,7 @@ def run_engine(params: dict, project_root: Path, mode: str) -> EngineReport:
     """
     spec, problem = _engine_params(params, mode)
     if spec is None:
-        return EngineReport(False, f"{mode} FAIL: {problem}", {}, "", [], [problem], None)
+        return EngineReport(False, _within_details_bound(f"{mode} FAIL: {problem}"), {}, "", [], [problem], None)
     return SinkEngine(project_root, spec).run()
 
 

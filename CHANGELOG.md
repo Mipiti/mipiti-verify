@@ -43,21 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a site, a callee, a reason and a reviewer and must match a site the check
   actually flagged; a stale entry fails the run, the allowlist content sits
   inside the evidence hash so editing it reopens review, and no entry
-  suppresses a scope or parse refusal. A safe form is recorded from the
-  value's own structure: `parameter_binding` names a data structure written
-  at the site, which is not a string and so cannot be the statement, and never
-  a position blessed by what its neighbours look like. Its residual is
-  declared -- what the sink does with the values inside that structure is not
-  followed into the callee -- and a sink taking bound values one per argument
-  is declared by naming the statement position in `positions`. The one residual -- a
+  suppresses a scope or parse refusal. An exception excepts a site the run
+  examined, so the list cannot be longer than the sites in scope, and a run
+  whose every flagged site is an exception -- with nothing anywhere in the
+  scope admitted by form -- has decided nothing mechanically and is refused
+  as vacuous. A safe form is decided from the value and never from where it
+  sits: `parameter_binding` names a data structure written at the site every
+  element of which is itself an admitted form, so a structure holding an
+  interpolation, a name that is not a constant, a call or another structure
+  is a violation, and so is one no element could be read from. What a callee
+  does with a value it accepts is a property of the callee and is not read,
+  so a sink taking bound values in a later argument is declared by naming the
+  statement position in `positions`, which leaves the data positions
+  unguarded. The one residual -- a
   sink reached under a name in neither `sinks` nor `wrappers` -- is stated in
   the result and is what the semantic tier reviews, over the inventory the
   mechanical tier built rather than by re-scanning.
 
   A verdict's details carry the counts, the refusal reasons and a per-parser
-  file count, and stay inside the size a result may be submitted at; a
-  per-site listing beyond that budget is dropped with a line saying how many
-  were left out, and the counts stay complete. Paths in a verdict are
+  file count, and stay inside the size a result may be submitted at whatever
+  the submission holds: a per-site listing beyond that budget is dropped with
+  a line saying how many were left out, a refusal states its first reasons
+  and then how many it did not list, and the whole string is cut to the bound
+  as a last resort, so one oversized row can never reject the batch it
+  travels in. The counts stay complete. Paths in a verdict are
   repository-relative, so a filesystem error contributes its reason and never
   the checkout's location on the machine that ran it. Within one invocation a
   scope is read and parsed once for both the verdict and the inventory the
@@ -84,10 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameters or a file path. A test file existing, and a symbol inside one,
   are `presence`: they prove something exists, never that it ran. The
   vocabulary and the per-type class are held equal to the assertion-type
-  catalogue by `formal/check_types.py` (T5, T7), and `formal/check_sound.py`
-  proves over a grammar of programs that the sound engine's flagged set
-  contains every unsafe site, self-validating that each of its enumeration
-  features is load-bearing.
+  catalogue by `formal/check_types.py` (T5, T7), which also holds the sink
+  vocabulary equal across the two declarations (T8: the safe forms and the
+  sink kinds, each put through the engine's own params reader), and
+  `formal/check_sound.py` proves over a grammar of programs that the sound
+  engine's flagged set contains every unsafe site, self-validating that each
+  of its enumeration features is load-bearing and naming the programs it
+  refuses on purpose -- those whose safety would rest on a fact about the
+  callee -- so a build that started passing one would fail the checker.
 
 - A `mechanism_found` fact on a `test_attested` result, and in the facts block
   the semantic tier is shown: whether the named mechanism resolves to a

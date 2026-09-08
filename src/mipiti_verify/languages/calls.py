@@ -35,9 +35,10 @@ from .definitions import _TS_GRAMMARS, node_text as text, walk
 # was built through (``constructed:<T>``) when reported.
 #
 # ``parameter_binding`` is never read off a node type: it is the engine's
-# name for a value the site hands over as data beside a literal statement,
-# and it is recorded only where the value's own structure shows it is not
-# a statement. See :meth:`SinkEngine.run` in ``verifiers.sound``.
+# name for a data structure written at the site whose every element is
+# itself a form the assertion admits, and it is decided from those elements
+# rather than from the position the value sits in. See
+# :meth:`SinkEngine.run` in ``verifiers.sound``.
 FORM_LITERAL = "literal"
 FORM_NAMED_CONSTANT = "named_constant"
 FORM_LITERAL_CONCAT = "literal_concat"
@@ -64,11 +65,17 @@ class Form(NamedTuple):
     reason: str      # what was seen, for the reader
     boundary: str    # the boundary type a ``constructed`` value was built through
     # Whether the value is a data structure written at the site -- an array,
-    # list, tuple, map or dictionary literal. Such a value is not a string
-    # and so cannot itself be the statement a sink executes, whatever it
-    # holds. This is a structural fact about the value, never about where
-    # it sits in the argument list.
+    # list, tuple, map or dictionary literal. A data structure carries its
+    # elements, and an element of it reaches the sink as surely as the
+    # structure does, so being one is never on its own a reason to admit
+    # the value: it only says the elements below are the values to judge.
     aggregate: bool = False
+    # The static form of each element the structure was written with, in
+    # source order, for an aggregate; empty for every other value. An
+    # aggregate this build read no element of is empty here too, so the
+    # engine treats "no element" as nothing established rather than as
+    # nothing to worry about.
+    elements: tuple = ()
 
 
 class CallTable(NamedTuple):
@@ -1019,9 +1026,12 @@ def classify_value(node, table: CallTable, constants: dict, boundary: dict) -> F
     if t in table.aggregates:
         # Not a safe form on its own -- it is still an unadmitted value at a
         # guarded position. What it records is that the value is a data
-        # structure written here, so it is not a string and cannot be the
-        # statement the sink runs.
-        return Form(FORM_VIOLATION, f"{t} expression", "", True)
+        # structure written here, together with the form of each element it
+        # was written with: an element reaches the sink inside the structure,
+        # so the engine judges the elements rather than the container.
+        elements = tuple(classify_value(e, table, constants, boundary)
+                         for e in named_children(node))
+        return Form(FORM_VIOLATION, f"{t} expression", "", True, elements)
     return Form(FORM_VIOLATION, f"{t} expression", "")
 
 
