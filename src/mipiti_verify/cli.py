@@ -1038,7 +1038,12 @@ def attest_construction(boundary_type: str, probe_paths: tuple, language: str,
 
     from .attestation import build_statement
     from .languages.adapters._common import run_command, tail
-    from .languages.adapters.checks import CHECK_TIMEOUT, compile_check
+    from .languages.adapters.checks import (
+        CHECK_TIMEOUT,
+        TOOLCHAIN_REJECTED,
+        compile_check,
+        rejected_by_toolchain,
+    )
     from .languages.definitions import language_of
 
     root = _Path(project_root).resolve()
@@ -1053,7 +1058,9 @@ def attest_construction(boundary_type: str, probe_paths: tuple, language: str,
         code, out, err, note = run_command(argv, cwd=root, timeout=CHECK_TIMEOUT)
         if note:
             return f"{argv[0] if argv else build_cmd}: {note}"
-        return "" if code == 0 else f"{build_cmd} failed: {tail(err or out)}"
+        if code == 0:
+            return ""
+        return f"{TOOLCHAIN_REJECTED}{build_cmd} failed: {tail(err or out)}"
 
     entries: list = []
     refused = compiled = 0
@@ -1067,11 +1074,14 @@ def attest_construction(boundary_type: str, probe_paths: tuple, language: str,
         probe_language = language.strip() or language_of(rel)
         reason = _check(probe_language, rel)
         # An empty reason means the tree COMPILED, which is the failure here.
-        # A reason that says the toolchain is absent is not a refusal of the
-        # probe either: it is the absence of an answer, recorded as an error.
-        missing = ("is not installed" in reason or "no compile check" in reason
-                   or "no Verilog lint tool" in reason or "no VHDL analyser" in reason)
-        status = "failed" if not reason else ("error" if missing else "passed")
+        # Anything else is recorded as a refusal ONLY when the toolchain
+        # itself rejected the tree. A missing tool, a project file the check
+        # could not find, a timeout and a tool that would not start are all
+        # the absence of an answer, and an absent answer is never written
+        # into a signed statement as a proof.
+        status = ("failed" if not reason
+                  else "passed" if rejected_by_toolchain(reason)
+                  else "error")
         refused += status == "passed"
         compiled += status == "failed"
         entries.append({

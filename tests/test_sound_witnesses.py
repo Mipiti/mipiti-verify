@@ -381,6 +381,44 @@ class TestSignedResiduals:
         assert "a construction statement" in result.details
         assert "1 probe(s) the toolchain refused" in result.details
 
+    def test_a_toolchain_that_never_ran_attests_nothing(self, boundary_project):
+        """A statement says the toolchain REFUSED the probe. A command that
+        could not be started never refused anything, so there is nothing to
+        sign and the run says so rather than recording a proof."""
+        from click.testing import CliRunner
+
+        from mipiti_verify.cli import main
+
+        _write(boundary_project, "probes/p.py", "SafeSql(raw)\n")
+        out = CliRunner().invoke(main, [
+            "attest-construction", "--boundary-type", "SafeSql",
+            "--probe", str(boundary_project / "probes" / "p.py"),
+            "--project-root", str(boundary_project), "--commit", "e" * 40,
+            "--build-cmd", "no-such-build-tool-anywhere {file}",
+        ])
+        assert out.exit_code == 1, out.output
+        assert "no answer" in out.output, out.output
+        assert "refused by the toolchain" not in out.output, out.output
+
+    def test_a_check_that_could_not_run_attests_nothing(self, boundary_project, monkeypatch):
+        """The same for a language check that reports why it could not be
+        made: no project file above the source, a timeout, an absent tool."""
+        from click.testing import CliRunner
+
+        from mipiti_verify.cli import main
+        from mipiti_verify.languages.adapters import checks as CH
+
+        _write(boundary_project, "probes/p.rs", "fn main() { SafeSql(raw); }\n")
+        monkeypatch.setattr(CH, "compile_check",
+                            lambda *a, **k: "no Cargo.toml above the mechanism file")
+        out = CliRunner().invoke(main, [
+            "attest-construction", "--boundary-type", "SafeSql",
+            "--probe", str(boundary_project / "probes" / "p.rs"),
+            "--project-root", str(boundary_project), "--commit", "f" * 40,
+        ])
+        assert out.exit_code == 1, out.output
+        assert "no answer" in out.output, out.output
+
     def test_a_probe_that_compiles_attests_nothing(self, boundary_project):
         from click.testing import CliRunner
 

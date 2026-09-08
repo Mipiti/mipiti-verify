@@ -140,7 +140,7 @@ class RunnerAdapter:
 
     @contextmanager
     def mutation_disable(self, mech: Mechanism) -> Iterator[DisableHandle]:
-        from .checks import compile_check
+        from .checks import compile_check, without_rejection_marker
         from .hdl import mutate_verilog, mutate_vhdl
         from .mutation import MUTATION_LANGUAGES, mutate_source
         from ._common import temp_dir
@@ -175,7 +175,12 @@ class RunnerAdapter:
                 reason = compile_check(language, self.project_root, mech.file,
                                        runner=self.runner, work_dir=Path(scratch))
                 if reason:
-                    raise DisableError(f"mutated tree does not compile: {reason}")
+                    # The marker distinguishes the toolchain's own rejection
+                    # from a check that could not be made; this caller says
+                    # "does not compile" either way, so it is dropped here
+                    # rather than repeated inside the sentence.
+                    raise DisableError(
+                        f"mutated tree does not compile: {without_rejection_marker(reason)}")
                 yield DisableHandle()
 
 
