@@ -283,6 +283,16 @@ def _cases() -> List[Case]:
             mode=MODE_TYPED_BOUNDARY, unsafe={"src/a.py:4"},
         ),
         Case(
+            "typed_boundary: a value built by an undeclared constructor",
+            {"src/a.py": "from safe import SafeSql, Other\n\ndef go(conn):\n"
+                         "    conn.execute(Other.make('SELECT 1'))\n"
+                         "    conn.execute(SafeSql.literal('SELECT 2'))\n"},
+            {"scope": ["src/a.py"], "sinks": _PY_SINKS, "boundary_type": "SafeSql",
+             "constructors": ["SafeSql.literal"],
+             "property": "The driver accepts only SafeSql."},
+            mode=MODE_TYPED_BOUNDARY, unsafe={"src/a.py:4"},
+        ),
+        Case(
             "python: a wrapper the check cannot see, declared",
             {"src/a.py": "from helpers import query\n\ndef go(conn, name):\n    query(conn, name)\n"},
             {"scope": ["src/a.py"], "sinks": _PY_SINKS, "safe_forms": ["literal"],
