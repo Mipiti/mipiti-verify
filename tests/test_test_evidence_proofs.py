@@ -884,7 +884,10 @@ class TestChangedFilesKeepsTestBacked:
             {"id": "a_test_fn", "type": "function_exists", "params": {"file": "tests/test_guard.py", "name": "test_unrelated_arithmetic"}},
             {"id": "a_spec", "type": "class_exists", "params": {"file": "src/auth.spec.ts", "name": "AuthSpec"}},
             {"id": "a_attested", "type": "test_attested", "params": {"test": TEST, "file": "tests/test_guard.py"}},
-            {"id": "a_exists", "type": "test_exists", "params": {"pattern": "tests/**/*.py", "file": "tests/x.py"}},
+            # No ``file``: this type's verdict is about a glob over the tree,
+            # which no set of changed files can scope, so it is kept by the
+            # rule for an assertion that names no file.
+            {"id": "a_exists", "type": "test_exists", "params": {"pattern": "tests/**/*.py"}},
             {"id": "a_other", "type": "file_exists", "params": {"file": "README.md"}},
         ]}
 
@@ -920,7 +923,7 @@ class TestChangedFilesKeepsTestBacked:
         with patch.object(runner_mod.console, "print") as printer:
             runner._run_tier("m1", tier=1)
         printed = " ".join(str(c.args[0]) for c in printer.call_args_list if c.args)
-        assert "kept 4 test-backed" in printed
+        assert "kept 3 test-backed" in printed
 
     def test_a_pattern_marks_tests_the_heuristic_misses(self, project):
         from mipiti_verify.runner import Runner

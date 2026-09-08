@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import re2
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +40,17 @@ class VerifierResult:
     # not what the test did. Empty otherwise. Not a fact: never reported
     # as an outcome.
     reach_scope: str = ""
+    # Whether the mechanism an assertion names resolves to a definition in
+    # the checkout. ``None`` when the assertion names no mechanism (the
+    # question does not arise); ``False`` when it names one the checkout
+    # does not define, so a reader can demote a claim about a mechanism
+    # that cannot be located rather than carry it as unknown indefinitely.
+    mechanism_found: bool | None = None
+    # Counted facts a verifier established beside the verdict (the sink
+    # engine's per-form, per-file and per-assumption counts). What the
+    # details state in prose, as data a reader can index; the submitted
+    # result row carries the details, never this.
+    facts: dict = field(default_factory=dict)
 
 
 class PathTraversalError(Exception):
@@ -94,6 +107,92 @@ def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024
     if size > max_size:
         raise PathTraversalError(f"File too large ({size} bytes, max {max_size}): {file_param}")
     return resolved.read_text(encoding="utf-8", errors="replace")
+
+
+# Bounds on a scope enumeration. A check that must read EVERY file a scope
+# names to certify anything about the scope cannot silently drop one, so a
+# file over the size bound and a scope over the count bound are refusals,
+# never omissions.
+SCOPE_MAX_FILES = 5000
+SCOPE_MAX_FILE_SIZE = 2 * 1024 * 1024
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _scope_entry_is_safe(entry: str) -> bool:
+    """A scope entry is repository-relative and never climbs: no absolute
+    path, no drive letter, no ``..`` segment."""
+    text = str(entry or "").replace("\\", "/")
+    if not text or text.startswith("/") or (len(text) > 1 and text[1] == ":"):
+        return False
+    return all(segment != ".." for segment in text.split("/"))
+
+
+def resolve_scope_files(
+    project_root: Path,
+    entries: list,
+    *,
+    max_files: int = SCOPE_MAX_FILES,
+    max_size: int = SCOPE_MAX_FILE_SIZE,
+) -> list[Path]:
+    """Every regular file inside ``project_root`` that a list of scope
+    entries names, sorted and de-duplicated, each safe to read.
+
+    An entry is a repository-relative glob (``**`` recurses), a directory
+    (walked recursively) or a single file. A symlink inside the checkout is
+    passed over -- its target is read on its own when the scope names it --
+    and one pointing out of the checkout is refused, since its content
+    cannot be bound to this tree. An entry that is absolute or carries a
+    ``..`` segment, and a match that resolves outside the root, raise
+    :class:`PathTraversalError`. A file above ``max_size`` or a scope above
+    ``max_files`` raises :class:`ValueError`: the scope is too broad to
+    read soundly and must be narrowed, never sampled.
+    """
+    root = project_root.resolve()
+    out: dict[Path, None] = {}
+    for raw in entries:
+        entry = str(raw or "").replace("\\", "/").strip()
+        if not _scope_entry_is_safe(entry):
+            raise PathTraversalError(f"Scope entry escapes or leaves the project root: {raw!r}")
+        entry = entry.rstrip("/") or "."
+        if any(ch in entry for ch in _GLOB_CHARS):
+            candidates = project_root.glob(entry)
+        else:
+            base = safe_resolve_path(project_root, entry)
+            if base.is_dir() and not base.is_symlink():
+                candidates = base.rglob("*")
+            else:
+                candidates = iter((base,))
+        for p in candidates:
+            if p.is_symlink():
+                # A link is not content: its target is read on its own when
+                # the scope names it. A link OUT of the checkout is refused
+                # rather than skipped -- it would otherwise put content the
+                # run cannot bind to this tree inside a claim about it.
+                try:
+                    p.resolve().relative_to(root)
+                except (ValueError, OSError):
+                    raise PathTraversalError(
+                        f"Scope entry follows a link out of the project root: {raw!r}")
+                continue
+            if not p.is_file():
+                continue
+            resolved = p.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                raise PathTraversalError(f"Scope entry escapes project root: {raw!r}")
+            if resolved.stat().st_size > max_size:
+                raise ValueError(
+                    f"File in scope too large to read: {resolved.relative_to(root).as_posix()} "
+                    f"(> {max_size} bytes); narrow the scope"
+                )
+            out[resolved] = None
+            if len(out) > max_files:
+                raise ValueError(
+                    f"Scope names more than {max_files} files; narrow it"
+                )
+    return sorted(out)
 
 
 _VALID_TARGETS = frozenset({"feature_description"})
@@ -218,22 +317,110 @@ class Verifier(Protocol):
 # Registry populated by submodule imports
 VERIFIER_REGISTRY: dict[str, Verifier] = {}
 
-# What a type's evidence IS, stated in one place for every registered type.
+# What a type's evidence IS, stated once per registered type as the FACT the
+# verdict reports, never inferred from the type's name, a param or a path.
 #
-# ``presence``   the verdict rests on something present in the tree: a file,
-#                a symbol, a declaration, a pattern, a pinned dependency. It
-#                establishes that the mechanism is there, not that it acts.
-# ``behavioral`` the verdict rests on the code having been exercised: a test
-#                that exists for it, or a signed statement that a named test
-#                ran and passed at this commit.
+# ``presence``                  a named construct, configuration value,
+#                               dependency, file or pattern occurrence exists
+#                               in the tree. Existence, not behaviour: a test
+#                               FILE existing is presence.
+# ``under_approximating_scan``  a syntactic scan over a subject with no
+#                               false-positive guarantee. A clean scan proves
+#                               the absence of the syntactic form only.
+# ``existential_witness``       a signed statement that a named execution ran
+#                               and passed at this commit. It proves the path
+#                               it drove, nothing about any other path.
+# ``sound_over_approximation``  every site in a declared scope that could
+#                               violate the property was enumerated and each
+#                               is a declared safe form or a reviewed
+#                               exception; sound modulo the declared sink
+#                               list.
+# ``by_construction``           the sink accepts only a declared boundary
+#                               type whose every construction site is
+#                               default-denied.
 #
-# Every registered type carries exactly one class; the formal check
-# ``formal/check_types.py`` refuses a registration that does not.
-EVIDENCE_PRESENCE = "presence"
-EVIDENCE_BEHAVIORAL = "behavioral"
-EVIDENCE_CLASSES = frozenset({EVIDENCE_PRESENCE, EVIDENCE_BEHAVIORAL})
+# The vocabulary is the assertion catalogue's; the tuple below is the copy
+# this package carries for when the catalogue is not installed, and the
+# formal check ``formal/check_types.py`` (T7) holds the two equal. Every
+# registered type declares exactly one class at registration; T5 refuses a
+# registration that does not.
+SOUNDNESS_PRESENCE = "presence"
+SOUNDNESS_SCAN = "under_approximating_scan"
+SOUNDNESS_WITNESS = "existential_witness"
+SOUNDNESS_OVER_APPROXIMATION = "sound_over_approximation"
+SOUNDNESS_BY_CONSTRUCTION = "by_construction"
 
-_BEHAVIORAL_TYPES = frozenset({"test_attested", "test_exists"})
+_FALLBACK_EVIDENCE_CLASSES: tuple[str, ...] = (
+    SOUNDNESS_PRESENCE,
+    SOUNDNESS_SCAN,
+    SOUNDNESS_WITNESS,
+    SOUNDNESS_OVER_APPROXIMATION,
+    SOUNDNESS_BY_CONSTRUCTION,
+)
+
+# Rank, weakest first. A class's rank is data other readers fold over; the
+# registry itself only checks membership.
+SOUNDNESS_RANK: dict[str, int] = {
+    name: rank for rank, name in enumerate(_FALLBACK_EVIDENCE_CLASSES)
+}
+
+# The classes whose verdict is a statement over EVERY site of a scope.
+SOUND_CLASSES = frozenset({SOUNDNESS_OVER_APPROXIMATION, SOUNDNESS_BY_CONSTRUCTION})
+
+# Older names, kept for readers of the registry: ``presence`` is the same
+# class; ``behavioral`` was the class of a signed execution witness.
+EVIDENCE_PRESENCE = SOUNDNESS_PRESENCE
+EVIDENCE_BEHAVIORAL = SOUNDNESS_WITNESS
+
+
+@lru_cache(maxsize=None)
+def catalogue_soundness_classes() -> tuple[str, ...] | None:
+    """The assertion catalogue's soundness vocabulary, or ``None``.
+
+    Read from the ``assertion_types`` module the installed catalogue
+    package ships, loaded by file path so that reading a tuple of names
+    does not import the package's entry point (a running server). ``None``
+    when the catalogue is not installed or predates the vocabulary.
+    """
+    try:
+        spec = importlib.util.find_spec("mipiti_mcp")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    for location in spec.submodule_search_locations:
+        path = Path(location) / "assertion_types.py"
+        if not path.is_file():
+            continue
+        try:
+            module_spec = importlib.util.spec_from_file_location("_mipiti_assertion_catalogue", path)
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_spec.name] = module
+            module_spec.loader.exec_module(module)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - a catalogue that cannot load is one that is not installed
+            return None
+        classes = getattr(module, "SOUNDNESS_CLASSES", None)
+        if isinstance(classes, (tuple, list)) and all(isinstance(c, str) for c in classes):
+            return tuple(classes)
+        return None
+    return None
+
+
+def _vocabulary() -> frozenset:
+    """The classes a registration may declare.
+
+    The catalogue is the source of the vocabulary, and the fallback tuple is
+    this package's copy of it for when the catalogue is not installed. A
+    catalogue that ADDS a class is honoured; one that is missing a class this
+    package already registers is not allowed to make the package unimportable,
+    so the two are unioned here and held equal by the type checker (T7), which
+    is where a divergence is a finding rather than a crash.
+    """
+    theirs = catalogue_soundness_classes() or ()
+    return frozenset(_FALLBACK_EVIDENCE_CLASSES) | frozenset(theirs)
+
+
+EVIDENCE_CLASSES = _vocabulary()
 
 EVIDENCE_CLASS: dict[str, str] = {}
 
@@ -245,13 +432,24 @@ def evidence_class(assertion_type: str) -> str:
     return EVIDENCE_CLASS.get(assertion_type, "")
 
 
-def register(assertion_type: str):
-    """Decorator to register a verifier for an assertion type."""
+def register(assertion_type: str, *, soundness: str):
+    """Decorator to register a verifier for an assertion type.
+
+    ``soundness`` is the class of the fact the verifier's verdict reports,
+    one of :data:`EVIDENCE_CLASSES`. It is declared here, at the one place
+    the type is defined, so no reader downstream infers it from the type's
+    name or its params. A registration outside the vocabulary is refused
+    at import time.
+    """
+    if soundness not in EVIDENCE_CLASSES:
+        raise ValueError(
+            f"{assertion_type!r} declares evidence class {soundness!r}, not one of "
+            f"{sorted(EVIDENCE_CLASSES)}"
+        )
+
     def decorator(cls):
         VERIFIER_REGISTRY[assertion_type] = cls()
-        EVIDENCE_CLASS[assertion_type] = (
-            EVIDENCE_BEHAVIORAL if assertion_type in _BEHAVIORAL_TYPES else EVIDENCE_PRESENCE
-        )
+        EVIDENCE_CLASS[assertion_type] = soundness
         return cls
     return decorator
 
@@ -266,4 +464,4 @@ def get_verifier(assertion_type: str) -> Verifier | None:
 
 def _load_all() -> None:
     """Import all verifier modules to trigger registration."""
-    from . import file_based, code_structure, config, dependencies, tests, semantic, rtl  # noqa: F401
+    from . import file_based, code_structure, config, dependencies, tests, semantic, rtl, sound  # noqa: F401

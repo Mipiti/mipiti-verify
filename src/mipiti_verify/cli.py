@@ -975,6 +975,237 @@ def attest_reach(pair_specs: tuple, model_id: str | None, api_key: str | None,
     _echo_provenance(provenance)
 
 
+def _signing_options(command):
+    """The signing ladder every attest command shares."""
+    options = [
+        click.option("--project-root", type=click.Path(exists=True), default=".",
+                     help="Project root directory"),
+        click.option("--commit", default="",
+                     help="Commit the statement covers (default: CI env or .git/HEAD)"),
+        click.option("--signing-key", "key_path", envvar="MIPITI_ATTESTATION_KEY",
+                     default="", type=click.Path(dir_okay=False),
+                     help=("ECDSA P-256 private key (PEM) for CI with no workload identity. "
+                           "Ignored where a CI identity is available, which signs keylessly.")),
+        click.option("--key-passphrase", envvar="MIPITI_ATTESTATION_KEY_PASSPHRASE",
+                     default="", help="Passphrase for an encrypted signing key."),
+        click.option("--sigstore-tuf-url", default=None, help="Custom Sigstore TUF root URL"),
+        click.option("--sigstore-trust-config", default=None,
+                     type=click.Path(exists=True, dir_okay=False),
+                     help="Pre-downloaded Sigstore ClientTrustConfig JSON, for air-gapped CI"),
+    ]
+    for option in reversed(options):
+        command = option(command)
+    return command
+
+
+@main.command(name="attest-construction")
+@click.option("--boundary-type", required=True,
+              help="The type whose construction the probes test, as the assertion names it")
+@click.option("--probe", "probe_paths", multiple=True, required=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help=("A source file that builds the boundary type from something that is "
+                    "not a literal, and MUST NOT compile. Repeatable."))
+@click.option("--language", default="",
+              help="Language of the probes (default: from each probe's extension)")
+@click.option("--build-cmd", default="", envvar="MIPITI_BUILD_CMD",
+              help=("Command that compiles one probe, for a toolchain the built-in "
+                    "checks cannot drive. '{file}' is replaced by the probe's path; a "
+                    "non-zero exit is the refusal this command records."))
+@_signing_options
+def attest_construction(boundary_type: str, probe_paths: tuple, language: str,
+                        build_cmd: str, project_root: str, commit: str, key_path: str,
+                        key_passphrase: str, sigstore_tuf_url: str,
+                        sigstore_trust_config: str) -> None:
+    """Record that a boundary type refuses to be built from a non-literal.
+
+    A typed_boundary witness tracks construction BY NAME: it accepts a value
+    built by a call to a declared constructor. What it cannot see is whether
+    some other expression could produce the same type. Your own toolchain can
+    settle that, and only your toolchain can: write a probe that builds the
+    type from a variable, and let the compiler refuse it.
+
+        mipiti-verify attest-construction --boundary-type SafeSql \
+            --probe probes/safe_sql_from_variable.rs
+
+    Each probe is compiled where it sits, with the same check that gates a
+    source mutation. A probe the toolchain REFUSES is the outcome this
+    command records; a probe that compiles means the type does not constrain
+    what reaches it, and the command exits non-zero without writing a
+    statement. Nothing is executed -- a probe is compiled, never run.
+    """
+    import shlex
+    from pathlib import Path as _Path
+
+    from .attestation import build_statement
+    from .languages.adapters._common import run_command, tail
+    from .languages.adapters.checks import CHECK_TIMEOUT, compile_check
+    from .languages.definitions import language_of
+
+    root = _Path(project_root).resolve()
+    resolved_commit = _resolved_commit(commit, root)
+
+    def _check(probe_language: str, rel: str) -> str:
+        """Empty when the probe COMPILED; otherwise why the toolchain
+        refused it (which is the outcome this command is looking for)."""
+        if not build_cmd.strip():
+            return compile_check(probe_language, root, rel)
+        argv = shlex.split(build_cmd.replace("{file}", rel))
+        code, out, err, note = run_command(argv, cwd=root, timeout=CHECK_TIMEOUT)
+        if note:
+            return f"{argv[0] if argv else build_cmd}: {note}"
+        return "" if code == 0 else f"{build_cmd} failed: {tail(err or out)}"
+
+    entries: list = []
+    refused = compiled = 0
+    for probe in probe_paths:
+        path = _Path(probe).resolve()
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            click.echo(f"Error: probe {probe} is outside the project root.", err=True)
+            raise SystemExit(1)
+        probe_language = language.strip() or language_of(rel)
+        reason = _check(probe_language, rel)
+        # An empty reason means the tree COMPILED, which is the failure here.
+        # A reason that says the toolchain is absent is not a refusal of the
+        # probe either: it is the absence of an answer, recorded as an error.
+        missing = ("is not installed" in reason or "no compile check" in reason
+                   or "no Verilog lint tool" in reason or "no VHDL analyser" in reason)
+        status = "failed" if not reason else ("error" if missing else "passed")
+        refused += status == "passed"
+        compiled += status == "failed"
+        entries.append({
+            "name": rel,
+            "file": rel,
+            "classname": boundary_type,
+            "language": probe_language,
+            "status": status,
+            "reason": reason,
+        })
+        click.echo(f"  {rel}: " + {
+            "passed": "refused by the toolchain",
+            "failed": "COMPILED -- the type accepts it",
+            "error": f"no answer ({reason})",
+        }[status])
+
+    errors = len(entries) - refused - compiled
+    summary = {
+        "totals": {"total": len(entries), "passed": refused, "failed": compiled,
+                   "errors": errors, "skipped": 0},
+        "tests": entries,
+    }
+    if compiled or not refused:
+        click.echo(
+            f"Error: {compiled} probe(s) compiled and {errors} produced no answer; "
+            f"nothing is attested. A construction statement records only probes the "
+            f"toolchain refused.", err=True)
+        raise SystemExit(1)
+
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=["mipiti-verify", "attest-construction", "--boundary-type", boundary_type],
+        selected_pattern="",
+        kind="construction",
+        predicate_extra={"boundary_type": boundary_type},
+    )
+    out_path, provenance = _write_run_attestation(
+        root, statement, suffix="construction", model_id=boundary_type, key_path=key_path,
+        key_passphrase=key_passphrase, sigstore_tuf_url=sigstore_tuf_url,
+        sigstore_trust_config=sigstore_trust_config)
+    click.echo(
+        f"Attested construction of {boundary_type} at {resolved_commit[:12]}: "
+        f"{refused} probe(s) the toolchain refused -> {out_path}")
+    _echo_provenance(provenance)
+
+
+@main.command(name="attest-allowlist-review")
+@click.option("--allowlist", "allowlist_path", required=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help=("JSON array of the reviewed exceptions, each "
+                    "{file, site, callee, reason, reviewed_by} -- the same "
+                    "entries the assertion carries."))
+@_signing_options
+def attest_allowlist_review(allowlist_path: str, project_root: str, commit: str,
+                            key_path: str, key_passphrase: str, sigstore_tuf_url: str,
+                            sigstore_trust_config: str) -> None:
+    """Record who stands behind a sound witness's reviewed exceptions.
+
+    A sound witness passes over an allowlisted site because a reviewer said
+    so, and the reason travels inside the evidence hash, so editing it
+    reopens the review. What the repository content cannot carry is WHO
+    reviewed it, signed. This command records that: the entries as reviewed,
+    at this commit, under the same signing identity as every other statement.
+
+        mipiti-verify attest-allowlist-review --allowlist allowlist.json
+
+    Every entry must name a file, a site, a callee, a reason and a reviewer;
+    an entry missing any of them is refused, since an exception with no
+    stated reason is not a review.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from .attestation import build_statement
+
+    root = _Path(project_root).resolve()
+    resolved_commit = _resolved_commit(commit, root)
+    try:
+        raw = _json.loads(_Path(allowlist_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        click.echo(f"Error: could not read the allowlist: {e}", err=True)
+        raise SystemExit(1)
+    if not isinstance(raw, list) or not raw:
+        click.echo("Error: the allowlist must be a non-empty JSON array of entries.", err=True)
+        raise SystemExit(1)
+
+    entries: list = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            click.echo(f"Error: allowlist[{i}] is not an object.", err=True)
+            raise SystemExit(1)
+        file_ = str(item.get("file") or "").strip().replace("\\", "/")
+        callee = str(item.get("callee") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        reviewer = str(item.get("reviewed_by") or "").strip()
+        try:
+            site = int(str(item.get("site") or "").strip())
+        except (TypeError, ValueError):
+            site = 0
+        if not (file_ and callee and reason and reviewer and site > 0):
+            click.echo(
+                f"Error: allowlist[{i}] must name file, site (a line number), callee, "
+                f"reason and reviewed_by.", err=True)
+            raise SystemExit(1)
+        entries.append({
+            "name": f"{file_}:{site} {callee}",
+            "file": file_, "site": site, "callee": callee,
+            "reason": reason, "reviewed_by": reviewer, "status": "passed",
+        })
+
+    summary = {
+        "totals": {"total": len(entries), "passed": len(entries), "failed": 0,
+                   "errors": 0, "skipped": 0},
+        "tests": entries,
+    }
+    statement = build_statement(
+        commit=resolved_commit,
+        summary=summary,
+        invocation=["mipiti-verify", "attest-allowlist-review"],
+        selected_pattern="",
+        kind="allowlist-review",
+    )
+    out_path, provenance = _write_run_attestation(
+        root, statement, suffix="allowlist-review", model_id="allowlist", key_path=key_path,
+        key_passphrase=key_passphrase, sigstore_tuf_url=sigstore_tuf_url,
+        sigstore_trust_config=sigstore_trust_config)
+    reviewers = sorted({e["reviewed_by"] for e in entries})
+    click.echo(
+        f"Attested {len(entries)} reviewed exception(s) at {resolved_commit[:12]} "
+        f"by {', '.join(reviewers)} -> {out_path}")
+    _echo_provenance(provenance)
+
+
 @main.command()
 @click.argument("model_id", required=False, default=None)
 @click.option("--all", "run_all", is_flag=True, help="Verify all models in the API key's workspace")

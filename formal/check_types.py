@@ -23,12 +23,14 @@ nobody can invoke. These properties pin the four together:
       carries its family's fail-closed clause (an empty or irrelevant SOURCE_CODE is
       NO) and the injection-refusal clause
   T5  every registered type has exactly one evidence class, stated in the
-      registry
+      registry, and it is one of the declared vocabulary
+  T7  the class the registry states for a type is the class the catalogue
+      declares for it
 
-T1 and T2 need the catalogue (``mipiti_mcp.assertion_types``); when it is
-not installed those two are reported as not established and the exit
-status still reflects only what was checked. T3-T5 need nothing beyond
-this package.
+T1, T2 and T7 need the catalogue (``mipiti_mcp.assertion_types``); when it
+is not installed those are reported as not established and the exit status
+still reflects only what was checked. T3-T5 need nothing beyond this
+package.
 
 Usage:
     python formal/check_types.py
@@ -105,6 +107,17 @@ OPTIONAL_READ_ALLOWANCE: dict[str, dict[str, str]] = {
     "test_attested": {
         "pattern": "accepted alias for 'test' from the earlier test-file form",
     },
+    # The two sound witnesses are one engine under two declarations, and one
+    # reader validates the params of both. The read is real -- which is what
+    # this allowance is checked against -- but it happens on the branch for
+    # the other mode, so the key is never required of a caller of this type.
+    "sink_default_deny": {
+        "boundary_type": "read on the typed_boundary branch of the shared param reader",
+        "constructors": "read on the typed_boundary branch of the shared param reader",
+    },
+    "typed_boundary": {
+        "safe_forms": "read on the sink_default_deny branch of the shared param reader",
+    },
 }
 
 # T2: catalogue-required keys that the structural verifier does not read
@@ -112,6 +125,11 @@ OPTIONAL_READ_ALLOWANCE: dict[str, dict[str, str]] = {
 # runner's tier-2 source loader, which is checked.
 RUNNER_READ_REQUIRED: dict[str, set] = {
     "file_hash": {"scope_file"},
+    # The property a sound witness proves is what the semantic tier judges
+    # sink adequacy against; the mechanical tier decides the same sites
+    # whatever the property says, so it never reads it.
+    "sink_default_deny": {"property"},
+    "typed_boundary": {"property"},
 }
 
 
@@ -175,7 +193,8 @@ def _verifier_param_reads() -> dict[str, tuple[set, set]]:
     helpers: dict[str, _ParamReads] = {}
     modules = [pkg] + [
         sys.modules[f"{pkg.__name__}.{m}"]
-        for m in ("file_based", "code_structure", "config", "dependencies", "tests", "semantic", "rtl")
+        for m in ("file_based", "code_structure", "config", "dependencies", "tests",
+                  "semantic", "rtl", "sound")
     ]
     trees: dict[str, ast.AST] = {}
     for mod in modules:
@@ -421,6 +440,34 @@ def check_t5() -> Tuple[int, List[str]]:
     return checked, violations
 
 
+def check_t7(catalogue) -> Tuple[int, List[str]]:
+    """T7: one soundness vocabulary, one class per type, across two repos.
+
+    The class is the FACT a verdict reports, and it is declared in the
+    catalogue and honoured by the verifier. Two declarations of one fact
+    that can disagree are two facts, so they are held equal here: the
+    vocabulary as a set, and the class of every type the two share.
+    """
+    violations: List[str] = []
+    checked = 0
+    theirs = tuple(getattr(catalogue, "SOUNDNESS_CLASSES", ()) or ())
+    checked += 1
+    if set(theirs) != set(EVIDENCE_CLASSES):
+        violations.append(
+            f"T7 vocabulary differs: verifier-only={sorted(set(EVIDENCE_CLASSES) - set(theirs))} "
+            f"catalogue-only={sorted(set(theirs) - set(EVIDENCE_CLASSES))}")
+    for spec in sorted(catalogue.ASSERTION_TYPES, key=lambda t: t.name):
+        if spec.name not in VERIFIER_REGISTRY:
+            continue  # T1 reports a catalogue type with no verifier
+        checked += 1
+        declared = getattr(spec, "soundness", "")
+        if EVIDENCE_CLASS.get(spec.name) != declared:
+            violations.append(
+                f"T7: {spec.name!r} is registered as {EVIDENCE_CLASS.get(spec.name)!r} "
+                f"but the catalogue declares {declared!r}")
+    return checked, violations
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -495,7 +542,8 @@ def main() -> int:
         print("\nT1 catalogue coverage:      NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
         print("T2 param spec agreement:    NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
         print("T6 mechanism-kind vocabulary: NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
-        not_established += ["T1", "T2", "T6"]
+        print("T7 soundness class:           NOT ESTABLISHED (mipiti_mcp.assertion_types not available)")
+        not_established += ["T1", "T2", "T6", "T7"]
     else:
         print(f"\nCatalogue: {len(catalogue.ASSERTION_TYPES)} types; registry: {len(VERIFIER_REGISTRY)} verifiers")
         c, v = check_t1(catalogue)
@@ -511,6 +559,13 @@ def main() -> int:
         else:
             print("T6 mechanism-kind vocabulary: NOT ESTABLISHED (catalogue predates MECHANISM_KINDS)")
             not_established.append("T6")
+        if getattr(catalogue, "SOUNDNESS_CLASSES", None):
+            c, v = check_t7(catalogue)
+            all_pass &= _report("T7 soundness class registry == catalogue", c, v)
+            established.append("T7")
+        else:
+            print("T7 soundness class:           NOT ESTABLISHED (catalogue predates SOUNDNESS_CLASSES)")
+            not_established.append("T7")
 
     c, v = check_t3()
     all_pass &= _report("T3 templates", c, v)

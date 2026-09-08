@@ -278,9 +278,11 @@
       "type": "string",
       "enum": [
         "dependence",
-        "reach"
+        "reach",
+        "construction",
+        "allowlist-review"
       ],
-      "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. \"reach\" marks a record produced by `mipiti-verify attest-reach`: each test entry carries the per-test coverage (reached) of a run of that test alone, the mechanism it was run for, and a reason when the pair was not run. Neither kind evidences that a test ran and passed."
+      "description": "Optional. Absent for a test-result record. \"dependence\" marks a record produced by `mipiti-verify attest-dependence`: each test entry's status is the test's outcome with the mechanism named in its fails_without entry disabled. \"reach\" marks a record produced by `mipiti-verify attest-reach`: each test entry carries the per-test coverage (reached) of a run of that test alone, the mechanism it was run for, and a reason when the pair was not run. \"construction\" marks a record produced by `mipiti-verify attest-construction`: each entry is a probe that builds the record's boundary_type from something that is not a literal, with status passed when the toolchain REFUSED to compile it; nothing is executed. \"allowlist-review\" marks a record produced by `mipiti-verify attest-allowlist-review`: each entry is a reviewed exception a named reviewer stands behind at this commit. No kind evidences that a test ran and passed."
     },
     "strategy": {
       "type": "string",

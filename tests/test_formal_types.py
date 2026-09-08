@@ -26,12 +26,13 @@ def _catalogue_available() -> bool:
     return (ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py").is_file()
 
 
-def _catalogue_declares_kinds() -> bool:
-    """Whether the installed catalogue carries ``MECHANISM_KINDS`` (T6's input)."""
+def _catalogue_declares(name: str) -> bool:
+    """Whether the installed catalogue carries a name a property needs
+    (``MECHANISM_KINDS`` for T6, ``SOUNDNESS_CLASSES`` for T7)."""
     spec = importlib.util.find_spec("mipiti_mcp")
     candidates = [Path(p) / "assertion_types.py" for p in (spec.submodule_search_locations or [])] if spec else []
     candidates.append(ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py")
-    return any(c.is_file() and "MECHANISM_KINDS" in c.read_text(encoding="utf-8") for c in candidates)
+    return any(c.is_file() and name in c.read_text(encoding="utf-8") for c in candidates)
 
 
 def test_every_type_property_is_verified():
@@ -39,11 +40,17 @@ def test_every_type_property_is_verified():
         [sys.executable, str(CHECKER)], cwd=ROOT, capture_output=True, text=True, timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    if _catalogue_available() and _catalogue_declares_kinds():
-        assert "ALL TYPE PROPERTIES VERIFIED" in result.stdout, result.stdout
-    elif _catalogue_available():
-        assert "TYPE PROPERTIES T1, T2, T3, T4, T5 VERIFIED; T6 NOT ESTABLISHED" in result.stdout, result.stdout
+    if not _catalogue_available():
+        missing = ["T1", "T2", "T6", "T7"]
+        verified = ["T3", "T4", "T5"]
     else:
-        assert "TYPE PROPERTIES T3, T4, T5 VERIFIED; T1, T2, T6 NOT ESTABLISHED" in result.stdout, result.stdout
+        missing = [p for p, name in (("T6", "MECHANISM_KINDS"), ("T7", "SOUNDNESS_CLASSES"))
+                   if not _catalogue_declares(name)]
+        verified = [p for p in ("T1", "T2", "T6", "T7", "T3", "T4", "T5") if p not in missing]
+    if not missing:
+        assert "ALL TYPE PROPERTIES VERIFIED" in result.stdout, result.stdout
+    else:
+        assert (f"TYPE PROPERTIES {', '.join(verified)} VERIFIED; "
+                f"{', '.join(missing)} NOT ESTABLISHED") in result.stdout, result.stdout
     for prop in ("T3 templates", "T4 fail-closed + injection clauses", "T5 evidence class"):
         assert f"{prop} (" in result.stdout and "FAILED" not in result.stdout, result.stdout

@@ -13,7 +13,7 @@ from __future__ import annotations
 import glob as glob_mod
 from pathlib import Path
 
-from . import VerifierResult, register
+from . import SOUNDNESS_PRESENCE, SOUNDNESS_WITNESS, VerifierResult, register
 from ..attestation import (
     ATTESTATION_DIR,
     AttestationError,
@@ -29,8 +29,17 @@ from ..attestation import (
 # each test entry records how the test fared with a mechanism disabled.
 KIND_DEPENDENCE = "dependence"
 KIND_REACH = "reach"
-# Records that state a fact about a test rather than that it ran and passed.
-FACT_KINDS = frozenset({KIND_DEPENDENCE, KIND_REACH})
+# Two further shapes, each a fact about EVIDENCE rather than about a test:
+# that a probe building a boundary type from a non-literal was refused by the
+# toolchain, and that a named reviewer stands behind a set of allowlisted
+# sites at this commit.
+KIND_CONSTRUCTION = "construction"
+KIND_ALLOWLIST_REVIEW = "allowlist-review"
+# Records that state a fact rather than that a test ran and passed. A reader
+# looking for a passing test must never take one of these for a test-result
+# record: they carry the same predicate shape and a different meaning.
+FACT_KINDS = frozenset({KIND_DEPENDENCE, KIND_REACH, KIND_CONSTRUCTION,
+                        KIND_ALLOWLIST_REVIEW})
 
 
 def load_verified_statements(
@@ -81,7 +90,7 @@ def statement_kind(statement: dict) -> str:
     return str(predicate.get("kind") or "") if isinstance(predicate, dict) else ""
 
 
-@register("test_exists")
+@register("test_exists", soundness=SOUNDNESS_PRESENCE)
 class TestExistsVerifier:
     """Check that test files matching a pattern exist."""
 
@@ -96,7 +105,7 @@ class TestExistsVerifier:
         return VerifierResult(passed=False, details=f"No test files matching '{pattern}'")
 
 
-@register("test_attested")
+@register("test_attested", soundness=SOUNDNESS_WITNESS)
 class TestAttestedVerifier:
     """Check a signed statement that the customer's CI ran their tests.
 
@@ -530,6 +539,12 @@ def _evidence_facts(entry: dict, test_name: str, params: dict,
     file, symbol = parse_mechanism(mechanism)
     if not file:
         return facts
+    # Whether the named mechanism resolves to a definition in this checkout.
+    # A named mechanism that cannot be located leaves every claim about it
+    # unresolvable, so the fact is stated rather than left to be inferred
+    # from an unknown reach.
+    if project_root is not None:
+        facts["mechanism_found"] = mechanism_line_span(project_root, file, symbol) is not None
     reached = _reached_mechanism(entry, project_root, file, symbol)
     if reached is None:
         # The test-result record carried no per-test coverage; a reach record
@@ -574,6 +589,8 @@ def _facts_sentence(facts: dict, mechanism_named: bool) -> str:
     if digest:
         parts.append(f"definition {digest[:19]}…")
     if mechanism_named:
+        if facts.get("mechanism_found") is False:
+            parts.append("mechanism defined in the checkout: no")
         parts.append(f"reached mechanism: {reach_wording(facts.get('reached'), facts.get('reach_scope', ''))}")
         if facts.get("depends") is None and facts.get("depends_reason"):
             parts.append(f"fails without mechanism: not established ({facts['depends_reason']})")

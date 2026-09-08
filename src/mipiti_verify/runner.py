@@ -21,6 +21,7 @@ from .customer_dsse_signer import (
 from .sigstore_signer import sign_verification_statement
 from .tier2 import ABSENCE_TYPES, SUBJECT_FEATURE_DESCRIPTION, SUBJECT_REPOSITORY_FILE
 from .verifiers import get_verifier
+from .verifiers.sound import SCOPE_TYPES
 from .workspace_key_signer import WorkspaceKeySigner
 
 console = Console(stderr=True)
@@ -34,6 +35,14 @@ console = Console(stderr=True)
 # defense that types map to a single, expected source-resolution
 # strategy.
 _PATTERN_GLOB_TYPES: frozenset[str] = frozenset({"test_exists"})
+
+# Tier-2 source-loading: types whose subject is a SCOPE of files rather than
+# one file, and whose tier-2 question is asked over the inventory the
+# mechanical tier built (every site of a declared sink with each argument's
+# static form) rather than over the files themselves. Tier 2 never re-scans:
+# it judges whether the declared sinks are the sinks through which the
+# stated property could be violated in the code the inventory shows.
+_SCOPE_TYPES: frozenset[str] = SCOPE_TYPES
 
 # Tier-2 source-loading: types whose tier-2 criterion may legitimately
 # be evaluated with empty SOURCE_CODE. The conservative default is the
@@ -193,6 +202,11 @@ def _load_test_attested_source(project_root: Path, params: dict[str, Any]) -> st
         f"definition_sha256 matches attestation: {_yes_no_unknown(matches)}",
     ]
     if mech_file:
+        # Whether the named mechanism resolves to a definition here at all.
+        # Stated before the two facts about it, because both are unknowable
+        # when it does not.
+        found = mechanism_line_span(project_root, mech_file, symbol) is not None
+        facts.append(f"mechanism defined in the checkout: {_yes_no_unknown(found)}")
         facts.append(f"reached mechanism: {reach_wording(reached, reach_scope)}")
         facts.append(f"fails without mechanism: {_yes_no_unknown(depends)}")
     sections.append("--- Facts ---\n" + "\n".join(facts))
@@ -286,14 +300,50 @@ def _is_test_file(path: str, pattern: re.Pattern[str] | None = None) -> bool:
 
 def _is_test_backed(assertion: dict[str, Any],
                     pattern: re.Pattern[str] | None = None) -> bool:
-    """Whether an assertion's evidence is a test rather than the code itself."""
+    """Whether an assertion's verdict can change while its own file does not.
+
+    Two rules, each with its own reason. An assertion whose evidence class is
+    a signed execution witness speaks about a RUN, not about a file, so no
+    file scoping applies to it and it is always re-verified. An assertion
+    whose subject is a test file is re-verified because the operator marked
+    that file as a test: what a test evidences is the code it exercises, so
+    its own file being unchanged says nothing about the claim. The class is
+    read from the registry rather than from a list of type names here, so a
+    type's evidence class is stated once, where the type is registered.
+    """
+    from .verifiers import EVIDENCE_BEHAVIORAL, evidence_class
+
     a_type = str(assertion.get("type") or "")
-    if a_type in ("test_attested", "test_exists"):
+    if evidence_class(a_type) == EVIDENCE_BEHAVIORAL:
         return True
     if a_type in ("function_exists", "class_exists"):
         return _is_test_file(
             str((assertion.get("params") or {}).get("file") or ""), pattern)
     return False
+
+
+def _load_scope_inventory_source(project_root: Path, a_type: str,
+                                 params: dict[str, Any]):
+    """``(SOURCE_CODE, verdict)`` for a sound-witness review.
+
+    The mechanical tier enumerated every site of a declared sink over the
+    scope and classified each guarded argument's static form. That inventory
+    -- plus every undeclared call into the sinks' receivers, every
+    construction site of a boundary type, every allowlisted site with its
+    reviewed reason, and a facts block carrying the counts and the parser
+    used per file -- is what the semantic tier reviews. It is not asked to
+    re-scan: the question left for it is whether the declared sinks are the
+    sinks through which the stated property could be violated in this code.
+
+    The engine's verdict comes back with the inventory so the caller's
+    structural precheck reads the run that produced what the reviewer is
+    shown, rather than running the scope a second time and judging one
+    against the other.
+    """
+    from .verifiers.sound import render_facts, render_inventory, run_engine, to_result
+
+    report = run_engine(params, project_root, a_type)
+    return f"{render_inventory(report)}\n\n{render_facts(report)}", to_result(report)
 
 
 def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
@@ -1085,7 +1135,7 @@ class Runner:
                 out["provenance"] = result.provenance
             if getattr(result, "evidence_hash", ""):
                 out["evidence_hash"] = result.evidence_hash
-            for fact in ("reached", "depends"):
+            for fact in ("reached", "depends", "mechanism_found"):
                 value = getattr(result, fact, None)
                 if value is not None:
                     out[fact] = bool(value)
@@ -1138,6 +1188,9 @@ class Runner:
         # two are not judged by the same rule. The runner is the only
         # place that knows which one it loaded.
         subject_kind = SUBJECT_REPOSITORY_FILE
+        # The mechanical verdict a scope type's loader already produced, so
+        # the precheck below does not run the scope a second time.
+        scope_verdict = None
         # For target-based assertions (e.g., feature_description), use
         # platform-injected content instead of reading from disk.
         # No truncation — content must match what Tier 1 verified via
@@ -1192,6 +1245,24 @@ class Runner:
             # statement itself is the fallback when the attestation names no
             # definition.
             source_code = _load_test_attested_source(self.project_root, params)
+        elif a_type in _SCOPE_TYPES:
+            # A sound witness has no single file: its subject is the scope,
+            # and its evidence is the inventory the mechanical tier built
+            # over it. The property the witness proves is what sink adequacy
+            # is judged against, so a witness that states none leaves the
+            # semantic tier nothing to judge and is refused here rather than
+            # asked as an open question.
+            if not str(params.get("property") or "").strip():
+                return {
+                    "status": "fail",
+                    "details": (
+                        f"Tier-2 cannot review a {a_type!r} witness that states no "
+                        f"`property`: sink adequacy is judged against the property "
+                        f"the sinks realise, and there is none to judge against."
+                    ),
+                }
+            source_code, scope_verdict = _load_scope_inventory_source(
+                self.project_root, a_type, params)
         elif not source_file and a_type in _PATTERN_GLOB_TYPES:
             # Pattern-based types (test_exists) use
             # ``params["pattern"]`` and tier-1 globs it. Mirror that
@@ -1367,12 +1438,14 @@ class Runner:
         # supplied with the assertion rather than a repository file, so a
         # file-oriented structural verifier has nothing to re-check and would
         # report a failure about the wrong subject.
-        structural_verdict = None
-        structural = (
-            get_verifier(a_type)
-            if a_type in _DECLARATION_TYPES and not params.get("target")
-            else None
-        )
+        # A scope type's mechanical verdict already came back with the
+        # inventory the reviewer is shown, so it is the precheck; every other
+        # declaration type is re-run here.
+        structural_verdict = scope_verdict
+        structural = None
+        if (scope_verdict is None and a_type in _DECLARATION_TYPES
+                and not params.get("target")):
+            structural = get_verifier(a_type)
         if structural is not None:
             try:
                 structural_verdict = structural.verify(params, self.project_root)
@@ -1542,6 +1615,11 @@ _DECLARATION_TYPES = frozenset({
     "no_plaintext_secret", "parameter_defined", "parameter_validated",
     "pattern_absent", "pattern_matches", "port_exists", "register_reset",
     "signal_exists", "sva_assertion_present", "test_exists", "test_attested",
+    # The sound witnesses: their engine reads the scope and executes nothing,
+    # and what it decides -- whether every site of a declared sink takes a
+    # safe form -- is the mechanical criterion the semantic tier is layered
+    # on and cannot itself affirm.
+    "sink_default_deny", "typed_boundary",
     # Deliberately absent: ``error_handled`` — its verifier runs the code under
     # test, and tier 1 already owns that result. ``test_passes`` was removed
     # entirely; ``test_attested`` reads a signed statement and executes
@@ -1692,7 +1770,7 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
         row["evidence_hash"] = result["evidence_hash"]
     if result.get("tier2_evidence_hash"):
         row["tier2_evidence_hash"] = result["tier2_evidence_hash"]
-    for fact in ("reached", "depends"):
+    for fact in ("reached", "depends", "mechanism_found"):
         if result.get(fact) is not None:
             row[fact] = result[fact]
     return row
@@ -1733,10 +1811,44 @@ def _auto_detect_oidc(audience: str = "") -> str:
     return ""
 
 
+def _digest_files(project_root: Path, assertions: list[dict[str, Any]]) -> set[str]:
+    """The repository-relative files the assertions were verified against.
+
+    A file-scoped assertion contributes the one file it names. A scope-based
+    assertion contributes every file its scope resolves to, so a witness that
+    is a statement about a whole scope binds the digest to that whole scope:
+    editing any file in it changes the verified code. A scope that cannot be
+    resolved contributes its entries verbatim, so an unresolvable scope is
+    still recorded rather than silently dropped.
+    """
+    from .verifiers import PathTraversalError, resolve_scope_files
+
+    files: set[str] = set()
+    root = project_root.resolve()
+    for a in assertions or []:
+        params = a.get("params") or {}
+        named = params.get("file", "")
+        if named:
+            files.add(named)
+        scope = params.get("scope")
+        if isinstance(scope, str):
+            scope = [scope]
+        if not isinstance(scope, list) or not scope:
+            continue
+        entries = [str(e) for e in scope if isinstance(e, str) and e.strip()]
+        try:
+            files.update(p.relative_to(root).as_posix()
+                         for p in resolve_scope_files(project_root, entries))
+        except (PathTraversalError, ValueError, OSError):
+            files.update(entries)
+    return files
+
+
 def _source_digest(project_root: Path, assertions: list[dict[str, Any]]) -> str:
     """A VCS-neutral content digest of the verified code.
 
-    Hashes the files the assertions reference (``params["file"]``), so it is the
+    Hashes the files the assertions reference (``params["file"]``, and every
+    file a scope-based assertion's ``params["scope"]`` names), so it is the
     precise "same code" identity independent of any source-control system — two
     runs whose verified files are byte-identical produce the same digest even
     under a rebase or on a different branch. Deterministic (files sorted; each
@@ -1744,13 +1856,7 @@ def _source_digest(project_root: Path, assertions: list[dict[str, Any]]) -> str:
     rather than skipped, so a deletion still changes the digest. Empty when no
     assertion is file-scoped (e.g. pattern-only globs); the server then falls back
     to the revision id."""
-    files = sorted(
-        {
-            f
-            for a in (assertions or [])
-            if (f := ((a.get("params") or {}).get("file", "")))
-        }
-    )
+    files = sorted(_digest_files(project_root, assertions))
     if not files:
         return ""
     root = project_root.resolve()

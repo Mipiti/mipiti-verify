@@ -10,6 +10,7 @@ from . import (
     PathTraversalError,
     RegexTimeoutError,
     VerifierResult,
+    SOUNDNESS_PRESENCE,
     register,
     resolve_file_content,
     safe_regex_search,
@@ -53,7 +54,7 @@ def _slice_offset(content: str, slice_text: str) -> int:
     return pos if pos >= 0 else 0
 
 
-@register("module_exists")
+@register("module_exists", soundness=SOUNDNESS_PRESENCE)
 class ModuleExistsVerifier:
     """Check that a Verilog/SystemVerilog module (or primitive/program) is declared."""
 
@@ -81,7 +82,7 @@ class ModuleExistsVerifier:
         )
 
 
-@register("module_instantiated")
+@register("module_instantiated", soundness=SOUNDNESS_PRESENCE)
 class ModuleInstantiatedVerifier:
     """Check that a module directly instantiates another module in its body."""
 
@@ -126,7 +127,7 @@ class ModuleInstantiatedVerifier:
         )
 
 
-@register("port_exists")
+@register("port_exists", soundness=SOUNDNESS_PRESENCE)
 class PortExistsVerifier:
     """Check that a module declares a port (ANSI header or non-ANSI body style)."""
 
@@ -176,7 +177,7 @@ class PortExistsVerifier:
         )
 
 
-@register("parameter_defined")
+@register("parameter_defined", soundness=SOUNDNESS_PRESENCE)
 class ParameterDefinedVerifier:
     """Check that a parameter/localparam is declared, optionally matching its value."""
 
@@ -246,7 +247,7 @@ class ParameterDefinedVerifier:
         )
 
 
-@register("signal_exists")
+@register("signal_exists", soundness=SOUNDNESS_PRESENCE)
 class SignalExistsVerifier:
     """Check that a net/variable (wire, reg, logic, bit) is declared."""
 
@@ -299,7 +300,7 @@ class SignalExistsVerifier:
         )
 
 
-@register("sva_assertion_present")
+@register("sva_assertion_present", soundness=SOUNDNESS_PRESENCE)
 class SvaAssertionPresentVerifier:
     """Check that a named SystemVerilog assertion exists.
 
@@ -337,7 +338,7 @@ class SvaAssertionPresentVerifier:
         )
 
 
-@register("register_reset")
+@register("register_reset", soundness=SOUNDNESS_PRESENCE)
 class RegisterResetVerifier:
     """Check that a register is assigned on a reset path.
 

@@ -28,6 +28,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Mapping, Tuple
 
+from .verifiers.sound import SCOPE_TYPES
+
 # Resolve the templates directory once at import time. The package
 # layout is ``mipiti_verify/templates/tier2_<type>.j2`` and we read
 # templates via the filesystem (not importlib.resources) so the
@@ -49,14 +51,17 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 SUBJECT_REPOSITORY_FILE = "repository_file"
 SUBJECT_FEATURE_DESCRIPTION = "feature_description"
 
-# Types whose structural check passes when the target is ABSENT. Their
-# templates ask a different fail-closed question from the presence
-# templates: "no visible match" is the expected state, so the clause that
-# closes the false-pass class for them is that an absence from an empty,
-# missing, or irrelevant subject proves nothing. Read by the runner (a
-# "not found" refusal on these types is a restatement of the structural
-# result, never a contradiction of it) and by the template contract checks.
-ABSENCE_TYPES = frozenset({"pattern_absent", "no_plaintext_secret"})
+# Types whose structural check passes on the ABSENCE of something: a match
+# that is not there, or -- for the sound witnesses, whose whole verdict is
+# that no site of a declared sink takes an unsafe form -- a violating site
+# that is not there. Their templates ask a different fail-closed question
+# from the presence templates: "nothing visible" is the expected state, so
+# the clause that closes the false-pass class for them is that an absence
+# from an empty, missing, or irrelevant subject proves nothing. Read by the
+# runner (a "not found" refusal on these types is a restatement of the
+# structural result, never a contradiction of it) and by the template
+# contract checks.
+ABSENCE_TYPES = frozenset({"pattern_absent", "no_plaintext_secret"}) | SCOPE_TYPES
 
 # The phrases every rendered prompt must carry, per template family. Each
 # closes the same false-pass class (YES rationalised from the assertion's
