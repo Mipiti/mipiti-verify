@@ -22,21 +22,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Verilog, SystemVerilog and VHDL alongside Python, JavaScript, TypeScript,
   Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP and Swift).
 
-  What makes the verdict worth something is what the check refuses. A scope
-  that matches nothing, a file it cannot read, a file whose extension names no
-  language, and a file the parser rejects each fail the run: a pass never
-  comes from an empty enumeration. Every site it could not classify counts as
-  a violation, as does reflection, dynamic evaluation, a macro body naming a
-  sink, a shell invocation built from a variable, and a sink handed on as a
-  value. Import and assignment aliases, and in-scope wrappers that forward a
-  parameter into a guarded position, are sinks themselves, closed to a
-  fixpoint. An allowlist entry must name a file, a site, a callee, a reason and
-  a reviewer and must match a site the check actually flagged; a stale entry
-  fails the run, and the allowlist content sits inside the evidence hash, so
-  editing it reopens review. The one residual -- a sink reached under a name
-  in neither `sinks` nor `wrappers` -- is stated in the result and is what the
-  semantic tier reviews, over the inventory the mechanical tier built rather
-  than by re-scanning.
+  What makes the verdict worth something is what the check refuses. A pass is
+  returned only when every site in the declared scope was examined and each
+  one proved safe, so everything that leaves a part of the scope unexamined is
+  a refusal: a scope that matches nothing; a file it cannot read, whose
+  extension names no language, that the parser rejects, or in a language this
+  install has no parser for (reading a language other than Python needs the
+  `ast` extra; the refusal names it); a link anywhere in the region an entry
+  searches, matched or not, since a pattern walk does not descend through a
+  linked directory and a linked file names content under a path the tree does
+  not own; a scope over 5,000 files, over 2 MiB in one file, or over 16 MiB in
+  total, all of which arrive as "narrow it" rather than as a job the machine
+  killed; and a chain of functions forwarding into a sink deeper than 12 hops,
+  where the sink set had not closed when the budget ran out. Every site it
+  could not classify counts as a violation, as does reflection, dynamic
+  evaluation, a macro body naming a sink, a shell invocation built from a
+  variable, and a sink handed on as a value. Import and assignment aliases,
+  and in-scope wrappers that forward a parameter into a guarded position, are
+  sinks themselves, closed to a fixpoint. An allowlist entry must name a file,
+  a site, a callee, a reason and a reviewer and must match a site the check
+  actually flagged; a stale entry fails the run, the allowlist content sits
+  inside the evidence hash so editing it reopens review, and no entry
+  suppresses a scope or parse refusal. A safe form is recorded from the
+  value's own structure: `parameter_binding` names a data structure written
+  at the site, which is not a string and so cannot be the statement, and never
+  a position blessed by what its neighbours look like. Its residual is
+  declared -- what the sink does with the values inside that structure is not
+  followed into the callee -- and a sink taking bound values one per argument
+  is declared by naming the statement position in `positions`. The one residual -- a
+  sink reached under a name in neither `sinks` nor `wrappers` -- is stated in
+  the result and is what the semantic tier reviews, over the inventory the
+  mechanical tier built rather than by re-scanning.
+
+  A verdict's details carry the counts, the refusal reasons and a per-parser
+  file count, and stay inside the size a result may be submitted at; a
+  per-site listing beyond that budget is dropped with a line saying how many
+  were left out, and the counts stay complete. Paths in a verdict are
+  repository-relative, so a filesystem error contributes its reason and never
+  the checkout's location on the machine that ran it. Within one invocation a
+  scope is read and parsed once for both the verdict and the inventory the
+  semantic tier is shown.
 
 - `attest-construction` and `attest-allowlist-review`: two signed statements
   for the facts a repository cannot settle on its own. The first compiles
@@ -44,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records the ones the toolchain refused (a probe that compiles writes
   nothing and exits non-zero; probes are compiled, never run). The second
   records the reviewed exceptions and who stands behind them at this commit.
+  A probe the toolchain never answered on -- no tool installed, no project
+  file above the source, a command that would not start or ran out of time --
+  is reported as an absent answer and signs nothing, since only the
+  toolchain's own rejection of a probe is evidence about the type.
   Neither changes a verdict; each replaces "on the author's word" with "in a
   signed statement" in the facts a reader sees. Both kinds are declared in
   `schemas/test-result-v1.schema.json`, and neither evidences that a test ran.

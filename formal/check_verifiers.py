@@ -49,6 +49,7 @@ from mipiti_verify.verifiers import (  # noqa: E402
     RegexTimeoutError,
     _load_all,
     get_verifier,
+    resolve_scope_files,
     safe_regex_search,
     safe_resolve_path,
 )
@@ -986,10 +987,17 @@ def check_sound_witnesses() -> Tuple[int, List[str], dict]:
 # ---------------------------------------------------------------------------
 
 def check_path_traversal() -> Tuple[int, List[str]]:
-    """Every traversal pattern must raise PathTraversalError."""
+    """No path a caller supplies reaches content outside the checkout.
+
+    Both resolvers are covered: the one that answers for a single named
+    file, and the one that enumerates a whole scope. The second is the
+    surface actually pointed at a customer repository -- it expands
+    patterns, walks directories and meets links -- so a property stated
+    only over the first would stop describing the code that walks the tree.
+    """
     violations = []
     checked = 0
-    project = _make_project({"safe.txt": "content"})
+    project = _make_project({"safe.txt": "content", "app/main.py": "x = 1\n"})
 
     traversal_paths = [
         "../../../etc/passwd",
@@ -1006,6 +1014,52 @@ def check_path_traversal() -> Tuple[int, List[str]]:
             except PathTraversalError:
                 pass
             checked += 1
+
+        # The scope resolver: the same strings, plus the pattern and link
+        # shapes only it can be handed.
+        scope_entries = traversal_paths + [
+            "/etc/passwd",
+            "../*.py",
+            "app/../../*.py",
+            "**/../../../etc/*",
+        ]
+        for entry in scope_entries:
+            try:
+                resolve_scope_files(project, [entry])
+                violations.append(f"Scope entry not blocked: {entry}")
+            except PathTraversalError:
+                pass
+            except (ValueError, OSError) as e:
+                violations.append(f"Scope entry {entry!r} refused as {type(e).__name__}, "
+                                  f"not as a traversal: {e}")
+            checked += 1
+
+        # A link out of the checkout is content this tree cannot bind, and a
+        # link inside it leaves the enumeration short of what the entry
+        # names. Neither may be passed over in silence.
+        outside = Path(tempfile.mkdtemp()) / "outside.py"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("x = 1\n", encoding="utf-8")
+        (project / "app" / "escape.py").symlink_to(outside)
+        try:
+            resolve_scope_files(project, ["app"])
+            violations.append("Scope link out of the checkout not blocked")
+        except PathTraversalError:
+            pass
+        except (ValueError, OSError) as e:
+            violations.append(f"Scope link out of the checkout refused as "
+                              f"{type(e).__name__}: {e}")
+        checked += 1
+        (project / "app" / "escape.py").unlink()
+        _cleanup(outside.parent)
+
+        (project / "app" / "linked.py").symlink_to(project / "safe.txt")
+        try:
+            resolved = resolve_scope_files(project, ["app"])
+            violations.append(f"Scope link inside the checkout passed over: {resolved}")
+        except (PathTraversalError, ValueError):
+            pass
+        checked += 1
     finally:
         _cleanup(project)
 
@@ -1306,7 +1360,7 @@ def main():
         print(f"  Signed evidence:     {ta_count} scenarios, oracle vs verifier cross-checked")
         print(f"  Sound witnesses:     {sw_count} checks over "
               f"{sum(sw_per_type.values())} programs, ground truth vs flagged set")
-        print(f"  Path traversal:      {pt_count} patterns blocked")
+        print(f"  Path traversal:      {pt_count} paths, scope entries and links blocked")
         print(f"  ReDoS protection:    {rd_count} patterns (RE2 linear-time + backreference rejection)")
         print(f"  Determinism:         {det_count} verifiers verified")
         print(f"  Structural proofs:   {sp_count} (valid for ALL inputs by code analysis)")

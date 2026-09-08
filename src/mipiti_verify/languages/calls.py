@@ -33,6 +33,11 @@ from .definitions import _TS_GRAMMARS, node_text as text, walk
 # The static forms the safe-form vocabulary names, plus the two outcomes a
 # form can have outside it. ``constructed`` carries the boundary type it
 # was built through (``constructed:<T>``) when reported.
+#
+# ``parameter_binding`` is never read off a node type: it is the engine's
+# name for a value the site hands over as data beside a literal statement,
+# and it is recorded only where the value's own structure shows it is not
+# a statement. See :meth:`SinkEngine.run` in ``verifiers.sound``.
 FORM_LITERAL = "literal"
 FORM_NAMED_CONSTANT = "named_constant"
 FORM_LITERAL_CONCAT = "literal_concat"
@@ -58,6 +63,12 @@ class Form(NamedTuple):
     form: str        # one of the FORM_* names
     reason: str      # what was seen, for the reader
     boundary: str    # the boundary type a ``constructed`` value was built through
+    # Whether the value is a data structure written at the site -- an array,
+    # list, tuple, map or dictionary literal. Such a value is not a string
+    # and so cannot itself be the statement a sink executes, whatever it
+    # holds. This is a structural fact about the value, never about where
+    # it sits in the argument list.
+    aggregate: bool = False
 
 
 class CallTable(NamedTuple):
@@ -83,6 +94,7 @@ class CallTable(NamedTuple):
     substitutions: frozenset       # substitution node types inside a template
     concatenations: frozenset      # binary / concatenation node types
     concat_operators: frozenset    # operator tokens that concatenate
+    aggregates: frozenset          # array / list / map / tuple literal node types
     identifiers: frozenset         # identifier node types
     imports: frozenset             # import / use node types (names there are bindings, not escapes)
     aliases: frozenset             # import-alias node types: (source field, alias field) below
@@ -104,7 +116,7 @@ def _t(
     assignments=(), assignment_fields=(("left", "right"), ("target", "value"), ("target", "result")),
     declarations=(), declaration_fields=(("name", "value"), ("pattern", "value"), ("declarator", "value")),
     instantiations=(), literals=(), templates=(), substitutions=(),
-    concatenations=(), concat_operators=("+",), identifiers=(), imports=(), aliases=(),
+    concatenations=(), concat_operators=("+",), aggregates=(), identifiers=(), imports=(), aliases=(),
     alias_fields=(("name", "alias"), ("path", "alias")), constants=(), constant_modifiers=(),
     constant_any_value=False, parameters=(), escapes=None, variable_callee=(), hdl=False,
 ) -> CallTable:
@@ -115,7 +127,8 @@ def _t(
         frozenset(assignments), tuple(assignment_fields), frozenset(declarations),
         tuple(declaration_fields), frozenset(instantiations), frozenset(literals),
         frozenset(templates), frozenset(substitutions), frozenset(concatenations),
-        frozenset(concat_operators), frozenset(identifiers), frozenset(imports), frozenset(aliases),
+        frozenset(concat_operators), frozenset(aggregates),
+        frozenset(identifiers), frozenset(imports), frozenset(aliases),
         tuple(alias_fields), frozenset(constants), frozenset(constant_modifiers), constant_any_value,
         frozenset(parameters), dict(escapes or {}), frozenset(variable_callee), hdl,
     )
@@ -131,6 +144,7 @@ _JS_TABLE = _t(
     templates=("template_string", "string"),
     substitutions=("template_substitution",),
     concatenations=("binary_expression",),
+    aggregates=("array", "object"),
     identifiers=("identifier", "property_identifier", "shorthand_property_identifier"),
     imports=("import_statement",),
     aliases=("import_specifier", "namespace_import"),
@@ -152,6 +166,7 @@ _TS_TABLES: dict[str, CallTable] = {
         literals=("interpreted_string_literal", "raw_string_literal", "int_literal", "float_literal",
                   "rune_literal", "imaginary_literal", "true", "false", "nil"),
         concatenations=("binary_expression",),
+        aggregates=("composite_literal",),
         identifiers=("identifier", "field_identifier", "package_identifier", "type_identifier"),
         imports=("import_declaration",),
         aliases=("import_spec",),
@@ -169,6 +184,7 @@ _TS_TABLES: dict[str, CallTable] = {
         literals=("string_literal", "raw_string_literal", "integer_literal", "float_literal",
                   "boolean_literal", "char_literal"),
         concatenations=("binary_expression",),
+        aggregates=("array_expression", "tuple_expression"),
         identifiers=("identifier", "field_identifier", "type_identifier"),
         imports=("use_declaration",),
         aliases=("use_as_clause",),
@@ -186,6 +202,7 @@ _TS_TABLES: dict[str, CallTable] = {
                   "octal_integer_literal", "binary_integer_literal", "decimal_floating_point_literal",
                   "hex_floating_point_literal", "character_literal", "true", "false", "null_literal"),
         concatenations=("binary_expression",),
+        aggregates=("array_creation_expression", "array_initializer"),
         identifiers=("identifier", "type_identifier"),
         imports=("import_declaration",),
         constants=("field_declaration",),
@@ -257,6 +274,8 @@ _TS_TABLES: dict[str, CallTable] = {
         templates=("interpolated_string_expression",),
         substitutions=("interpolation",),
         concatenations=("binary_expression",),
+        aggregates=("implicit_array_creation_expression", "array_creation_expression",
+                    "initializer_expression", "collection_expression"),
         identifiers=("identifier",),
         imports=("using_directive",),
         constants=("field_declaration",),
@@ -274,6 +293,7 @@ _TS_TABLES: dict[str, CallTable] = {
         templates=("string", "heredoc_body"),
         substitutions=("interpolation",),
         concatenations=("binary",),
+        aggregates=("array", "hash"),
         identifiers=("identifier", "constant"),
         imports=(),
         constants=("assignment",),
@@ -296,6 +316,7 @@ _TS_TABLES: dict[str, CallTable] = {
                        "encapsed_string_interpolation"),
         concatenations=("binary_expression",),
         concat_operators=(".", "+"),
+        aggregates=("array_creation_expression",),
         identifiers=("name", "variable_name"),
         imports=("namespace_use_declaration",),
         constants=("const_element",),
@@ -316,6 +337,7 @@ _TS_TABLES: dict[str, CallTable] = {
         templates=("line_string_literal", "multi_line_string_literal"),
         substitutions=("interpolated_expression",),
         concatenations=("additive_expression",),
+        aggregates=("array_literal", "dictionary_literal"),
         identifiers=("simple_identifier", "type_identifier"),
         imports=("import_declaration",),
         constants=("property_declaration",),
@@ -994,6 +1016,12 @@ def classify_value(node, table: CallTable, constants: dict, boundary: dict) -> F
         path = path_name(callee, table)
         if leaf in boundary.get("constructors", set()) or path in boundary.get("constructors", set()):
             return Form(FORM_CONSTRUCTED, f"built through {path or leaf}", boundary.get("type", ""))
+    if t in table.aggregates:
+        # Not a safe form on its own -- it is still an unadmitted value at a
+        # guarded position. What it records is that the value is a data
+        # structure written here, so it is not a string and cannot be the
+        # statement the sink runs.
+        return Form(FORM_VIOLATION, f"{t} expression", "", True)
     return Form(FORM_VIOLATION, f"{t} expression", "")
 
 

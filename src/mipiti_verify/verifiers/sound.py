@@ -29,13 +29,20 @@ Sound in one direction only: the engine over-approximates. A callee is
 matched by its leaf name on any receiver; an alias, a partial application
 and a wrapper that forwards a parameter into a guarded position are sinks
 too; a value escaping into reflection, dynamic evaluation, a macro body or
-a function pointer is a violation; a file without a parser has every site
-reported unclassifiable, which passes only through the allowlist.
+a function pointer is a violation.
+
+A pass is returned only when every file the scope names was read and every
+site in it was classified, so anything that leaves part of the scope
+unexamined is a refusal and never a caveat on a pass: a file with no
+parser for its language, a link in the region a scope entry searches, a
+scope larger than the run can hold, and a forwarding chain that had not
+closed when the discovery budget ran out. An allowlist excepts a site the
+run flagged; it never excuses a part of the scope the run did not read.
 
 Each language is read through ``languages.calls``: Python by its own
 ``ast``, every other tabled grammar (Verilog, SystemVerilog and VHDL
-included) by tree-sitter when the parser extra is installed, and by a
-regex locator otherwise. The parser used is recorded per file.
+included) by tree-sitter. There is no third strategy. The parser used is
+recorded per file.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ import ast
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Optional
@@ -67,9 +75,12 @@ MODE_TYPED_BOUNDARY = "typed_boundary"
 # and by the tier-2 template contract, so the two never drift apart.
 SCOPE_TYPES = frozenset({MODE_DEFAULT_DENY, MODE_TYPED_BOUNDARY})
 
+# Every file in a scope is read by a parser that reads the language's
+# grammar. There is no third strategy: a file this build cannot parse is a
+# refusal, so no verdict rests on a search that saw a name without seeing
+# what was handed to it.
 PARSER_AST = "ast"
 PARSER_TREE_SITTER = "tree-sitter"
-PARSER_REGEX = "regex"
 
 # Grammars tried in order for a language whose first grammar rejects a
 # file: SystemVerilog is a superset of Verilog, so a ``.v`` file the
@@ -93,7 +104,53 @@ _PYTHON_ESCAPES: dict = {
 _PYTHON_SHELL_CALLS = frozenset({"run", "call", "check_call", "check_output", "Popen", "getoutput",
                                  "getstatusoutput"})
 
+# How many hops of wrapper discovery the fixed point runs before it gives
+# up. Each round re-walks every file in scope, so a bound that grows with
+# the file count is a bound only in principle. A forwarding chain deeper
+# than this is a modelling problem, and the run says so rather than
+# spending the CI job on it -- or, worse, stopping short of closure and
+# reporting a pass over sites it never enumerated.
+_MAX_WRAPPER_ROUNDS = 12
+
 _MAX_LISTED_LINES = 200
+
+# The details string is a submitted field with a fixed size limit on the
+# receiving side, and one oversized row rejects the whole batch it travels
+# in -- every other assertion's result with it. The counts and the refusal
+# reasons are the load-bearing part and are bounded by construction; the
+# per-site listing is a convenience, so it is what gives way, and the line
+# that replaces it says how many sites were left out.
+_MAX_DETAILS_CHARS = 4000
+
+# Room kept back for the line that reports how many sites were left out, so
+# the omission is always stated inside the budget rather than being the
+# thing that overruns it.
+_OMISSION_ROOM = 100
+
+
+def _os_reason(error: OSError) -> str:
+    """Why a filesystem read failed, without where the checkout sits.
+
+    The string form of an ``OSError`` carries the absolute path the call
+    failed on. This verdict is submitted and stored, and every path it
+    reports elsewhere is repository-relative, so the reason is taken from
+    the error alone and the path is named separately by the caller.
+    """
+    return error.strerror or type(error).__name__
+
+
+def _parser_counts(parser_by_file: dict) -> str:
+    """How many files each parser read, as a bounded summary.
+
+    The per-file map stays in the structured facts, where a reader can
+    index it. Naming every file here would make the length of a submitted
+    verdict grow with the size of the scope.
+    """
+    counts: dict = {}
+    for parser in parser_by_file.values():
+        counts[parser] = counts.get(parser, 0) + 1
+    return f"{len(parser_by_file)} file(s); " + ("; ".join(
+        f"{name}={n}" for name, n in sorted(counts.items())) or "none")
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +203,11 @@ class ArgRecord:
     reason: str
     boundary: str = ""
     allowlisted: str = ""       # the reviewed reason when allowlisted
+    # Whether the value is a data structure written at the site (an array,
+    # list, tuple, map or dictionary literal), and so cannot be the
+    # statement a sink runs. Read only where a form is proved from the
+    # value itself; never a licence granted by an argument's position.
+    aggregate: bool = False
 
 
 @dataclass
@@ -484,6 +546,11 @@ class _PythonBackend:
             return C.Form(C.FORM_VIOLATION, f"call to {path or leaf or 'a value'}", "")
         if isinstance(node, ast.Starred):
             return C.Form(C.FORM_VIOLATION, "unpacked positional arguments", "")
+        if isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set)):
+            # A data structure written at the site: an unadmitted value at a
+            # guarded position, and not a string, so it cannot be the
+            # statement the sink runs whatever it holds.
+            return C.Form(C.FORM_VIOLATION, f"{type(node).__name__} expression", "", True)
         return C.Form(C.FORM_VIOLATION, f"{type(node).__name__} expression", "")
 
     def _bound_constructions(self, ctors: set) -> dict:
@@ -526,7 +593,8 @@ class _PythonBackend:
                             form = C.Form(C.FORM_VIOLATION, "unpacked keyword arguments", "")
                         else:
                             form = self._classify(expr, boundary)
-                        site.args.append(ArgRecord(index, name, guarded, form.form, form.reason, form.boundary))
+                        site.args.append(ArgRecord(index, name, guarded, form.form, form.reason,
+                                                   form.boundary, aggregate=form.aggregate))
                     report.sites.append(site)
                     if isinstance(node.func, ast.Attribute) and not isinstance(node.func.value, ast.Name):
                         report.receiver_unknown += 1
@@ -553,7 +621,8 @@ class _PythonBackend:
                         continue
                     site = SiteRecord(self.rel, node.lineno, C.KIND_ASSIGN, leaf, path, declared=spec.declared)
                     form = self._classify(value, boundary)
-                    site.args.append(ArgRecord(0, "", spec.guards(0, ""), form.form, form.reason, form.boundary))
+                    site.args.append(ArgRecord(0, "", spec.guards(0, ""), form.form, form.reason,
+                                               form.boundary, aggregate=form.aggregate))
                     report.sites.append(site)
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 value = node.value
@@ -755,7 +824,8 @@ class _TreeSitterBackend:
                     for arg in C.arguments_of(node, t):
                         form = C.classify_value(arg.node, t, self.constants, boundary)
                         site.args.append(ArgRecord(arg.index, arg.name, spec.guards(arg.index, arg.name),
-                                                   form.form, form.reason, form.boundary))
+                                                   form.form, form.reason, form.boundary,
+                                                   aggregate=form.aggregate))
                     report.sites.append(site)
                     if callee is not None and C.named_children(callee) and not all(
                             n.type in t.identifiers for n in C.walk(callee)
@@ -786,7 +856,8 @@ class _TreeSitterBackend:
                 site = SiteRecord(self.rel, C.line_of(node), C.KIND_ASSIGN, leaf, path, declared=spec.declared)
                 for index, value in enumerate(values):
                     form = C.classify_value(value, t, self.constants, boundary)
-                    site.args.append(ArgRecord(index, "", spec.guards(index, ""), form.form, form.reason, form.boundary))
+                    site.args.append(ArgRecord(index, "", spec.guards(index, ""), form.form, form.reason,
+                                               form.boundary, aggregate=form.aggregate))
                 report.sites.append(site)
             elif nt in t.instantiations:
                 found = C.instantiation_of(node, t)
@@ -801,7 +872,8 @@ class _TreeSitterBackend:
                 for arg in args:
                     form = C.classify_value(arg.node, t, self.constants, boundary)
                     site.args.append(ArgRecord(arg.index, arg.name, spec.guards(arg.index, arg.name),
-                                               form.form, form.reason, form.boundary))
+                                               form.form, form.reason, form.boundary,
+                                               aggregate=form.aggregate))
                 report.sites.append(site)
             elif nt in t.macro_definitions and FEATURE_ESCAPES not in self.features:
                 name = C.field(node, "name")
@@ -954,64 +1026,6 @@ class _TreeSitterBackend:
 
 
 # ---------------------------------------------------------------------------
-# Regex backend (no parser)
-# ---------------------------------------------------------------------------
-
-class _RegexBackend:
-    parser = PARSER_REGEX
-
-    def __init__(self, rel: str, language: str, content: str) -> None:
-        from .code_structure import _blank_code_noise
-
-        self.rel = rel
-        self.language = language
-        self.content = _blank_code_noise(content, rel)
-
-    def aliases(self, leaves: set) -> dict:
-        return {}
-
-    def wrappers(self, sinks: dict) -> dict:
-        return {}
-
-    def references(self, leaves: set) -> int:
-        count = 0
-        for leaf in leaves:
-            count += len(re.findall(rf"(?<![\w$]){re.escape(leaf)}(?![\w$])", self.content))
-        return count
-
-    def analyse(self, sinks: dict, boundary: dict) -> FileReport:
-        report = FileReport(self.rel, self.language, self.parser)
-        for spec in sinks.values():
-            leaf = re.escape(spec.leaf)
-            if spec.kind == C.KIND_ASSIGN:
-                pattern = rf"(?<![\w$.]){leaf}\s*(?:<=|=)(?!=)"
-            elif spec.kind == C.KIND_INSTANTIATE:
-                pattern = rf"(?<![\w$.]){leaf}\s*(?:#\s*\(|[A-Za-z_]\w*\s*\()"
-            else:
-                pattern = rf"(?<![\w$]){leaf}\s*\("
-            for m in re.finditer(pattern, self.content):
-                line = self.content.count("\n", 0, m.start()) + 1
-                report.sites.append(SiteRecord(
-                    self.rel, line, spec.kind, spec.leaf, spec.callee, declared=spec.declared,
-                    args=[ArgRecord(0, "", True, C.FORM_UNCLASSIFIABLE,
-                                    "no parser for this file; the arguments were not read")]))
-        if boundary:
-            for ctor in boundary.get("constructors", set()):
-                leaf = ctor.rsplit(".", 1)[-1]
-                for m in re.finditer(rf"(?<![\w$]){re.escape(leaf)}\s*\(", self.content):
-                    line = self.content.count("\n", 0, m.start()) + 1
-                    report.constructions.append(SiteRecord(
-                        self.rel, line, C.KIND_CONSTRUCTOR, leaf, ctor, category="construction",
-                        note=f"construction of {boundary['type']}",
-                        args=[ArgRecord(0, "", True, C.FORM_UNCLASSIFIABLE,
-                                        "no parser for this file; the arguments were not read")]))
-            report.constructor_references = self.references(
-                {c.rsplit(".", 1)[-1] for c in boundary.get("constructors", set())})
-        report.references = self.references({s.leaf for s in sinks.values()})
-        return report
-
-
-# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -1045,10 +1059,14 @@ def _parse_backend(rel: str, language: str, content: str, features: frozenset):
             return None, f"unparsed: {rel} ({type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''})"
     table = C.table_for(language)
     if table is None:
-        # A grammar this package has not tabled: locate sites by name and
-        # report every one of them unclassifiable. Sound and useless until
-        # the grammar is tabled -- never a silent pass.
-        return _RegexBackend(rel, language, content), ""
+        # No call grammar for this language in this build. Sites could still
+        # be located by name, but the arguments at them could not be read,
+        # and the sites the name search missed would not be counted at all.
+        # A scope this build cannot read is a refusal, never a pass with a
+        # caveat attached.
+        return None, (
+            f"unparsed: {rel} (this build reads no call grammar for {language}; "
+            f"narrow the scope to the languages it reads)")
     from ..languages.definitions import get_parser
 
     tried = 0
@@ -1065,7 +1083,10 @@ def _parse_backend(rel: str, language: str, content: str, features: frozenset):
             return _TreeSitterBackend(rel, language, tree.root_node, C.table_for(grammar) or table, features), ""
     if tried:
         return None, f"unparsed: {rel} (the {language} grammar reports syntax errors)"
-    return _RegexBackend(rel, language, content), ""
+    return None, (
+        f"unparsed: {rel} (no {language} parser is installed, so the arguments at its sites "
+        f"cannot be read; install the 'ast' extra of this package, or narrow the scope to "
+        f"the languages this install reads)")
 
 
 def _signed_notes(project_root: Path, spec: EngineSpec) -> dict:
@@ -1133,6 +1154,24 @@ def _signed_notes(project_root: Path, spec: EngineSpec) -> dict:
     return notes
 
 
+# Reports already computed in this process, keyed by everything the report
+# is a statement about: the mode, the engine features, the evidence hash
+# (every file's content and the whole declaration) and the signed
+# statements the run folds into its residual lines. Bounded, and small:
+# within one invocation the same witness is evaluated twice (a verdict,
+# then the inventory a semantic review is asked about), and a scope is
+# parsed once for both.
+_REPORT_CACHE: "OrderedDict[tuple, EngineReport]" = OrderedDict()
+_REPORT_CACHE_MAX = 32
+
+
+def _remember(key: tuple, report: "EngineReport") -> None:
+    _REPORT_CACHE[key] = report
+    _REPORT_CACHE.move_to_end(key)
+    while len(_REPORT_CACHE) > _REPORT_CACHE_MAX:
+        _REPORT_CACHE.popitem(last=False)
+
+
 class SinkEngine:
     """One run of the default-deny check over a scope."""
 
@@ -1152,7 +1191,7 @@ class SinkEngine:
         except ValueError as e:
             return [], f"scope refused: {e}"
         except OSError as e:
-            return [], f"scope unreadable: {e}"
+            return [], f"scope unreadable: {_os_reason(e)}"
         if not paths:
             return [], "scope matched no files"
         out: list = []
@@ -1164,7 +1203,7 @@ class SinkEngine:
             try:
                 content = p.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
-                return [], f"unreadable file in scope: {rel} ({e})"
+                return [], f"unreadable file in scope: {rel} ({_os_reason(e)})"
             out.append((rel, language, content))
         return out, ""
 
@@ -1178,6 +1217,18 @@ class SinkEngine:
         if problem:
             return EngineReport(False, f"{spec.mode} FAIL: {problem}", facts, "", [], [problem], spec)
         evidence_hash = self._evidence_hash(files)
+        signed = _signed_notes(self.root, spec)
+        # The scope is read on every call, so the report is always a
+        # statement about the files as they are now. Parsing them again to
+        # reach a report already computed for exactly this content is not:
+        # the key below covers every file's content, the whole declaration
+        # and the signed statements, so a hit is the same statement about
+        # the same bytes.
+        cache_key = (spec.mode, self.features, evidence_hash,
+                     json.dumps(signed, sort_keys=True))
+        cached = _REPORT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         backends: list = []
         for rel, language, content in files:
             backend, err = _parse_backend(rel, language, content, self.features)
@@ -1198,7 +1249,8 @@ class SinkEngine:
         if spec.mode == MODE_TYPED_BOUNDARY:
             boundary = {"type": spec.boundary_type, "constructors": set(spec.constructors)}
         discovered: dict = {}
-        for _round in range(len(backends) + 8):
+        settled = False
+        for _round in range(_MAX_WRAPPER_ROUNDS):
             grew = False
             for backend in backends:
                 per_file = dict(sinks)
@@ -1210,7 +1262,20 @@ class SinkEngine:
                         discovered[name] = wrapper
                         grew = True
             if not grew:
+                settled = True
                 break
+        if not settled:
+            # The sink set was still growing when the budget ran out, so the
+            # scope holds a forwarding chain deeper than this many hops and
+            # the enumeration is not closed. An unclosed sink set means sites
+            # that were never looked at, which is a refusal.
+            problem = (
+                f"the chain of functions forwarding into a declared sink is deeper than "
+                f"{_MAX_WRAPPER_ROUNDS} hops, so the sink set did not close over this scope; "
+                f"declare the outermost of them in 'wrappers', or narrow the scope")
+            facts["files"] = len(files)
+            return EngineReport(False, f"{spec.mode} FAIL: {problem}", facts, evidence_hash,
+                                [], [problem], spec)
         facts["wrappers_discovered"] = len(discovered)
 
         reports: list = []
@@ -1255,8 +1320,17 @@ class SinkEngine:
                         # A safe form the assertion did not admit.
                         a.form, a.reason = C.FORM_VIOLATION, f"{a.form} is not an admitted safe form ({a.reason})"
                         continue
-                    if C.FORM_PARAMETER_BINDING in safe and first_ok and a is not guarded[0]:
-                        a.form, a.reason = C.FORM_PARAMETER_BINDING, "data bound beside a literal statement"
+                    if C.FORM_PARAMETER_BINDING in safe and first_ok and a is not guarded[0] and a.aggregate:
+                        # Data bound beside a literal statement. Recorded from
+                        # the value's own structure -- a data structure written
+                        # at the site, which is not a string and so cannot be
+                        # the statement -- never from the position it sits in.
+                        # A guarded position holding anything else stays a
+                        # violation however safe its neighbours are; an operator
+                        # whose sink takes bound values one per argument names
+                        # the statement position in ``positions`` instead.
+                        a.form, a.reason = C.FORM_PARAMETER_BINDING, \
+                            f"data bound beside a literal statement ({a.reason})"
                         continue
                     if a.form != C.FORM_VIOLATION:
                         a.form, a.reason = C.FORM_VIOLATION, f"{a.form} is not an admitted safe form ({a.reason})"
@@ -1361,17 +1435,14 @@ class SinkEngine:
                     f"a callee is matched by name on any receiver; {receiver_unknown} site(s) on a receiver "
                     f"whose type is not read; a differently named method fronting a sink is visible only "
                     f"through 'wrappers'"),
-                "wrapper_closure": (
-                    f"wrappers discovered by fixpoint within the scope; "
-                    f"{sum(1 for p in facts['parser_by_file'].values() if p == PARSER_REGEX)} file(s) "
-                    f"without a parser contribute no wrapper or alias"),
+                "wrapper_closure": "wrappers discovered by fixpoint within the scope",
                 "metaprogramming": f"{escapes_total} escape site(s) (reflection, dynamic evaluation, macro bodies, sinks as values) counted as violations unless allowlisted",
                 "parser_fidelity": "; ".join(
                     f"{parser}:{sum(1 for p in facts['parser_by_file'].values() if p == parser)}"
-                    for parser in (PARSER_AST, PARSER_TREE_SITTER, PARSER_REGEX)),
+                    for parser in (PARSER_AST, PARSER_TREE_SITTER)),
             },
         })
-        facts["assumptions"].update(_signed_notes(self.root, spec))
+        facts["assumptions"].update(signed)
         problems: list = []
         if sites_total == 0 and references == 0:
             problems.append("declared sinks do not occur in scope (no site and no reference to their names)")
@@ -1379,7 +1450,9 @@ class SinkEngine:
             problems.append(f"declared constructors of {spec.boundary_type} do not occur in scope")
         passed = not violations and not unclassifiable and not stale and not problems
         details = self._render(passed, facts, violations, unclassifiable, stale, problems)
-        return EngineReport(passed, details, facts, evidence_hash, reports, problems, spec)
+        report = EngineReport(passed, details, facts, evidence_hash, reports, problems, spec)
+        _remember(cache_key, report)
+        return report
 
     def _evidence_hash(self, files: list) -> str:
         spec = self.spec
@@ -1411,21 +1484,28 @@ class SinkEngine:
         lines = [f"{head}: {counts}"]
         if problems:
             lines.append("refused: " + "; ".join(problems))
-        parsers = "; ".join(f"{f}={p}" for f, p in sorted(facts["parser_by_file"].items()))
-        lines.append(f"parser_by_file: {parsers}")
+        lines.append("parsers: " + _parser_counts(facts["parser_by_file"]))
         lines.append("assumptions: " + "; ".join(f"{k}: {v}" for k, v in facts["assumptions"].items()))
+        head_len = sum(len(ln) + 1 for ln in lines)
+        listing: list = []
         listed = 0
+        omitted = 0
+        budget = _MAX_DETAILS_CHARS - head_len
         for label, items in (("violations", violations), ("unclassifiable", unclassifiable), ("stale allowlist", stale)):
             if not items:
                 continue
-            lines.append(f"{label}:")
+            listing.append(f"{label}:")
             for item in items:
-                if listed >= _MAX_LISTED_LINES:
-                    lines.append(f"  ... ({len(items)} in this group; listing capped at {_MAX_LISTED_LINES})")
-                    break
-                lines.append(f"  {item}")
+                line = f"  {item}"
+                if listed >= _MAX_LISTED_LINES or budget - len(line) - 1 < _OMISSION_ROOM:
+                    omitted += 1
+                    continue
+                listing.append(line)
+                budget -= len(line) + 1
                 listed += 1
-        return "\n".join(lines)
+        if omitted:
+            listing.append(f"  ... ({omitted} further site(s) not listed; the counts above are complete)")
+        return "\n".join(lines + listing)
 
 
 def flagged_sites(report: EngineReport) -> set:
@@ -1549,7 +1629,7 @@ def render_facts(report: EngineReport, extra: Optional[list] = None) -> str:
         f"allowlisted: {facts.get('allowlisted', 0)}; violations: {facts.get('violations', 0)}; "
         f"unclassifiable: {facts.get('unclassifiable', 0)}; stale allowlist entries: {facts.get('stale_allowlist', 0)}; "
         f"escape sites: {facts.get('escapes', 0)}; wrappers discovered: {facts.get('wrappers_discovered', 0)}",
-        "parser per file: " + "; ".join(f"{f}={p}" for f, p in sorted(facts.get("parser_by_file", {}).items())),
+        "parsers: " + _parser_counts(facts.get("parser_by_file", {})),
     ]
     for key, value in (facts.get("assumptions") or {}).items():
         lines.append(f"{key}: {value}")

@@ -27,6 +27,25 @@ def test_the_flagged_set_is_a_superset_of_the_unsafe_sites():
     assert "S1-S3 superset, verdict, refusal" in result.stdout, result.stdout
 
 
+def test_the_grammar_covers_every_language_the_claim_names():
+    """The banner is the claim. Pinning the languages here means a build
+    that cannot read one of them, or a checker that quietly drops its
+    programs, fails a test rather than printing a narrower verdict under
+    the same banner."""
+    result = subprocess.run(
+        [sys.executable, str(CHECKER)], cwd=ROOT, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(ln for ln in result.stdout.splitlines() if ln.startswith("Programs:"))
+    count = int(line.split()[1])
+    languages = line.split(" across ", 1)[1].split(", ")
+    assert set(languages) == {
+        "go", "javascript", "python", "rust", "systemverilog", "vhdl"}, line
+    # A floor, not an equality: adding a program is ordinary, dropping the
+    # coverage of a whole language is what this guards.
+    assert count >= 40, line
+
+
 def test_every_enumeration_feature_is_load_bearing():
     """A mutant that skips one feature must lose a site the ground truth
     names; a feature no program exercises fails the checker."""

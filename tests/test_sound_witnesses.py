@@ -137,10 +137,45 @@ class TestScope:
         result = get_verifier("sink_default_deny").verify(_params(), project)
         assert not result.passed and "unparsed" in result.details
 
-    def test_a_link_inside_the_checkout_is_read_as_its_target(self, project):
+    def test_a_linked_file_in_the_searched_region_is_refused(self, project):
+        """A link under the region is a refusal even when its target is
+        elsewhere in the tree: reading the target under its own path would
+        leave the path the scope named unaccounted for."""
+        (project / "internal").mkdir()
+        _write(project, "internal/api.py", "import subprocess\n\n\ndef go(u):\n    subprocess.run(u)\n")
+        (project / "src" / "api.py").symlink_to(project / "internal" / "api.py")
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["src"])
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["src/**/*.py"])
+
+    def test_a_linked_directory_in_the_searched_region_is_refused(self, project):
+        """A pattern walk does not descend through a linked directory, so an
+        unread subtree would otherwise never appear in any count."""
+        (project / "other").mkdir()
+        _write(project, "other/bad.py", "def go(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        (project / "src" / "linked").symlink_to(project / "other", target_is_directory=True)
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["src"])
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["src/**/*.py"])
+
+    def test_a_witness_refuses_rather_than_passing_over_a_link(self, project):
+        """The verdict, not just the resolver: an unsafe call reachable only
+        through a link must never sit under a PASS."""
+        (project / "other").mkdir()
+        _write(project, "other/bad.py", "def go(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        (project / "src" / "linked").symlink_to(project / "other", target_is_directory=True)
+        result = get_verifier("sink_default_deny").verify(_params(), project)
+        assert not result.passed and "scope refused" in result.details and "link" in result.details
+
+    def test_a_link_whose_target_is_in_scope_is_still_refused(self, project):
+        """The resolver does not weigh whether the target happens to be
+        named elsewhere in the scope: that is a property of the other
+        entries, not of the link."""
         (project / "src" / "linked.py").symlink_to(project / "src" / "db.py")
-        files = resolve_scope_files(project, ["src"])
-        assert [p.name for p in files] == ["db.py"]
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["src"])
 
     def test_a_link_out_of_the_checkout_is_refused(self, project, tmp_path):
         outside = tmp_path.parent / "outside_target.py"
@@ -159,6 +194,30 @@ class TestScope:
             _write(project, f"src/mod{i}.py", "x = 1\n")
         with pytest.raises(ValueError, match="narrow it"):
             resolve_scope_files(project, ["src"], max_files=2)
+
+    def test_a_scope_whose_files_are_too_large_together_is_refused(self, project):
+        """The count cap and the per-file cap bound one dimension each; a
+        scope inside both can still be more source than a run can hold, and
+        that must arrive as a refusal rather than as a killed job."""
+        for i in range(8):
+            _write(project, f"src/mod{i}.py", "# padding\n" * 200)
+        with pytest.raises(ValueError, match="narrow it"):
+            resolve_scope_files(project, ["src"], max_total_size=4096)
+
+    def test_a_forwarding_chain_deeper_than_the_budget_is_refused(self, project):
+        """The sink set must close over the scope before any verdict rests
+        on it. A budget that runs out with the set still growing means
+        sites were never enumerated, so the run refuses."""
+        depth = 20
+        body = ["def go(conn, name):", "    conn.execute(name)"]
+        chain = "\n".join(body) + "\n"
+        for i in range(depth):
+            chain += f"\n\ndef hop{i}(conn, name):\n    " + (
+                "go(conn, name)" if i == 0 else f"hop{i - 1}(conn, name)") + "\n"
+        _write(project, "src/db.py", chain)
+        result = get_verifier("sink_default_deny").verify(_params(), project)
+        assert not result.passed
+        assert "did not close over this scope" in result.details, result.details
 
     def test_a_sink_that_never_occurs_proves_nothing(self, project):
         result = get_verifier("sink_default_deny").verify(
@@ -203,6 +262,48 @@ class TestParams:
 # D. The evidence hash binds the scope and the allowlist
 # ---------------------------------------------------------------------------
 
+class TestRepeatedEvaluation:
+    def test_the_scope_is_parsed_once_for_the_verdict_and_the_inventory(self, project):
+        """Tier 1 and the inventory a semantic review is shown are the same
+        statement about the same bytes, so the scope is read and parsed once
+        for both rather than once each."""
+        import mipiti_verify.verifiers.sound as S
+        from mipiti_verify.runner import _load_scope_inventory_source
+
+        getattr(S, "_REPORT_CACHE", {}).clear()
+        parses = {"n": 0}
+        real = S._parse_backend
+
+        def counting(rel, language, content, features):
+            parses["n"] += 1
+            return real(rel, language, content, features)
+
+        original = S._parse_backend
+        S._parse_backend = counting
+        try:
+            get_verifier("sink_default_deny").verify(_params(), project)
+            first = parses["n"]
+            _load_scope_inventory_source(project, "sink_default_deny", _params())
+        finally:
+            S._parse_backend = original
+        assert first > 0
+        assert parses["n"] == first, f"{parses['n']} parses for {first} files"
+
+    def test_edited_source_is_read_again(self, project):
+        """The report is a statement about the files as they are now: a
+        changed file is a different statement, never a remembered one."""
+        import mipiti_verify.verifiers.sound as S
+
+        getattr(S, "_REPORT_CACHE", {}).clear()
+        assert get_verifier("sink_default_deny").verify(_params(), project).passed
+        _write(project, "src/db.py", "def go(conn, name):\n    conn.execute(name)\n")
+        assert not get_verifier("sink_default_deny").verify(_params(), project).passed
+
+
+# ---------------------------------------------------------------------------
+# D. The evidence hash
+# ---------------------------------------------------------------------------
+
 class TestEvidenceHash:
     def _hash(self, project, **over):
         return get_verifier("sink_default_deny").verify(_params(**over), project).evidence_hash
@@ -228,8 +329,7 @@ class TestEvidenceHash:
 # ---------------------------------------------------------------------------
 
 class TestUnreadableSites:
-    def test_a_language_without_a_parser_reports_every_site_unclassifiable(
-            self, project, monkeypatch):
+    def test_a_language_without_an_installed_parser_is_refused(self, project, monkeypatch):
         from mipiti_verify.languages import definitions as D
 
         _write(project, "src/app.go",
@@ -238,10 +338,33 @@ class TestUnreadableSites:
         result = get_verifier("sink_default_deny").verify(
             _params(scope=["src/app.go"]), project)
         assert not result.passed
-        assert "no parser for this file" in result.details
-        assert result.facts["parser_by_file"]["src/app.go"] == "regex"
+        assert "unparsed" in result.details
+        assert result.facts["parser_by_file"]["src/app.go"] == "none"
 
-    def test_an_unreadable_site_can_still_be_allowlisted(self, project, monkeypatch):
+    def test_the_refusal_for_a_missing_parser_names_the_next_action(self, project, monkeypatch):
+        from mipiti_verify.languages import definitions as D
+
+        _write(project, "src/app.go",
+               'package a\n\nfunc Run(db *DB) {\n\tdb.execute("SELECT 1")\n}\n')
+        monkeypatch.setattr(D, "_get_parser", lambda language: None)
+        result = get_verifier("sink_default_deny").verify(
+            _params(scope=["src/app.go"]), project)
+        assert "'ast' extra" in result.details, result.details
+
+    def test_a_call_a_name_search_would_miss_cannot_reach_a_pass(self, project, monkeypatch):
+        """Without a parser the arguments at a site are unread AND the sites
+        a name search does not match are uncounted, so the run is refused
+        rather than passed on what a search happened to find."""
+        from mipiti_verify.languages import definitions as D
+
+        _write(project, "src/app.rb",
+               'def go(conn, user)\n  sql = "SELECT \'" + user + "\'"\n  conn.exec sql\nend\n')
+        monkeypatch.setattr(D, "_get_parser", lambda language: None)
+        result = get_verifier("sink_default_deny").verify(
+            _params(scope=["src/app.rb"], sinks=[{"callee": "exec"}]), project)
+        assert not result.passed, result.details
+
+    def test_an_allowlist_cannot_suppress_an_unreadable_file(self, project, monkeypatch):
         from mipiti_verify.languages import definitions as D
 
         _write(project, "src/app.go",
@@ -252,7 +375,48 @@ class TestUnreadableSites:
                 {"file": "src/app.go", "site": "4", "callee": "execute",
                  "reason": "read by hand in review", "reviewed_by": "a.reviewer"}]),
             project)
+        assert not result.passed, result.details
+
+    def test_a_refusal_names_no_absolute_path(self, project):
+        """A verdict is submitted and stored. Every path it reports is
+        repository-relative, so a filesystem error contributes its reason
+        and never the checkout's location on the machine that ran it."""
+        import os
+
+        blocked = _write(project, "src/blocked.py", "x = 1\n")
+        os.chmod(blocked, 0o000)
+        try:
+            result = get_verifier("sink_default_deny").verify(_params(), project)
+        finally:
+            os.chmod(blocked, 0o644)
+        assert not result.passed, result.details
+        assert "src/blocked.py" in result.details
+        assert str(project) not in result.details
+        assert not any(part.startswith("/") and "/" in part[1:]
+                       for part in result.details.replace("'", " ").split()), result.details
+
+    def test_the_details_stay_inside_the_submitted_field_bound(self, project):
+        """One oversized result rejects the whole batch it is submitted in,
+        so the listing gives way and says how much it left out while the
+        counts stay complete."""
+        for i in range(400):
+            _write(project, f"src/mod{i}.py",
+                   "def go(conn, name):\n    conn.execute(name)\n")
+        result = get_verifier("sink_default_deny").verify(_params(), project)
+        assert not result.passed
+        assert len(result.details) <= 5000, len(result.details)
+        assert "not listed" in result.details
+        assert "violations=400" in result.details
+        assert result.facts["violations"] == 400
+
+    def test_a_passing_verdict_stays_inside_the_bound_on_a_wide_scope(self, project):
+        for i in range(600):
+            _write(project, f"src/mod{i}.py",
+                   "def go(conn):\n    conn.execute(\"SELECT 1\")\n")
+        result = get_verifier("sink_default_deny").verify(
+            _params(safe_forms=["literal"]), project)
         assert result.passed, result.details
+        assert len(result.details) <= 5000, len(result.details)
 
     def test_a_stale_exception_fails_the_run(self, project):
         result = get_verifier("sink_default_deny").verify(
@@ -289,7 +453,7 @@ class TestRunnerPlumbing:
         assert "src/db.py:2" in source
         assert "declared sinks: execute" in source
         assert "--- Facts (established by the mechanical tier) ---" in source
-        assert "parser per file: src/db.py=ast" in source
+        assert "parsers: 1 file(s); ast=1" in source
 
     def test_tier_2_refuses_a_witness_that_states_no_property(self, project):
         from mipiti_verify.runner import Runner

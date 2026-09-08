@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re2
 import sys
 from dataclasses import dataclass, field
@@ -115,6 +116,14 @@ def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024
 # never omissions.
 SCOPE_MAX_FILES = 5000
 SCOPE_MAX_FILE_SIZE = 2 * 1024 * 1024
+# The file count and each file's size bound one dimension each; their
+# product is what a run actually holds, since every file in scope is read
+# and parsed and every parse tree is live at once while the sink set is
+# closed over the whole scope. Without a bound on the total, a scope well
+# inside both other caps exhausts the machine and the job dies with no
+# verdict at all -- the one outcome a check that must refuse rather than
+# sample cannot produce.
+SCOPE_MAX_TOTAL_SIZE = 16 * 1024 * 1024
 
 _GLOB_CHARS = ("*", "?", "[")
 
@@ -128,53 +137,99 @@ def _scope_entry_is_safe(entry: str) -> bool:
     return all(segment != ".." for segment in text.split("/"))
 
 
+def _glob_search_root(entry: str) -> str:
+    """The leading segments of a pattern that carry no glob character.
+
+    This is the directory the pattern search starts from, and so the region
+    whose contents decide what the entry enumerates.
+    """
+    kept: list[str] = []
+    for segment in entry.split("/"):
+        if any(ch in segment for ch in _GLOB_CHARS):
+            break
+        kept.append(segment)
+    return "/".join(kept) or "."
+
+
+def _refuse_links_under(base: Path, root: Path, raw) -> None:
+    """Refuse when the region a scope entry searches holds any link.
+
+    A pattern walk does not descend through a linked directory, and a
+    linked file is content the tree does not own under that name, so a link
+    in the region means the enumeration is not the set the entry names.
+    The refusal is unconditional: whether the link would have matched is
+    not knowable from the pattern alone, and a guess in that direction is
+    an omission with nothing to report it.
+    """
+    if not base.exists() or not base.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        here = Path(dirpath)
+        for name in list(dirnames) + list(filenames):
+            path = here / name
+            if not path.is_symlink():
+                continue
+            try:
+                path.resolve().relative_to(root)
+            except (ValueError, OSError):
+                raise PathTraversalError(
+                    f"Scope entry follows a link out of the project root: {raw!r}")
+            try:
+                where = path.relative_to(root).as_posix()
+            except ValueError:  # pragma: no cover - base is inside root
+                where = name
+            raise ValueError(
+                f"Scope entry {raw!r} searches a region holding a link ({where}); "
+                f"a link is not read as content, so name the target's own path"
+            )
+
+
 def resolve_scope_files(
     project_root: Path,
     entries: list,
     *,
     max_files: int = SCOPE_MAX_FILES,
     max_size: int = SCOPE_MAX_FILE_SIZE,
+    max_total_size: int = SCOPE_MAX_TOTAL_SIZE,
 ) -> list[Path]:
     """Every regular file inside ``project_root`` that a list of scope
     entries names, sorted and de-duplicated, each safe to read.
 
     An entry is a repository-relative glob (``**`` recurses), a directory
-    (walked recursively) or a single file. A symlink inside the checkout is
-    passed over -- its target is read on its own when the scope names it --
-    and one pointing out of the checkout is refused, since its content
-    cannot be bound to this tree. An entry that is absolute or carries a
-    ``..`` segment, and a match that resolves outside the root, raise
-    :class:`PathTraversalError`. A file above ``max_size`` or a scope above
-    ``max_files`` raises :class:`ValueError`: the scope is too broad to
-    read soundly and must be narrowed, never sampled.
+    (walked recursively) or a single file. An entry that is absolute or
+    carries a ``..`` segment, and a match that resolves outside the root,
+    raise :class:`PathTraversalError`. A file above ``max_size``, a scope
+    above ``max_files``, and a scope whose files come to more than
+    ``max_total_size`` together all raise :class:`ValueError`: the scope is
+    too broad to read soundly and must be narrowed, never sampled.
+
+    A link anywhere in the region an entry searches is a refusal, whether
+    it is matched or not. Enumeration through links is not reliable -- a
+    pattern walk does not descend through a linked directory at all, and a
+    linked file names content under a path the tree does not own -- so a
+    link found in the region would otherwise leave the enumeration short
+    of what the entry names, with nothing to say so. The refusal names the
+    link; the scope names the target's own path instead.
     """
     root = project_root.resolve()
     out: dict[Path, None] = {}
+    total = 0
     for raw in entries:
         entry = str(raw or "").replace("\\", "/").strip()
         if not _scope_entry_is_safe(entry):
             raise PathTraversalError(f"Scope entry escapes or leaves the project root: {raw!r}")
         entry = entry.rstrip("/") or "."
         if any(ch in entry for ch in _GLOB_CHARS):
+            _refuse_links_under(project_root.joinpath(_glob_search_root(entry)), root, raw)
             candidates = project_root.glob(entry)
         else:
             base = safe_resolve_path(project_root, entry)
-            if base.is_dir() and not base.is_symlink():
+            if base.is_dir():
+                _refuse_links_under(base, root, raw)
                 candidates = base.rglob("*")
             else:
                 candidates = iter((base,))
         for p in candidates:
-            if p.is_symlink():
-                # A link is not content: its target is read on its own when
-                # the scope names it. A link OUT of the checkout is refused
-                # rather than skipped -- it would otherwise put content the
-                # run cannot bind to this tree inside a claim about it.
-                try:
-                    p.resolve().relative_to(root)
-                except (ValueError, OSError):
-                    raise PathTraversalError(
-                        f"Scope entry follows a link out of the project root: {raw!r}")
-                continue
             if not p.is_file():
                 continue
             resolved = p.resolve()
@@ -182,15 +237,23 @@ def resolve_scope_files(
                 resolved.relative_to(root)
             except ValueError:
                 raise PathTraversalError(f"Scope entry escapes project root: {raw!r}")
-            if resolved.stat().st_size > max_size:
+            size = resolved.stat().st_size
+            if size > max_size:
                 raise ValueError(
                     f"File in scope too large to read: {resolved.relative_to(root).as_posix()} "
                     f"(> {max_size} bytes); narrow the scope"
                 )
+            if resolved not in out:
+                total += size
             out[resolved] = None
             if len(out) > max_files:
                 raise ValueError(
                     f"Scope names more than {max_files} files; narrow it"
+                )
+            if total > max_total_size:
+                raise ValueError(
+                    f"Scope names more than {max_total_size} bytes of source "
+                    f"({len(out)} file(s) so far); narrow it"
                 )
     return sorted(out)
 

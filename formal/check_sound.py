@@ -10,7 +10,10 @@ makes the witness a lie.
 
 This checker states that direction over a grammar of small programs, one
 per construct the engine must see through, in Python (its own parser), a
-tree-sitter language and a hardware description language. Each program
+tree-sitter language and a hardware description language. The grammar is
+fixed: every program runs on every invocation. A build that cannot read one
+of the languages fails the checker rather than dropping its programs, so
+the verdict always covers the whole claim and never a subset of it. Each program
 declares its own ground truth -- the sites that are unsafe by
 construction -- and the checker asserts:
 
@@ -43,7 +46,6 @@ from typing import List, Tuple
 _ROOT = Path(os.path.dirname(os.path.abspath(__file__))).parent
 sys.path.insert(0, str(_ROOT / "src"))
 
-from mipiti_verify.languages.definitions import tree_sitter_available  # noqa: E402
 from mipiti_verify.verifiers.sound import (  # noqa: E402
     FEATURE_ALIASES,
     FEATURE_ASSIGN_SINKS,
@@ -139,6 +141,22 @@ def _cases() -> List[Case]:
              "safe_forms": ["literal", "parameter_binding"],
              "property": "Data is bound, never interpolated."},
             expect="pass",
+        ),
+        Case(
+            "python: a statement fragment beside a literal statement",
+            {"src/a.py": "def go(conn, tail):\n    conn.execute(\"SELECT 1\", \"UNION \" + tail)\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("execute")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "Data is bound, never interpolated."},
+            unsafe={"src/a.py:2"},
+        ),
+        Case(
+            "python: a bare name beside a literal statement is not bound data",
+            {"src/a.py": "def go(conn, rest):\n    conn.execute(\"SELECT 1\", rest)\n"},
+            {"scope": ["src/a.py"], "sinks": [_sink("execute")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "Data is bound, never interpolated."},
+            unsafe={"src/a.py:2"},
         ),
         Case(
             "python: a guarded keyword position",
@@ -309,110 +327,121 @@ def _cases() -> List[Case]:
         ),
     ]
 
-    if tree_sitter_available("javascript"):
-        cases += [
-            Case(
-                "javascript: a template literal with a substitution",
-                {"src/a.js": "function go(db, name) {\n  db.query(`SELECT ${name}`);\n}\n"},
-                {"scope": ["src/a.js"], "sinks": [_sink("query", positions=[0])],
-                 "safe_forms": ["literal", "literal_concat"],
-                 "property": "No statement is built from data."},
-                unsafe={"src/a.js:2"}, language="javascript",
-            ),
-            Case(
-                "javascript: a literal template",
-                {"src/a.js": "function go(db) {\n  db.query(`SELECT 1`);\n}\n"},
-                {"scope": ["src/a.js"], "sinks": [_sink("query", positions=[0])],
-                 "safe_forms": ["literal", "literal_concat"],
-                 "property": "No statement is built from data."},
-                expect="pass", language="javascript",
-            ),
-        ]
+    cases += [
+        Case(
+            "javascript: a template literal with a substitution",
+            {"src/a.js": "function go(db, name) {\n  db.query(`SELECT ${name}`);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("query", positions=[0])],
+             "safe_forms": ["literal", "literal_concat"],
+             "property": "No statement is built from data."},
+            unsafe={"src/a.js:2"}, language="javascript",
+        ),
+        Case(
+            "javascript: a literal template",
+            {"src/a.js": "function go(db) {\n  db.query(`SELECT 1`);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("query", positions=[0])],
+             "safe_forms": ["literal", "literal_concat"],
+             "property": "No statement is built from data."},
+            expect="pass", language="javascript",
+        ),
+        Case(
+            "javascript: values bound in an array beside a literal statement",
+            {"src/a.js": "function go(db, uid) {\n  db.query(\"SELECT ?\", [uid]);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("query")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "Data is bound, never interpolated."},
+            expect="pass", language="javascript",
+        ),
+        Case(
+            "javascript: a statement fragment beside a literal statement",
+            {"src/a.js": "function go(db, tail) {\n  db.query(\"SELECT 1\", \"UNION \" + tail);\n}\n"},
+            {"scope": ["src/a.js"], "sinks": [_sink("query")],
+             "safe_forms": ["literal", "parameter_binding"],
+             "property": "Data is bound, never interpolated."},
+            unsafe={"src/a.js:2"}, language="javascript",
+        ),
+    ]
 
-    if tree_sitter_available("rust"):
-        cases += [
-            Case(
-                "rust: a macro sink",
-                {"src/a.rs": "fn go(name: &str) {\n    query!(name);\n}\n"},
-                {"scope": ["src/a.rs"], "sinks": [_sink("query", kind="macro", positions=[0])],
-                 "safe_forms": ["literal"], "property": "Every statement is a literal."},
-                unsafe={"src/a.rs:2"}, language="rust",
-            ),
-        ]
+    cases += [
+        Case(
+            "rust: a macro sink",
+            {"src/a.rs": "fn go(name: &str) {\n    query!(name);\n}\n"},
+            {"scope": ["src/a.rs"], "sinks": [_sink("query", kind="macro", positions=[0])],
+             "safe_forms": ["literal"], "property": "Every statement is a literal."},
+            unsafe={"src/a.rs:2"}, language="rust",
+        ),
+    ]
 
-    if tree_sitter_available("go"):
-        cases += [
-            Case(
-                "go: a constant at the guarded position",
-                {"src/a.go": "package a\n\nconst Q = \"SELECT 1\"\n\n"
-                             "func Run(db *DB) {\n\tdb.Query(Q)\n}\n"},
-                {"scope": ["src/a.go"], "sinks": [_sink("Query", positions=[0])],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "Every statement is a constant."},
-                expect="pass", language="go",
-            ),
-            Case(
-                "go: a parameter at the guarded position",
-                {"src/a.go": "package a\n\nfunc Run(db *DB, name string) {\n\tdb.Query(name)\n}\n"},
-                {"scope": ["src/a.go"], "sinks": [_sink("Query", positions=[0])],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "Every statement is a constant."},
-                unsafe={"src/a.go:4"}, language="go",
-            ),
-        ]
+    cases += [
+        Case(
+            "go: a constant at the guarded position",
+            {"src/a.go": "package a\n\nconst Q = \"SELECT 1\"\n\n"
+                         "func Run(db *DB) {\n\tdb.Query(Q)\n}\n"},
+            {"scope": ["src/a.go"], "sinks": [_sink("Query", positions=[0])],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "Every statement is a constant."},
+            expect="pass", language="go",
+        ),
+        Case(
+            "go: a parameter at the guarded position",
+            {"src/a.go": "package a\n\nfunc Run(db *DB, name string) {\n\tdb.Query(name)\n}\n"},
+            {"scope": ["src/a.go"], "sinks": [_sink("Query", positions=[0])],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "Every statement is a constant."},
+            unsafe={"src/a.go:4"}, language="go",
+        ),
+    ]
 
-    if tree_sitter_available("systemverilog"):
-        cases += [
-            Case(
-                "systemverilog: a store to a named target from a literal",
-                {"rtl/a.sv": "module m (input logic clk);\n  logic [7:0] cfg_reg;\n"
-                             "  always_ff @(posedge clk) begin\n    cfg_reg <= 8'h00;\n"
-                             "  end\nendmodule\n"},
-                {"scope": ["rtl/a.sv"], "sinks": [_sink("cfg_reg", kind="assign")],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "The configuration register takes only constants."},
-                expect="pass", language="systemverilog",
-            ),
-            Case(
-                "systemverilog: a store to a named target from a signal",
-                {"rtl/a.sv": "module m (input logic clk, input logic [7:0] key_in);\n"
-                             "  logic [7:0] cfg_reg;\n"
-                             "  always_ff @(posedge clk) begin\n    cfg_reg <= key_in;\n"
-                             "  end\nendmodule\n"},
-                {"scope": ["rtl/a.sv"], "sinks": [_sink("cfg_reg", kind="assign")],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "The configuration register takes only constants."},
-                unsafe={"rtl/a.sv:4"}, needs=(FEATURE_ASSIGN_SINKS,), language="systemverilog",
-            ),
-            Case(
-                "systemverilog: an instantiation port driven by a signal",
-                {"rtl/a.sv": "module m (input logic clk, input logic [7:0] key_in);\n"
-                             "  aes_core u_aes (.clk(clk), .key_in(key_in));\n"
-                             "endmodule\n"},
-                {"scope": ["rtl/a.sv"], "sinks": [_sink("aes_core", kind="instantiate",
-                                                        positions=["key_in"])],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "The key port is tied to a constant."},
-                unsafe={"rtl/a.sv:2"}, language="systemverilog",
-            ),
-        ]
+    cases += [
+        Case(
+            "systemverilog: a store to a named target from a literal",
+            {"rtl/a.sv": "module m (input logic clk);\n  logic [7:0] cfg_reg;\n"
+                         "  always_ff @(posedge clk) begin\n    cfg_reg <= 8'h00;\n"
+                         "  end\nendmodule\n"},
+            {"scope": ["rtl/a.sv"], "sinks": [_sink("cfg_reg", kind="assign")],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "The configuration register takes only constants."},
+            expect="pass", language="systemverilog",
+        ),
+        Case(
+            "systemverilog: a store to a named target from a signal",
+            {"rtl/a.sv": "module m (input logic clk, input logic [7:0] key_in);\n"
+                         "  logic [7:0] cfg_reg;\n"
+                         "  always_ff @(posedge clk) begin\n    cfg_reg <= key_in;\n"
+                         "  end\nendmodule\n"},
+            {"scope": ["rtl/a.sv"], "sinks": [_sink("cfg_reg", kind="assign")],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "The configuration register takes only constants."},
+            unsafe={"rtl/a.sv:4"}, needs=(FEATURE_ASSIGN_SINKS,), language="systemverilog",
+        ),
+        Case(
+            "systemverilog: an instantiation port driven by a signal",
+            {"rtl/a.sv": "module m (input logic clk, input logic [7:0] key_in);\n"
+                         "  aes_core u_aes (.clk(clk), .key_in(key_in));\n"
+                         "endmodule\n"},
+            {"scope": ["rtl/a.sv"], "sinks": [_sink("aes_core", kind="instantiate",
+                                                    positions=["key_in"])],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "The key port is tied to a constant."},
+            unsafe={"rtl/a.sv:2"}, language="systemverilog",
+        ),
+    ]
 
-    if tree_sitter_available("vhdl"):
-        cases += [
-            Case(
-                "vhdl: a signal assignment from a declared constant",
-                {"rtl/a.vhd": "library ieee;\nuse ieee.std_logic_1164.all;\n\n"
-                              "entity guard is\n  port (clk : in std_logic);\nend entity;\n\n"
-                              "architecture rtl of guard is\n"
-                              "  constant DEFAULT : std_logic_vector(7 downto 0) := \"00000000\";\n"
-                              "  signal cfg_reg : std_logic_vector(7 downto 0);\n"
-                              "begin\n  cfg_reg <= DEFAULT;\nend architecture;\n"},
-                {"scope": ["rtl/a.vhd"], "sinks": [_sink("cfg_reg", kind="assign")],
-                 "safe_forms": ["literal", "named_constant"],
-                 "property": "The configuration register takes only constants."},
-                expect="pass", language="vhdl",
-            ),
-        ]
+    cases += [
+        Case(
+            "vhdl: a signal assignment from a declared constant",
+            {"rtl/a.vhd": "library ieee;\nuse ieee.std_logic_1164.all;\n\n"
+                          "entity guard is\n  port (clk : in std_logic);\nend entity;\n\n"
+                          "architecture rtl of guard is\n"
+                          "  constant DEFAULT : std_logic_vector(7 downto 0) := \"00000000\";\n"
+                          "  signal cfg_reg : std_logic_vector(7 downto 0);\n"
+                          "begin\n  cfg_reg <= DEFAULT;\nend architecture;\n"},
+            {"scope": ["rtl/a.vhd"], "sinks": [_sink("cfg_reg", kind="assign")],
+             "safe_forms": ["literal", "named_constant"],
+             "property": "The configuration register takes only constants."},
+            expect="pass", language="vhdl",
+        ),
+    ]
     return cases
 
 
