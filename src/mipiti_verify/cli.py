@@ -1326,6 +1326,15 @@ def attest_allowlist_review(allowlist_path: str, project_root: str, commit: str,
                     "layouts, e.g. '^specs/'."))
 @click.option("--concurrency", default=1, type=int, help="Max concurrent Tier 2 LLM calls (default: 1, sequential). Tune based on your API rate limits.")
 @click.option("--tier2-consistency-n", default=None, type=int, help="Tier-2 self-consistency: number of judgments per fresh evidence; a PASS requires all N to agree (default 3, or MIPITI_TIER2_CONSISTENCY_N).")
+@click.option(
+    "--rejudge", "rejudge", multiple=True, metavar="ASSERTION_ID",
+    help=(
+        "Judge this assertion again even though a stored verdict matches its "
+        "evidence. Repeatable. Use it when a verdict was reached on judgments "
+        "that disagreed and you want another reading without editing the "
+        "evidence. There is deliberately no form that names every assertion: "
+        "one in a CI configuration would re-judge the whole suite on every "
+        "run, and a verdict settled by repetition is not settled by evidence."))
 @click.option("--component", "component_id", default=None, help="Component ID to scope verification (only verify assertions for controls in this component). Auto-detect from git remote if not specified.")
 @click.option(
     "--component-path/--no-component-path",
@@ -1366,6 +1375,7 @@ def run(
     test_file_pattern: str | None,
     concurrency: int,
     tier2_consistency_n: int | None,
+    rejudge: tuple,
     component_id: str | None,
     auto_component_path: bool,
 ) -> None:
@@ -1451,6 +1461,7 @@ def run(
             test_file_pattern=test_file_pattern,
             concurrency=concurrency,
             tier2_consistency_n=tier2_consistency_n,
+            rejudge=frozenset(rejudge or ()),
             component_id=component_id,
             auto_component_path=auto_component_path,
         )
