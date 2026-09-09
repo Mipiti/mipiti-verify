@@ -160,6 +160,37 @@ def _glob_search_root(entry: str) -> str:
     return "/".join(kept) or "."
 
 
+def _refuse_link_on_the_entry(root: Path, entry: str, raw) -> None:
+    """Refuse when the entry's OWN path is, or passes through, a link.
+
+    ``_refuse_links_under`` walks the region an entry searches and refuses a
+    link found inside it. It cannot see a link at the TOP of the entry, because
+    the base it is handed has already been resolved — and a resolved link is
+    indistinguishable from a real directory by then. So an entry naming a link
+    enumerates the target's tree while the scope still reads as the name that
+    was declared, which is the one thing a declared scope has to mean.
+
+    Checked segment by segment from the project root down, so a link anywhere
+    along the entry is refused and not only one at its end.
+    """
+    here = root
+    for segment in entry.split("/"):
+        if not segment or segment == ".":
+            continue
+        here = here / segment
+        if here.is_symlink():
+            try:
+                where = here.relative_to(root).as_posix()
+            except ValueError:  # pragma: no cover - built from root downward
+                where = segment
+            raise ValueError(
+                f"Scope entry {raw!r} names a link ({where}); a link is not read "
+                f"as content, so name the target's own path"
+            )
+        if not here.exists():
+            return
+
+
 def _refuse_links_under(base: Path, root: Path, raw) -> None:
     """Refuse when the region a scope entry searches holds any link.
 
@@ -169,6 +200,10 @@ def _refuse_links_under(base: Path, root: Path, raw) -> None:
     The refusal is unconditional: whether the link would have matched is
     not knowable from the pattern alone, and a guess in that direction is
     an omission with nothing to report it.
+
+    This covers links INSIDE the region. A link at the top of the entry is
+    ``_refuse_link_on_the_entry``'s job, and has to be asked first: the base
+    handed here is already resolved.
     """
     if not base.exists() or not base.is_dir():
         return
@@ -229,9 +264,13 @@ def resolve_scope_files(
             raise PathTraversalError(f"Scope entry escapes or leaves the project root: {raw!r}")
         entry = entry.rstrip("/") or "."
         if any(ch in entry for ch in _GLOB_CHARS):
+            # The entry's own leading path first: resolving it would turn a
+            # link into a directory nothing downstream can tell apart.
+            _refuse_link_on_the_entry(project_root, _glob_search_root(entry), raw)
             _refuse_links_under(project_root.joinpath(_glob_search_root(entry)), root, raw)
             candidates = project_root.glob(entry)
         else:
+            _refuse_link_on_the_entry(project_root, entry, raw)
             base = safe_resolve_path(project_root, entry)
             if base.is_dir():
                 _refuse_links_under(base, root, raw)

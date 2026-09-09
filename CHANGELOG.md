@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A scope entry that is itself a link, or that passes through one, is refused
+  the same way a link inside the searched region already was. The check runs
+  before the path is resolved, because resolution is where a link stops being
+  distinguishable from a real directory — after it the walk enumerates the
+  target's tree while the scope still reads as the name that was declared. A
+  declared scope has to name the tree that was read.
+
 - Formal checks in CI take a third of the time. `audit_bundle_bind.cfg`
   and `audit_main_orphan_legacy.cfg` are split per `key_source` class
   (`audit_bind_*.cfg`, `audit_main_orphan.cfg`, `audit_main_legacy.cfg`),

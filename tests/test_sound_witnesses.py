@@ -177,6 +177,46 @@ class TestScope:
         with pytest.raises(ValueError, match="link"):
             resolve_scope_files(project, ["src"])
 
+    def test_an_entry_that_IS_a_linked_directory_is_refused(self, project):
+        """The sibling tests put a link INSIDE the region an entry searches.
+        This one puts it at the top of the entry, which is where a resolved
+        path stops being distinguishable from a real directory — so the walk
+        enumerates the target's tree while the scope still reads as the name
+        that was declared, and a declared scope naming one tree while another
+        was read is the one thing it must not do."""
+        (project / "other").mkdir()
+        _write(project, "other/bad.py", "def go(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        (project / "linked_src").symlink_to(project / "other", target_is_directory=True)
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["linked_src"])
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["linked_src/**/*.py"])
+
+    def test_an_entry_that_IS_a_linked_file_is_refused(self, project):
+        (project / "other").mkdir()
+        _write(project, "other/bad.py", "def go(conn, u):\n    conn.execute(\"SELECT \" + u)\n")
+        (project / "shortcut.py").symlink_to(project / "other" / "bad.py")
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["shortcut.py"])
+
+    def test_a_link_anywhere_along_the_entry_is_refused_not_only_at_its_end(self, project):
+        """A middle segment resolves just as silently as a final one."""
+        (project / "other" / "deep").mkdir(parents=True)
+        _write(project, "other/deep/x.py", "x = 1\n")
+        (project / "hop").symlink_to(project / "other", target_is_directory=True)
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["hop/deep"])
+        with pytest.raises(ValueError, match="link"):
+            resolve_scope_files(project, ["hop/deep/**/*.py"])
+
+    def test_a_real_directory_of_the_same_shape_still_resolves(self, project):
+        """So the refusals above are about the link, not about the shape of
+        the entry — otherwise every one of them would pass on a broken walk."""
+        (project / "plain").mkdir()
+        _write(project, "plain/ok.py", "y = 2\n")
+        assert [p.name for p in resolve_scope_files(project, ["plain"])] == ["ok.py"]
+        assert [p.name for p in resolve_scope_files(project, ["plain/**/*.py"])] == ["ok.py"]
+
     def test_a_link_out_of_the_checkout_is_refused(self, project, tmp_path):
         outside = tmp_path.parent / "outside_target.py"
         outside.write_text("x = 1\n", encoding="utf-8")
