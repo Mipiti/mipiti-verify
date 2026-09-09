@@ -17,6 +17,26 @@ from ._common import Runner, run_command, tail, which
 
 CHECK_TIMEOUT = 600
 
+# Marks the one reason that is an ANSWER from the toolchain: it ran, it read
+# the tree, and it rejected it. Every other reason a check returns -- an
+# absent tool, no project file above the source, a timeout, a tool that
+# could not be started -- is the absence of an answer. A caller that treats
+# a refusal as proof of anything must be able to tell the two apart without
+# reading prose, so the answer carries this marker and nothing else does.
+TOOLCHAIN_REJECTED = "rejected by the toolchain: "
+
+
+def rejected_by_toolchain(reason: str) -> bool:
+    """Whether a check's reason is the toolchain's own rejection of the
+    tree, rather than a report that the check could not be made."""
+    return reason.startswith(TOOLCHAIN_REJECTED)
+
+
+def without_rejection_marker(reason: str) -> str:
+    """The reason as prose, for a caller that has already said which of the
+    two cases it is in."""
+    return reason[len(TOOLCHAIN_REJECTED):] if rejected_by_toolchain(reason) else reason
+
 
 def _nearest(project_root: Path, rel_file: str, marker_names: tuple[str, ...]) -> Optional[Path]:
     """The closest directory at or above ``rel_file`` (bounded by the
@@ -37,7 +57,7 @@ def _run(argv: list[str], cwd: Path, runner: Optional[Runner], env: Optional[dic
     if note:
         return f"{argv[0]}: {note}"
     if code != 0:
-        return f"{' '.join(argv[:2])} failed: {tail(err or out)}"
+        return f"{TOOLCHAIN_REJECTED}{' '.join(argv[:2])} failed: {tail(err or out)}"
     return ""
 
 

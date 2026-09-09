@@ -9,10 +9,10 @@ from __future__ import annotations
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, resolve_file_content
+from . import SOUNDNESS_PRESENCE, PathTraversalError, VerifierResult, register, resolve_file_content
 
 
-@register("parameter_validated")
+@register("parameter_validated", soundness=SOUNDNESS_PRESENCE)
 class ParameterValidatedVerifier:
     """Tier 1: Check function exists and references the parameter name."""
 
@@ -43,7 +43,7 @@ class ParameterValidatedVerifier:
         )
 
 
-@register("error_handled")
+@register("error_handled", soundness=SOUNDNESS_PRESENCE)
 class ErrorHandledVerifier:
     """Tier 1: Check function has error handling constructs."""
 
@@ -88,7 +88,7 @@ class ErrorHandledVerifier:
         )
 
 
-@register("middleware_registered")
+@register("middleware_registered", soundness=SOUNDNESS_PRESENCE)
 class MiddlewareRegisteredVerifier:
     """Tier 1: Check middleware name appears in file."""
 
@@ -123,7 +123,7 @@ class MiddlewareRegisteredVerifier:
         )
 
 
-@register("http_header_set")
+@register("http_header_set", soundness=SOUNDNESS_PRESENCE)
 class HttpHeaderSetVerifier:
     """Tier 1: Check HTTP header name appears in file."""
 

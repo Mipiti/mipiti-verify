@@ -6,7 +6,17 @@ import json
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, RegexTimeoutError, VerifierResult, register, resolve_file_content, safe_read_file, safe_regex_search, safe_resolve_path
+from . import (
+    SOUNDNESS_PRESENCE,
+    PathTraversalError,
+    RegexTimeoutError,
+    VerifierResult,
+    register,
+    resolve_file_content,
+    safe_read_file,
+    safe_regex_search,
+    safe_resolve_path,
+)
 
 
 def _parse_config(project_root: Path, file_param: str) -> dict | None:
@@ -103,7 +113,7 @@ def _nested_get(d: dict, key: str):
     return current
 
 
-@register("config_key_exists")
+@register("config_key_exists", soundness=SOUNDNESS_PRESENCE)
 class ConfigKeyExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -123,7 +133,7 @@ class ConfigKeyExistsVerifier:
         return VerifierResult(passed=False, details=f"Config key '{key}' not found in {params['file']}")
 
 
-@register("config_value_matches")
+@register("config_value_matches", soundness=SOUNDNESS_PRESENCE)
 class ConfigValueMatchesVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -150,7 +160,7 @@ class ConfigValueMatchesVerifier:
         return VerifierResult(passed=False, details=f"Config '{key}' = '{value}' does not match pattern '{pattern}'")
 
 
-@register("env_var_referenced")
+@register("env_var_referenced", soundness=SOUNDNESS_PRESENCE)
 class EnvVarReferencedVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:

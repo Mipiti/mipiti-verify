@@ -90,6 +90,21 @@ mipiti-verify attest-reach --pair tests/test_auth.py::test_token_required=app/au
 
 `attest-tests` reads the report your test step wrote and signs it; it runs nothing. `attest-dependence` and `attest-reach` are the two opt-in commands that **run tests**: each named test once, with its mechanism disabled (does the test fail without it?) or alone under coverage (which lines of the mechanism's file does it execute?). Both go through the project's runner adapter (pytest, jest, vitest, mocha, go, cargo, maven, gradle, dotnet, rspec, phpunit, or a `--run-cmd` for simulators; `--suite-cmd` + `--suite-junit` for a harness that runs everything at once) and belong in the job that already runs your tests. See [Test-result attestations](#test-result-attestations-test_attested) and [Runners](#runners).
 
+### `attest-construction` / `attest-allowlist-review` — Record what only your build can settle
+
+```bash
+mipiti-verify attest-construction --boundary-type SafeSql --probe probes/safe_sql_from_variable.rs
+mipiti-verify attest-allowlist-review --allowlist allowlist.json
+```
+
+Two facts a sound witness cannot establish by reading the repository, signed with the same identity ladder as every other statement.
+
+`attest-construction` compiles each probe and records the ones the toolchain REFUSED. A probe builds the boundary type from something that is not a literal; a compiler that rejects it is evidence the type cannot be produced another way, which name-based construction tracking can only assume. A probe that compiles means the type does not constrain what reaches it: the command exits non-zero and writes nothing. A probe the toolchain never answered on — no tool installed, no project file above the source, a command that would not start or ran out of time — is an absent answer, not a refusal: it is reported as such and nothing is signed. Nothing is executed — a probe is compiled, never run. Use `--build-cmd '<command> {file}'` for a toolchain the built-in checks cannot drive.
+
+`attest-allowlist-review` records the reviewed exceptions and who stands behind them at this commit. The reasons already travel inside the evidence hash; what the repository cannot carry is a signed reviewer. Every entry must name a file, a site, a callee, a reason and a reviewer.
+
+Neither statement changes a verdict. Each replaces "taken on the author's word" with "recorded in a signed statement" in the facts a reader sees.
+
 ## Audit Envelope Contract
 
 What an auditor running `mipiti-verify audit <report>` actually verifies, and what each check does (or doesn't) defend against. The contract is what makes the verifier defensible without trusting the platform: every claim the audit reports is anchored in either a public-anchor cryptographic chain or an auditor-supplied pin.
@@ -367,7 +382,7 @@ Coverage formats accepted by `--coverage`: coverage.py JSON (`coverage json`; wi
 
 **Tier 2 reads the closure.** For a `test_attested` review the reviewer is handed the test's definition from the checkout, the named mechanism's definition, and a facts block (definition hash match, reached, fails without). The criterion is YES only if the test as shown exercises the mechanism and asserts the stated outcome; a fact of `reached: no` or `fails without mechanism: no` is a NO whatever the test text says.
 
-**Never skipped under `--changed-files`.** Test-backed assertions (`test_attested`, `test_exists`, and `function_exists` / `class_exists` whose file is a test file) are always verified, in both tiers, when `--changed-files` is set: a test's subject is the code it exercises, so its own file being unchanged says nothing about the claim. A test file is recognised by layout (`tests/`, `test/`, `__tests__/`, `test_*`, `conftest*`, `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`); repositories whose tests live outside the conventional layouts, e.g. `specs/auth.py`, add `--test-file-pattern '<regex>'` (also `MIPITI_TEST_FILE_PATTERN`), which marks additional repository-relative paths in addition to the heuristic.
+**Never skipped under `--changed-files`.** An assertion whose evidence is a signed execution witness (`test_attested`), one that names no file at all (a glob such as `test_exists`, or a `scope` such as the sound witnesses), and one whose file is a test file (`function_exists` / `class_exists`) are always verified, in both tiers, when `--changed-files` is set: what a test evidences is the code it exercises, so its own file being unchanged says nothing about the claim, and a claim over a glob or a scope is not scoped by a file list at all. A test file is recognised by layout (`tests/`, `test/`, `__tests__/`, `test_*`, `conftest*`, `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`); repositories whose tests live outside the conventional layouts, e.g. `specs/auth.py`, add `--test-file-pattern '<regex>'` (also `MIPITI_TEST_FILE_PATTERN`), which marks additional repository-relative paths in addition to the heuristic.
 
 ```yaml
       - run: pytest --junitxml=report.xml --cov --cov-context=test && coverage json --show-contexts -o coverage.json
@@ -595,16 +610,45 @@ mipiti-verify attest-reach --run-cmd 'make -C sim run TEST={test}' \
 
 ## Two-Tier Verification
 
-**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->28<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls. No assertion type executes project code:
-- `function_exists`, `class_exists`, `decorator_present`, `function_calls`
-- `pattern_matches`, `pattern_absent`, `import_present`
-- `file_exists`, `file_hash`
-- `config_key_exists`, `config_value_matches`
-- `dependency_exists`, `dependency_version`
-- `test_attested`, `test_exists`
-- `env_var_referenced`, `error_handled`
-- `no_plaintext_secret`, `middleware_registered`, `http_header_set`
-- `module_exists`, `module_instantiated`, `port_exists`, `parameter_defined`, `signal_exists`, `sva_assertion_present`, `register_reset` (RTL/Verilog)
+**Tier 1 (Mechanical)** — <!--ASSERTION_TYPE_COUNT-->30<!--/ASSERTION_TYPE_COUNT--> typed assertion checks, deterministic code analysis, no external API calls. No assertion type executes project code.
+
+Every type declares the CLASS of fact its verdict reports. The class is a property of the check, not of the wording of the claim it is attached to, and it is what decides whether a pass can carry a claim about every case or only about the case it saw:
+
+| Soundness class | What a pass reports | Types |
+| --- | --- | --- |
+| `presence` | A named construct, configuration value, dependency, file or pattern occurrence exists in the tree. Existence, not behaviour: a test FILE existing is presence. | `function_exists`, `class_exists`, `decorator_present`, `function_calls`, `import_present`, `file_exists`, `file_hash`, `config_key_exists`, `config_value_matches`, `env_var_referenced`, `dependency_exists`, `dependency_version`, `parameter_validated`, `error_handled`, `middleware_registered`, `http_header_set`, `test_exists`, `module_exists`, `module_instantiated`, `port_exists`, `parameter_defined`, `signal_exists`, `sva_assertion_present`, `register_reset` |
+| `under_approximating_scan` | A syntactic scan over a subject, with no false-positive guarantee. A clean scan proves the absence of the syntactic form, and nothing more. | `pattern_matches`, `pattern_absent`, `no_plaintext_secret` |
+| `existential_witness` | A signed statement that a named execution ran and passed at this commit. It proves the path it drove, not any other path. | `test_attested` |
+| `sound_over_approximation` | Every site in a declared scope that could violate the property was enumerated, and each is a declared safe form or a reviewed exception. Sound modulo the declared sink list. | `sink_default_deny` |
+| `by_construction` | The sink accepts only a declared boundary type, and every construction site of that type is itself default-denied. | `typed_boundary` |
+
+The RTL and hardware types (`module_exists` through `register_reset`) read Verilog, SystemVerilog and VHDL; the two sound witnesses read those languages through the same rules as software sources.
+
+### Sound witnesses (`sink_default_deny`, `typed_boundary`)
+
+These two are the only types whose pass is a statement about EVERY site in a scope rather than about one place. They take no `file`: their subject is a `scope` of repository-relative paths, directories or globs.
+
+`sink_default_deny` — over every source file in `scope`, every site of a declared sink receives, at each guarded position, only a form the declared `safe_forms` vocabulary accepts, or is an allowlisted site with a reviewed reason. A sink is a call, a constructor, a macro invocation, a store to a named target (an HDL blocking or non-blocking assignment, a field store) or a module instantiation. The accepted forms are `literal`, `named_constant` (a name bound once at module, class or package scope to a literal, or an HDL parameter, localparam or constant), `literal_concat` (every operand safe; a template with any expression part is a violation) and `parameter_binding` (a data structure written at the site — an array, list, tuple, map or dictionary literal — every element of which is itself one of the accepted forms; decided from the value and its elements, never from the position it sits in).
+
+`typed_boundary` — every guarded sink position receives a value whose static form is a construction of `boundary_type` through one of the declared `constructors`, and every construction site of that type in scope receives only literal or named-constant arguments, or is allowlisted.
+
+A verdict of either type reports, beside the pass or fail, how many sites of the declared sinks the run decided and how many of those stand on a reviewed exception rather than on a form it admitted. A claim about every site is worth exactly what the enumeration behind it is worth, so the run states the size of that enumeration as data a reader can act on rather than as a sentence a reader has to trust. Every run of these types states both, a refused one included: a run that decided nothing reports nothing decided, so a later run is never read against an earlier run's numbers. Neither is ever read from the assertion — a count of what a run examined is a fact only that run holds — and a check that enumerates no scope states neither.
+
+What makes the verdict worth something is what the check REFUSES:
+
+- A scope that matches nothing, a file it cannot read, a file whose extension names no language, a file the language's parser rejects, and a file in a language this install has no parser for are all failures. A pass never comes from an empty enumeration, and never from a search that saw a name without seeing what was handed to it. Reading a language other than Python needs the parsers: install `mipiti-verify[ast]` (the GitHub Action image already carries them). The refusal names the remedy.
+- A link anywhere in the region a scope entry searches is a refusal, matched or not: a pattern walk does not descend through a linked directory, and a linked file names content under a path the tree does not own, so an enumeration that met one would be short of what the entry names with nothing to say so. Name the target's own path.
+- A scope whose files come to more than 16 MiB together is a refusal, as is one over 5,000 files or holding a file over 2 MiB. Every file in scope is read and parsed at once, so a scope inside the other caps can still be more than a run can hold; that arrives as "narrow it", never as a killed job.
+- A chain of functions forwarding into a declared sink deeper than 12 hops is a refusal: the sink set had not closed over the scope when the budget ran out, and an unclosed sink set means sites that were never enumerated. Declare the outermost of them in `wrappers`.
+- Every site it could not classify counts as a violation. Reflection, dynamic evaluation, a macro body naming a sink, a shell invocation built from a variable, and a sink handed on as a value are violations too.
+- Aliases (an import alias, a rebinding), and wrappers in scope that forward a parameter into a guarded position, are sinks themselves, found by a fixpoint over the scope. Wrappers the check cannot see are declared in `wrappers`.
+- An allowlist entry must name a file, a site, a callee, a reason and a reviewer, and must match a site the check actually flagged. A stale entry fails the run, and the allowlist content is inside the evidence hash, so editing it reopens review. An exception excepts a site the run examined, so the list cannot be longer than the sites in scope, and a run whose every flagged site is an exception — with nothing anywhere in the scope admitted by form — has decided nothing mechanically and is a refusal, as vacuous as a scope the declared sinks never occur in.
+
+`parameter_binding` is decided by what the structure was written with, because an element of a structure reaches the callee as surely as a value at the position does: a structure holding an interpolation, a name that is not a constant, a call or another structure is a violation, and so is one no element could be read from. Whether a callee treats such a value as data or as the statement it runs is a property of the callee, which this check does not read — the same boundary every other form stops at — so a sink that takes bound values in a later argument is declared by naming the statement position in `positions`, which leaves the data positions unguarded.
+
+The residual, stated in the result and reviewed by tier 2, is the sink list itself: a sink reached under a name that appears in neither `sinks` nor `wrappers` is not enumerated. Tier 2 is shown the inventory the mechanical tier built — every site with each argument's static form, every undeclared call into the sinks' receivers, every allowlisted site with its reason, and how many files each parser read — and answers whether the declared sinks are the sinks through which the stated `property` could be violated in that code. It never re-scans.
+
+Two optional signed statements upgrade the two residuals the repository content cannot settle on its own: `attest-construction` records that your toolchain refuses a probe that builds the boundary type from a non-literal, and `attest-allowlist-review` records who stands behind the reviewed exceptions at this commit. Neither changes the verdict; both are stated in the facts a reader sees.
 
 **Tier 2 (Semantic)** — AI evaluates whether matched code actually implements the control's intent. Supports OpenAI, Anthropic, and Ollama (local).
 

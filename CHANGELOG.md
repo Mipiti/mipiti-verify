@@ -9,6 +9,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Two assertion types whose pass is a statement about EVERY site in a declared
+  scope rather than about one place. `sink_default_deny`: over every source
+  file in `scope`, every site of a declared sink receives, at each guarded
+  position, only a form the declared `safe_forms` vocabulary accepts, or is an
+  allowlisted site with a reviewed reason. `typed_boundary`: every guarded sink
+  position receives a value built through a declared constructor of
+  `boundary_type`, and every construction site of that type takes only literal
+  or named-constant arguments. A sink is a call, a constructor, a macro
+  invocation, a store to a named target or a module instantiation, so a
+  hardware description is read by the same rules as a software source
+  (Verilog, SystemVerilog and VHDL alongside Python, JavaScript, TypeScript,
+  Go, Rust, Java, Kotlin, C, C++, C#, Ruby, PHP and Swift).
+
+  What makes the verdict worth something is what the check refuses. A pass is
+  returned only when every site in the declared scope was examined and each
+  one proved safe, so everything that leaves a part of the scope unexamined is
+  a refusal: a scope that matches nothing; a file it cannot read, whose
+  extension names no language, that the parser rejects, or in a language this
+  install has no parser for (reading a language other than Python needs the
+  `ast` extra; the refusal names it); a link anywhere in the region an entry
+  searches, matched or not, since a pattern walk does not descend through a
+  linked directory and a linked file names content under a path the tree does
+  not own; a scope over 5,000 files, over 2 MiB in one file, or over 16 MiB in
+  total, all of which arrive as "narrow it" rather than as a job the machine
+  killed; and a chain of functions forwarding into a sink deeper than 12 hops,
+  where the sink set had not closed when the budget ran out. Every site it
+  could not classify counts as a violation, as does reflection, dynamic
+  evaluation, a macro body naming a sink, a shell invocation built from a
+  variable, and a sink handed on as a value. Import and assignment aliases,
+  and in-scope wrappers that forward a parameter into a guarded position, are
+  sinks themselves, closed to a fixpoint. An allowlist entry must name a file,
+  a site, a callee, a reason and a reviewer and must match a site the check
+  actually flagged; a stale entry fails the run, the allowlist content sits
+  inside the evidence hash so editing it reopens review, and no entry
+  suppresses a scope or parse refusal. An exception excepts a site the run
+  examined, so the list cannot be longer than the sites in scope, and a run
+  whose every flagged site is an exception -- with nothing anywhere in the
+  scope admitted by form -- has decided nothing mechanically and is refused
+  as vacuous. A safe form is decided from the value and never from where it
+  sits: `parameter_binding` names a data structure written at the site every
+  element of which is itself an admitted form, so a structure holding an
+  interpolation, a name that is not a constant, a call or another structure
+  is a violation, and so is one no element could be read from. What a callee
+  does with a value it accepts is a property of the callee and is not read,
+  so a sink taking bound values in a later argument is declared by naming the
+  statement position in `positions`, which leaves the data positions
+  unguarded. The one residual -- a
+  sink reached under a name in neither `sinks` nor `wrappers` -- is stated in
+  the result and is what the semantic tier reviews, over the inventory the
+  mechanical tier built rather than by re-scanning.
+
+  A verdict's details carry the counts, the refusal reasons and a per-parser
+  file count, and stay inside the size a result may be submitted at whatever
+  the submission holds: a per-site listing beyond that budget is dropped with
+  a line saying how many were left out, a refusal states its first reasons
+  and then how many it did not list, and the whole string is cut to the bound
+  as a last resort, so one oversized row can never reject the batch it
+  travels in. The counts stay complete. Paths in a verdict are
+  repository-relative, so a filesystem error contributes its reason and never
+  the checkout's location on the machine that ran it. Within one invocation a
+  scope is read and parsed once for both the verdict and the inventory the
+  semantic tier is shown.
+
+  Two of those counts travel further than the details. How many sites of the
+  declared sinks a run decided, and how many of those stand on a reviewed
+  exception rather than on a form it admitted, are reported as data on the
+  submitted result of every tier-1 run of these two types. A claim about every
+  site in a scope is worth what its enumeration is worth, so a reader deciding
+  whether to rely on one is handed the size of it rather than a sentence to
+  take on trust. A refused run states them too -- a run that examined nothing
+  reports nothing examined, so an earlier run's numbers can never stand in for
+  a later run that established none -- and neither number is ever read from
+  the assertion, since a count of what a run examined is a fact only that run
+  holds. Every other type states neither: absent is not zero, it is a question
+  that run did not answer.
+
+- `attest-construction` and `attest-allowlist-review`: two signed statements
+  for the facts a repository cannot settle on its own. The first compiles
+  probes that build a boundary type from something that is not a literal and
+  records the ones the toolchain refused (a probe that compiles writes
+  nothing and exits non-zero; probes are compiled, never run). The second
+  records the reviewed exceptions and who stands behind them at this commit.
+  A probe the toolchain never answered on -- no tool installed, no project
+  file above the source, a command that would not start or ran out of time --
+  is reported as an absent answer and signs nothing, since only the
+  toolchain's own rejection of a probe is evidence about the type.
+  Neither changes a verdict; each replaces "on the author's word" with "in a
+  signed statement" in the facts a reader sees. Both kinds are declared in
+  `schemas/test-result-v1.schema.json`, and neither evidences that a test ran.
+
+- Every assertion type now declares the CLASS of fact its verdict reports --
+  `presence`, `under_approximating_scan`, `existential_witness`,
+  `sound_over_approximation` or `by_construction` -- at the one place the type
+  is registered, so no reader infers strength from a type's name, its
+  parameters or a file path. A test file existing, and a symbol inside one,
+  are `presence`: they prove something exists, never that it ran. The
+  vocabulary and the per-type class are held equal to the assertion-type
+  catalogue by `formal/check_types.py` (T5, T7), which also holds the sink
+  vocabulary equal across the two declarations (T8: the safe forms and the
+  sink kinds, each put through the engine's own params reader), and
+  `formal/check_sound.py` proves over a grammar of programs that the sound
+  engine's flagged set contains every unsafe site, self-validating that each
+  of its enumeration features is load-bearing and naming the programs it
+  refuses on purpose -- those whose safety would rest on a fact about the
+  callee -- so a build that started passing one would fail the checker.
+
+- A `mechanism_found` fact on a `test_attested` result, and in the facts block
+  the semantic tier is shown: whether the named mechanism resolves to a
+  definition in the checkout. A mechanism that cannot be located leaves every
+  claim about it unresolvable, which now reads as a stated fact rather than as
+  two unexplained unknowns.
+
+- Pattern matching in the sound-witness engine runs on the linear-time
+  engine the rest of the package uses, so a name taken from a source file
+  cannot cost a run more than the text it scans, and the structural proof
+  that no verifier reaches for the backtracking one covers this module too.
+  The pipeline checker that carries that proof now runs under the test suite
+  rather than only as its own step.
+
 - Tier-2 self-consistency and evidence-keyed verdict reuse, so a nondeterministic judge cannot flicker a control's verified status between runs. Each fresh evidence is judged N times (N=3 default; `--tier2-consistency-n` / `tier2-consistency-n` input / `MIPITI_TIER2_CONSISTENCY_N`) and the spread decides: a PASS requires every judgment to agree, a unanimous fail is a confident fail, an all-inconclusive vote is skipped, and anything else is a split — reported not verified and deliberately not cached, so a borderline verdict is never frozen into a lucky green. Each verdict is keyed by a hash of exactly what the judge is shown (assertion type, params, assembled source, subject kind, the per-type template bytes, provider and model); when the platform returns a stored verdict for an unchanged hash the runner reuses it with no judge call. A confident assertion converges to a cached pass over a run or two; a genuinely borderline one never caches green.
 
 ### Fixed
@@ -42,6 +161,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ("reached mechanism: unknown") is never a ground for NO.
 
 ### Changed
+
+- A scope entry that is itself a link, or that passes through one, is refused
+  the same way a link inside the searched region already was. The check runs
+  before the path is resolved, because resolution is where a link stops being
+  distinguishable from a real directory — after it the walk enumerates the
+  target's tree while the scope still reads as the name that was declared. A
+  declared scope has to name the tree that was read.
 
 - Formal checks in CI take a third of the time. `audit_bundle_bind.cfg`
   and `audit_main_orphan_legacy.cfg` are split per `key_source` class

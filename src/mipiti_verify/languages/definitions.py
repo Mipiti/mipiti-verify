@@ -345,6 +345,11 @@ def tree_sitter_available(language: str) -> bool:
     return _get_parser(language) is not None
 
 
+def get_parser(language: str):
+    """A tree-sitter parser for ``language``, or ``None`` (see ``_get_parser``)."""
+    return _get_parser(language)
+
+
 def _walk(node):
     """Breadth-first, document-order traversal.
 
@@ -363,6 +368,12 @@ def _walk(node):
 
 def _text(node) -> str:
     return node.text.decode("utf-8", errors="replace") if node is not None else ""
+
+
+# Public names for the traversal primitives, read by the other module in
+# this package that walks a parse tree (the call-site tables in ``calls``).
+walk = _walk
+node_text = _text
 
 
 def _first_child_of_types(node, types, *, named_only=True):

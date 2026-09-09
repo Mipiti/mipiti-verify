@@ -12,6 +12,8 @@ from . import (
     PathTraversalError,
     RegexTimeoutError,
     VerifierResult,
+    SOUNDNESS_PRESENCE,
+    SOUNDNESS_SCAN,
     register,
     resolve_content,
     resolve_file_content,
@@ -185,7 +187,7 @@ def _reject_unwitnessed_match(match: object, pattern: str) -> str | None:
     return None
 
 
-@register("file_exists")
+@register("file_exists", soundness=SOUNDNESS_PRESENCE)
 class FileExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -197,7 +199,7 @@ class FileExistsVerifier:
         return VerifierResult(passed=False, details=f"File not found: {params['file']}")
 
 
-@register("file_hash")
+@register("file_hash", soundness=SOUNDNESS_PRESENCE)
 class FileHashVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -222,7 +224,7 @@ class FileHashVerifier:
         return VerifierResult(passed=False, details=f"Hash mismatch: expected {expected[:16]}... got {actual[:16]}...")
 
 
-@register("pattern_matches")
+@register("pattern_matches", soundness=SOUNDNESS_SCAN)
 class PatternMatchesVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -252,7 +254,7 @@ class PatternMatchesVerifier:
         return VerifierResult(passed=False, details=f"Pattern not found: {pattern}")
 
 
-@register("pattern_absent")
+@register("pattern_absent", soundness=SOUNDNESS_SCAN)
 class PatternAbsentVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -279,7 +281,7 @@ class PatternAbsentVerifier:
         return VerifierResult(passed=True, details=f"Pattern correctly absent: {pattern}")
 
 
-@register("no_plaintext_secret")
+@register("no_plaintext_secret", soundness=SOUNDNESS_SCAN)
 class NoPlaintextSecretVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:

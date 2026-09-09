@@ -7,7 +7,14 @@ import ast
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, resolve_file_content, safe_regex_search
+from . import (
+    SOUNDNESS_PRESENCE,
+    PathTraversalError,
+    VerifierResult,
+    register,
+    resolve_file_content,
+    safe_regex_search,
+)
 
 
 # --- Definition-shape building blocks (FunctionExistsVerifier) ---
@@ -391,7 +398,7 @@ def _blank_string(content: str, start: int, quote: str, blank, n: int) -> int:
     return start + 1
 
 
-@register("function_exists")
+@register("function_exists", soundness=SOUNDNESS_PRESENCE)
 class FunctionExistsVerifier:
     """Check that a function/method is DEFINED in a file.
 
@@ -500,7 +507,7 @@ class FunctionExistsVerifier:
         )
 
 
-@register("class_exists")
+@register("class_exists", soundness=SOUNDNESS_PRESENCE)
 class ClassExistsVerifier:
     """Check that a class/struct/interface is DECLARED in a file.
 
@@ -731,7 +738,7 @@ def _decorator_matches(expr: ast.expr, decorator: str) -> bool:
     return path == decorator or path.rsplit(".", 1)[-1] == decorator
 
 
-@register("decorator_present")
+@register("decorator_present", soundness=SOUNDNESS_PRESENCE)
 class DecoratorPresentVerifier:
     """Check that a decorator is APPLIED to a function in a file.
 
@@ -847,7 +854,7 @@ class DecoratorPresentVerifier:
         )
 
 
-@register("function_calls")
+@register("function_calls", soundness=SOUNDNESS_PRESENCE)
 class FunctionCallsVerifier:
     """Check that a function calls another function.
 
@@ -1101,7 +1108,7 @@ def _module_covers(claim: str, imported: str) -> bool:
     return claim == imported or imported.startswith(claim + ".")
 
 
-@register("import_present")
+@register("import_present", soundness=SOUNDNESS_PRESENCE)
 class ImportPresentVerifier:
     """Check that a module is IMPORTED in a file.
 

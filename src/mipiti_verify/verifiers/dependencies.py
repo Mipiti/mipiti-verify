@@ -6,7 +6,7 @@ import json
 import re2
 from pathlib import Path
 
-from . import PathTraversalError, VerifierResult, register, safe_resolve_path
+from . import SOUNDNESS_PRESENCE, PathTraversalError, VerifierResult, register, safe_resolve_path
 
 
 def _parse_manifest(file_path: Path) -> dict[str, str]:
@@ -145,7 +145,7 @@ def _parse_pom_xml(content: str) -> dict[str, str]:
     return deps
 
 
-@register("dependency_exists")
+@register("dependency_exists", soundness=SOUNDNESS_PRESENCE)
 class DependencyExistsVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:
@@ -170,7 +170,7 @@ class DependencyExistsVerifier:
         return VerifierResult(passed=False, details=f"Package '{package}' not found in {params['manifest']}")
 
 
-@register("dependency_version")
+@register("dependency_version", soundness=SOUNDNESS_PRESENCE)
 class DependencyVersionVerifier:
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
         try:

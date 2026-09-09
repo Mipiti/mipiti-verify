@@ -49,6 +49,7 @@ from mipiti_verify.verifiers import (  # noqa: E402
     RegexTimeoutError,
     _load_all,
     get_verifier,
+    resolve_scope_files,
     safe_regex_search,
     safe_resolve_path,
 )
@@ -956,14 +957,47 @@ def check_test_attested() -> Tuple[int, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Sound witnesses: ground-truth oracle
+# ---------------------------------------------------------------------------
+
+def check_sound_witnesses() -> Tuple[int, List[str], dict]:
+    """The equivalence classes of the two sound witnesses.
+
+    Their input space is a scope of programs rather than one file, so the
+    independent spec is written the other way round: each program in
+    ``formal/check_sound.py`` declares the sites that are unsafe by
+    construction, and the engine must flag every one of them and pass
+    exactly on the programs that have none. Run from here too, so the
+    registry coverage below sees the two types covered by classes and not
+    only by a separate checker.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from check_sound import _cases, check_cases
+
+    cases = _cases()
+    count, violations = check_cases(cases)
+    per_type: dict = {}
+    for case in cases:
+        per_type[case.mode] = per_type.get(case.mode, 0) + 1
+    return count, violations, per_type
+
+
+# ---------------------------------------------------------------------------
 # Security property: path traversal
 # ---------------------------------------------------------------------------
 
 def check_path_traversal() -> Tuple[int, List[str]]:
-    """Every traversal pattern must raise PathTraversalError."""
+    """No path a caller supplies reaches content outside the checkout.
+
+    Both resolvers are covered: the one that answers for a single named
+    file, and the one that enumerates a whole scope. The second is the
+    surface actually pointed at a customer repository -- it expands
+    patterns, walks directories and meets links -- so a property stated
+    only over the first would stop describing the code that walks the tree.
+    """
     violations = []
     checked = 0
-    project = _make_project({"safe.txt": "content"})
+    project = _make_project({"safe.txt": "content", "app/main.py": "x = 1\n"})
 
     traversal_paths = [
         "../../../etc/passwd",
@@ -980,6 +1014,52 @@ def check_path_traversal() -> Tuple[int, List[str]]:
             except PathTraversalError:
                 pass
             checked += 1
+
+        # The scope resolver: the same strings, plus the pattern and link
+        # shapes only it can be handed.
+        scope_entries = traversal_paths + [
+            "/etc/passwd",
+            "../*.py",
+            "app/../../*.py",
+            "**/../../../etc/*",
+        ]
+        for entry in scope_entries:
+            try:
+                resolve_scope_files(project, [entry])
+                violations.append(f"Scope entry not blocked: {entry}")
+            except PathTraversalError:
+                pass
+            except (ValueError, OSError) as e:
+                violations.append(f"Scope entry {entry!r} refused as {type(e).__name__}, "
+                                  f"not as a traversal: {e}")
+            checked += 1
+
+        # A link out of the checkout is content this tree cannot bind, and a
+        # link inside it leaves the enumeration short of what the entry
+        # names. Neither may be passed over in silence.
+        outside = Path(tempfile.mkdtemp()) / "outside.py"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("x = 1\n", encoding="utf-8")
+        (project / "app" / "escape.py").symlink_to(outside)
+        try:
+            resolve_scope_files(project, ["app"])
+            violations.append("Scope link out of the checkout not blocked")
+        except PathTraversalError:
+            pass
+        except (ValueError, OSError) as e:
+            violations.append(f"Scope link out of the checkout refused as "
+                              f"{type(e).__name__}: {e}")
+        checked += 1
+        (project / "app" / "escape.py").unlink()
+        _cleanup(outside.parent)
+
+        (project / "app" / "linked.py").symlink_to(project / "safe.txt")
+        try:
+            resolved = resolve_scope_files(project, ["app"])
+            violations.append(f"Scope link inside the checkout passed over: {resolved}")
+        except (PathTraversalError, ValueError):
+            pass
+        checked += 1
     finally:
         _cleanup(project)
 
@@ -1229,6 +1309,11 @@ def main():
     per_type["test_attested"] = ta_count
     total += ta_count
 
+    # Sound witnesses: ground-truth oracle over a scope of programs
+    sw_count, sw_violations, sw_per_type = check_sound_witnesses()
+    per_type.update(sw_per_type)
+    total += sw_count
+
     # Exhaustive over the registry: a verifier without classes here fails.
     _load_all()
     uncovered = sorted(set(VERIFIER_REGISTRY) - set(per_type))
@@ -1239,13 +1324,15 @@ def main():
         eq_violations.append(f"equivalence classes for unregistered types: {', '.join(unknown)}")
 
     print(f"\nPer-verifier equivalence classes ({len(per_type)} verifiers, "
-          f"{len(inputs) + ta_count} classes):")
+          f"{len(inputs) + ta_count + sum(sw_per_type.values())} classes):")
     for atype in sorted(per_type):
         print(f"  {atype:<24} {per_type[atype]:>3}")
 
     all_pass &= _print_block("\nEquivalence classes", len(inputs), eq_violations, "ALL VERIFIED")
     all_pass &= _print_block("Signed evidence (test_attested) scenarios", ta_count, ta_violations,
                              "ALL VERIFIED (fact-derived oracle)")
+    all_pass &= _print_block("Sound witness programs", sw_count, sw_violations,
+                             "ALL VERIFIED (ground-truth oracle; flagged set is a superset)")
 
     pt_count, pt_violations = check_path_traversal()
     total += pt_count
@@ -1271,7 +1358,9 @@ def main():
         print(f"  Verifiers covered:   {len(per_type)} of {len(VERIFIER_REGISTRY)} registered")
         print(f"  Equivalence classes: {len(inputs)} inputs, spec vs verifier cross-checked")
         print(f"  Signed evidence:     {ta_count} scenarios, oracle vs verifier cross-checked")
-        print(f"  Path traversal:      {pt_count} patterns blocked")
+        print(f"  Sound witnesses:     {sw_count} checks over "
+              f"{sum(sw_per_type.values())} programs, ground truth vs flagged set")
+        print(f"  Path traversal:      {pt_count} paths, scope entries and links blocked")
         print(f"  ReDoS protection:    {rd_count} patterns (RE2 linear-time + backreference rejection)")
         print(f"  Determinism:         {det_count} verifiers verified")
         print(f"  Structural proofs:   {sp_count} (valid for ALL inputs by code analysis)")
