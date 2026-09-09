@@ -305,8 +305,8 @@ def mutated_file(
         raise DisableError(
             f"{rel_file} is not in a git checkout (or git is not installed), so a "
             f"source mutation could not be proven restored. Source mutation needs a "
-            f"clean git checkout; outside one, use --strategy hook for compiled code "
-            f"(Python and JavaScript are disabled at runtime and need no checkout)")
+            f"clean git checkout; outside one, --strategy hook is the way through for "
+            f"the go and cargo runners and the command runner")
     if dirty:
         raise DisableError(
             f"{rel_file} has uncommitted changes; a mutation is only applied "

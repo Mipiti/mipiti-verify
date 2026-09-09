@@ -44,6 +44,27 @@ def _reasons(summary: dict) -> dict[str, str]:
     return {t["id"]: t["fails_without"][0].get("reason", "") for t in summary["tests"]}
 
 
+# A tool absent from the machine skips its test, so the suite runs anywhere.
+# That makes a skip invisible in a green run: fine while the absence is a fact
+# about a developer's laptop, not fine where a job was configured to install
+# the tool, because there a skip means the install stopped working and the
+# coverage went away without saying so. ``MIPITI_TEST_REQUIRE_TOOLCHAINS``
+# names the tools a caller has undertaken to provide;
+# ``test_the_declared_toolchains_are_installed`` fails when one is not there,
+# so the gates below stay plain skips and the guarantee is stated once.
+REQUIRED_TOOLS = sorted(set(os.environ.get("MIPITI_TEST_REQUIRE_TOOLCHAINS", "").split()))
+
+
+def test_the_declared_toolchains_are_installed():
+    missing = [t for t in REQUIRED_TOOLS if shutil.which(t) is None]
+    assert not missing, (
+        f"MIPITI_TEST_REQUIRE_TOOLCHAINS names {missing} but they are not on PATH, "
+        "so the tests that need them would report as skipped and this suite would "
+        "stay green while covering nothing. Install them, or drop them from the "
+        "variable to say the coverage is not expected here"
+    )
+
+
 # The command-runner tests wrap their toolchain in ``sh -c``; a runner
 # without a POSIX shell skips them rather than failing on the wrapper.
 needs_sh = pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX shell (sh) on this runner")
@@ -54,6 +75,11 @@ needs_javac = pytest.mark.skipif(shutil.which("javac") is None or shutil.which("
 needs_swiftc = pytest.mark.skipif(shutil.which("swiftc") is None, reason="swiftc is not installed")
 needs_iverilog = pytest.mark.skipif(shutil.which("iverilog") is None or shutil.which("vvp") is None,
                                     reason="iverilog is not installed")
+# Either analyser satisfies a VHDL check, exactly as ``checks.check_vhdl``
+# accepts either; the test drives whichever this machine has.
+VHDL_TOOL = "ghdl" if shutil.which("ghdl") else ("nvc" if shutil.which("nvc") else "")
+needs_vhdl = pytest.mark.skipif(not VHDL_TOOL,
+                                reason="no VHDL analyser (ghdl or nvc) is installed")
 needs_coverage = pytest.mark.skipif(
     subprocess.run([sys.executable, "-c", "import coverage"], capture_output=True).returncode != 0,
     reason="coverage.py is not installed")
@@ -328,3 +354,59 @@ class TestVitest:
             assert "coverage" in entry["reason"]
         else:
             assert entry["reached"] and entry["reached"][0]["file"] == "src/guard.js"
+
+
+@needs_sh
+@needs_vhdl
+class TestVhdl:
+    """A VHDL architecture: emptying its body leaves the outputs undriven, so
+    the testbench that reads one fails and the one that does not still passes.
+
+    VHDL has no plusargs, so the two tests are two top-level entities and
+    ``{test}`` names the one to elaborate and run -- the same shape the Icarus
+    tests get from ``+{test}``.
+    """
+
+    FILES = {
+        "guard.vhd": (
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\n"
+            "entity guard is\n  port (a : in std_logic; y : out std_logic);\nend entity;\n\n"
+            "architecture rtl of guard is\nbegin\n  y <= not a;\nend architecture;\n"
+        ),
+        "tb.vhd": (
+            "library ieee;\nuse ieee.std_logic_1164.all;\n\n"
+            "entity tb_guard is\nend entity;\n\n"
+            "architecture sim of tb_guard is\n"
+            "  signal a : std_logic := '1';\n  signal y : std_logic;\n"
+            "begin\n"
+            "  dut : entity work.guard port map (a => a, y => y);\n"
+            "  check : process\n  begin\n    wait for 1 ns;\n"
+            "    assert y = '0' report \"y is not driven low\" severity failure;\n"
+            "    report \"PASS\";\n    wait;\n  end process;\n"
+            "end architecture;\n\n"
+            "entity unrelated is\nend entity;\n\n"
+            "architecture sim of unrelated is\nbegin\n"
+            "  check : process\n  begin\n    wait for 1 ns;\n"
+            "    assert true report \"unreachable\" severity failure;\n"
+            "    report \"PASS\";\n    wait;\n  end process;\n"
+            "end architecture;\n"
+        ),
+    }
+
+    #: ``ghdl`` and ``nvc`` take different arguments for the same three steps,
+    #: so the command is built for whichever the machine has -- the choice
+    #: ``checks.check_vhdl`` makes for the compile gate, made here for the run.
+    RUN = {
+        "ghdl": 'sh -c "ghdl -a --std=08 guard.vhd tb.vhd && ghdl -e --std=08 {test} && ghdl -r --std=08 {test}"',
+        "nvc": 'sh -c "nvc --std=2008 -a guard.vhd tb.vhd && nvc --std=2008 -e {test} && nvc --std=2008 -r {test}"',
+    }
+
+    def test_dependence_through_the_vhdl_analyser(self, tmp_path):
+        _checkout(tmp_path, self.FILES)
+        adapter = detect_adapter(tmp_path, run_cmd=self.RUN[VHDL_TOOL])
+        summary = run_dependence(tmp_path, [
+            ("tb_guard", "guard.vhd::architecture:rtl"),
+            ("unrelated", "guard.vhd::architecture:rtl"),
+        ], adapter=adapter, timeout=300)
+        assert _facts(summary) == {"tb_guard": "failed", "unrelated": "passed"}
+        assert (tmp_path / "guard.vhd").read_text() == self.FILES["guard.vhd"]
