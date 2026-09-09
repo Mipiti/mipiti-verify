@@ -155,7 +155,27 @@ jobs:
       - name: Install package and dev extras
         run: pip install --no-deps -e . && pip install --require-hashes -r requirements-dev.lock
 
+      # The HDL toolchains, and only those. Every other language a source
+      # mutation checks is checked with the tool that also runs that
+      # project's tests -- cargo check beside cargo test, go build beside
+      # go test -- so it cannot plausibly be absent where verification is
+      # meaningful. Verilog and VHDL are the exception: a team on a
+      # commercial simulator has none of verilator, slang, iverilog, ghdl
+      # or nvc, so the missing-analyser branch is the one with a live
+      # failure mode in the field, and it is the one the suite could not
+      # reach on a runner image that ships none of them.
+      - name: Install HDL toolchains for the end-to-end mutation tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends iverilog verilator ghdl
+
       - name: Run tests (excluding spec-invariants which needs Fulcio OIDC)
+        # The declared toolchains must be present rather than silently
+        # skipped: a skipif is invisible in a green run, so a runner image
+        # that stopped shipping one would quietly return the suite to the
+        # coverage this step exists to end.
+        env:
+          MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
 
       - name: Formal verification (Python BFS + cross-check)

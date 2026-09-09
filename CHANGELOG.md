@@ -132,6 +132,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The end-to-end mutation tests for Verilog and VHDL now run in CI instead of
+  reporting as skipped. Every other language a source mutation checks is
+  checked with the tool that also runs that project's tests -- `cargo check`
+  beside `cargo test`, `go build` beside `go test` -- so the analyser cannot
+  plausibly be absent where verification is meaningful. Verilog and VHDL are
+  the exception: a team on a commercial simulator has none of verilator,
+  slang, iverilog, ghdl or nvc, which makes the missing-analyser branch the
+  one with a live failure mode and the one the suite was not reaching. A VHDL
+  case joins the two Verilog ones, driving whichever analyser is installed
+  exactly as the compile gate does. `MIPITI_TEST_REQUIRE_TOOLCHAINS` names the
+  tools a caller undertakes to provide and fails when one is absent, so a job
+  that stops installing them says so rather than going quietly back to
+  skipping.
+
 - A JavaScript or TypeScript mechanism run through the command runner is
   refused with the reason it is refused for, instead of being rewritten on
   disk and then failed against a check that does not exist. The set of
