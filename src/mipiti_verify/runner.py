@@ -1529,6 +1529,10 @@ class Runner:
         # the only question left in front of it is the quality one. Absence
         # types state theirs in the template, and test_attested carries its
         # own facts block.
+        # The evidence the verdict is keyed on: the source as the judge reasons
+        # over it, before the mechanical tier's own prose is appended below.
+        hashed_source = source_code
+        structural_fact_shown = False
         if (
             structural_verdict is not None
             and structural_verdict.passed
@@ -1536,6 +1540,16 @@ class Runner:
             and a_type != "test_attested"
             and structural_verdict.details
         ):
+            # The facts block is shown to the judge but kept OUT of the hashed
+            # evidence: its text carries the target's LOCATION ("defined at
+            # line 447"), which moves whenever anything above the definition
+            # is edited. The judge is handed the isolated definition block, so
+            # that edit leaves the code it reasons over byte-identical — only
+            # the line number moved. Keying the verdict on it would reopen and
+            # re-judge, at full cost, a question whose inputs did not change.
+            # What the verdict DOES depend on is the fact the block states,
+            # and that is hashed as a fact rather than as prose.
+            structural_fact_shown = True
             source_code = (
                 f"{source_code}\n\n--- Facts (established by the mechanical tier) ---\n"
                 f"the target is present: {structural_verdict.details}"
@@ -1545,8 +1559,9 @@ class Runner:
             from .tier2 import get_provider
 
             ev_hash = _tier2_evidence_hash(
-                a_type, a_params, source_code, subject_kind,
+                a_type, a_params, hashed_source, subject_kind,
                 self.tier2_provider_name, self.tier2_model,
+                structural_fact_shown=structural_fact_shown,
             )
             reviewer = f"ai:{self.tier2_provider_name}/{self.tier2_model or 'default'}"
 
@@ -1778,17 +1793,32 @@ def _auto_detect_repo(project_root: Path) -> str:
     return ""
 
 
-_TIER2_HASH_SCHEMA = "t2v1"
+#: Bumped when the hashed payload changes shape. A bump voids every
+#: stored verdict once, which is the honest cost of correcting a key.
+_TIER2_HASH_SCHEMA = "t2v2"
 
 
-def _tier2_evidence_hash(a_type, a_params, source_code, subject_kind, provider_name, model):
-    """A stable hash of exactly what the tier-2 judge is shown, so a verdict can
-    be keyed by its evidence and reused when the evidence is unchanged. Hashes
-    the semantic inputs — assertion type, canonical params, the assembled
-    SOURCE_CODE, subject kind — plus the template bytes for this type (a
+def _tier2_evidence_hash(a_type, a_params, source_code, subject_kind, provider_name, model,
+                         *, structural_fact_shown: bool = False):
+    """A stable hash of the SEMANTIC inputs to a tier-2 verdict, so a verdict can
+    be keyed by its evidence and reused while that evidence is unchanged.
+
+    Hashes the assertion type, canonical params, the source the judge reasons
+    over, and the subject kind — plus the template bytes for this type (a
     template edit re-opens the verdict), the provider and model (a judge change
-    re-opens it), and a schema version. NOT the rendered prompt, which carries a
-    fresh per-call boundary token and so is never equal twice."""
+    re-opens it), and a schema version.
+
+    Two things the judge SEES are deliberately excluded, on the same principle:
+    a verdict must turn on what was asked and what was shown, not on incidental
+    text that varies without the question changing.
+
+    - the rendered prompt, which carries a fresh per-call boundary token and so
+      would never be equal twice;
+    - the mechanical tier's facts block, whose text names the target's LOCATION
+      ("defined at line 447"). For the types whose definition block is isolated,
+      an edit anywhere above the target leaves the judged source identical and
+      moves only that number. What the verdict depends on is that the fact was
+      established, not where — so it enters as ``structural_fact_shown``."""
     import hashlib
     tmpl = ""
     try:
@@ -1806,6 +1836,7 @@ def _tier2_evidence_hash(a_type, a_params, source_code, subject_kind, provider_n
         "template": tmpl,
         "provider": provider_name or "",
         "model": model or "",
+        "structural_fact_shown": bool(structural_fact_shown),
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

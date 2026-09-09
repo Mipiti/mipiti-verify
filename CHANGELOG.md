@@ -132,6 +132,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A tier-2 verdict is keyed on the evidence, not on where that evidence sits
+  in its file. The judge for `function_exists` and `class_exists` is handed the
+  isolated definition block — existence is settled mechanically and the
+  semantic tier is told it is not being asked to locate the symbol — so an
+  edit anywhere else in the file leaves the code it reasons over identical.
+  The mechanical tier's facts block names the target's location, and that text
+  was folded into the hashed evidence, so such an edit changed the key and the
+  assertion was re-judged at full cost with nothing about the question having
+  changed. The fact the block states is still part of the key; the line number
+  is not. The schema version moves with it, so every stored verdict is
+  recomputed once.
+
 - A run signs with an identity minted when it signs, not one taken at
   startup. A workload identity token is short-lived, and a verification run
   spends as long as its evidence takes between starting and signing its first
