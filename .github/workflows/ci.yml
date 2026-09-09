@@ -6,18 +6,25 @@ name: CI
 # duplication. Dropping the push:main trigger saves ~5 min × N
 # bot-auto-merged PRs per release.
 #
-# Markdown-only / CHANGELOG-only PRs skip CI too: tests have no README
-# dependency, so running the full suite for a docs tweak is a waste.
-# Human-authored PRs that DO need CI will change something outside
-# *.md; bot-authored README-update PRs (post-release) only touch
-# README.md and don't need CI at all.
+# Markdown-only PRs still run this workflow, and its jobs report as
+# they always do; what they skip is the suite, via the `docs_only`
+# output below. The filter used to live on the trigger, which meant
+# this workflow did not run at all on a docs PR and a second workflow
+# had to post the same check names so the PR was not blocked waiting
+# for statuses nobody would send. Two workflows publishing one set of
+# contexts is only safe while exactly one of them runs, and that does
+# not hold: `paths-ignore` skips a run when EVERY changed file matches,
+# while `paths` starts one when ANY does, so a PR touching a .md file
+# and code — the shape of most changes here, since the CHANGELOG moves
+# with them — ran both, and every required context was posted twice,
+# once by a job that did the work and once by a job that echoed a line.
+# GitHub calls duplicate contexts ambiguous and does not define which
+# one a required check reads. So the skip moved off the trigger and
+# into the jobs, and this is the only workflow that posts these names.
 
 on:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'CHANGELOG.md'
 
 jobs:
   # Single shared inert-path determination, consumed (fail-safe) by the
@@ -35,6 +42,11 @@ jobs:
       contents: read
     outputs:
       inert: ${{ steps.guard.outputs.inert }}
+      #: Every changed file is markdown. Narrower than `inert`, which also
+      #: admits workflow files and version-line-only edits: those must still
+      #: run the suite, a prose change need not. This is exactly the set the
+      #: retired docs-only workflow stubbed, so the cost it saved is kept.
+      docs_only: ${{ steps.guard.outputs.docs_only }}
     steps:
       - name: Inert-path guard
         id: guard
@@ -48,9 +60,16 @@ jobs:
             --jq '.files[].path' 2>/dev/null)
           echo "Changed files:"; printf '%s\n' "$files"
           inert=true
-          [ -z "$files" ] && inert=false
+          docs_only=true
+          # No file list means the question could not be asked, so neither
+          # verdict is safe to assert: both fail open and the work runs.
+          [ -z "$files" ] && inert=false && docs_only=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
+            case "$f" in
+              *.md|*/*.md) ;;
+              *) docs_only=false ;;
+            esac
             case "$f" in
               .github/workflows/*|*.md|*/*.md) ;;
               pyproject.toml)
@@ -71,7 +90,9 @@ jobs:
             esac
           done <<< "$files"
           echo "inert=$inert" >> "$GITHUB_OUTPUT"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "Inert (skip expensive formal jobs/steps): $inert"
+          echo "Docs-only (skip the suite): $docs_only"
           exit 0
 
   test:
@@ -165,6 +186,7 @@ jobs:
       # failure mode in the field, and it is the one the suite could not
       # reach on a runner image that ships none of them.
       - name: Install HDL toolchains for the end-to-end mutation tests
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends iverilog verilator ghdl
@@ -174,6 +196,11 @@ jobs:
         # skipped: a skipif is invisible in a green run, so a runner image
         # that stopped shipping one would quietly return the suite to the
         # coverage this step exists to end.
+        # A prose-only change cannot alter what the suite asserts, and this
+        # is the step the retired docs-only workflow existed to avoid. The
+        # job still reports, so the required context is satisfied either
+        # way; fail-safe, so an unanswerable diff runs the suite.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
         env:
           MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
@@ -244,8 +271,12 @@ jobs:
     needs: detect-changes
     # `always()` keeps the matrix running even if detect-changes
     # failed (fail-safe: TLC step inside re-evaluates the verdict and
-    # defaults to running). Each matrix instance is a required check.
-    if: ${{ always() }}
+    # defaults to running). The one case that skips the matrix outright
+    # is a prose-only diff, where even the cheap static checks read code
+    # that did not change; `audit-tlc-all` accepts that skip only under
+    # the same verdict, so a skip for any other reason still fails the
+    # gate. The required context is `audit-tlc-all`, not these.
+    if: ${{ always() && (needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true') }}
     permissions:
       contents: read
     strategy:
@@ -343,6 +374,49 @@ jobs:
           esac
           java $JAVA_OPTS -jar tla2tools.jar -config "$CFG.cfg" -workers auto "$TLA_MODULE"
         working-directory: formal
+
+  # One context standing for the whole audit-tlc matrix.
+  #
+  # The ruleset used to require each `audit-tlc (<cfg>)` by name, which
+  # makes the required set a hand-kept copy of a matrix that grows: two
+  # PRs added configs and neither updated the ruleset, so six of the
+  # seventeen ran without being required and could fail while the PR
+  # stayed mergeable — among them the sufficiency, model-only and
+  # manifest-signature slices. Requiring this one job instead means the
+  # matrix can gain a config without anyone remembering a second place.
+  #
+  # `needs` on a matrix job yields one result for the whole matrix:
+  # success only if every instance succeeded. `always()` so a cancelled
+  # or skipped matrix is reported rather than silently satisfying the
+  # gate by not running.
+  audit-tlc-all:
+    name: audit-tlc-all
+    runs-on: ubuntu-latest
+    needs: [detect-changes, audit-tlc]
+    if: ${{ always() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Every audit-tlc config succeeded
+        env:
+          RESULT: ${{ needs.audit-tlc.result }}
+          GUARD: ${{ needs.detect-changes.result }}
+          DOCS_ONLY: ${{ needs.detect-changes.outputs.docs_only }}
+        run: |
+          if [ "$RESULT" = "success" ]; then
+            echo "audit-tlc: every config succeeded"
+            exit 0
+          fi
+          # A skip counts only where the guard ANSWERED and said the diff
+          # is prose. A skip for any other reason -- a cancelled matrix, a
+          # guard that could not answer -- is not an argument that the
+          # specs still hold.
+          if [ "$RESULT" = "skipped" ] && [ "$GUARD" = "success" ] && [ "$DOCS_ONLY" = "true" ]; then
+            echo "audit-tlc: skipped, prose-only diff"
+            exit 0
+          fi
+          echo "::error::audit-tlc matrix result is '$RESULT' (guard=$GUARD docs_only=$DOCS_ONLY)"
+          exit 1
 
   test-spec-invariants:
     # Dedicated job for the audit-spec BFS implementation check

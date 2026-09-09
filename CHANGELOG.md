@@ -132,6 +132,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A run signs with an identity minted when it signs, not one taken at
+  startup. A workload identity token is short-lived, and a verification run
+  spends as long as its evidence takes between starting and signing its first
+  statement, so on a repository of any size the token was reliably expired
+  before it was ever used and the run lost its attestation every time — a
+  hard failure where `--require-attestation` is set. The credential that mints
+  tokens stays valid for the whole job, so one obtained at the point of use
+  cannot have aged out in between. Detection still happens at startup, which
+  is what lets a run know signing is possible before producing something to
+  sign; an explicitly supplied token is used as given, since re-minting would
+  substitute an identity the caller did not choose. The two other signing
+  entry points already minted at the point of use and are unchanged.
+
+- An expired identity token now says it expired. The validator answers
+  "malformed or missing claims" for every rejection, expiry included, so a
+  stale token sent a reader looking for a broken one. The expiry claim is read
+  without verifying the signature and only to word the message; nothing is
+  trusted on the strength of it, and an unreadable token adds nothing.
+
+- One `audit-tlc-all` context stands for the whole audit-tlc matrix, reading
+  the matrix job's own result, which is success only when every config
+  succeeded. The required set is stated once instead of being a list of config
+  names kept in step by hand with a matrix that grows, so a config added later
+  is covered by construction. A skip counts only where the change guard
+  answered and said the diff is prose; a cancelled matrix, or a guard that
+  could not answer, fails.
+
+- Markdown-only pull requests are handled inside the one workflow that
+  publishes the check contexts, rather than by a second workflow posting the
+  same job names. Two workflows can publish one set of contexts only while
+  exactly one of them runs, and trigger path filters cannot express that:
+  `paths-ignore` suppresses a run when every changed file matches while
+  `paths` starts one when any does, so a change touching prose and code
+  satisfies both. GitHub's guidance is to keep job names unique across
+  workflows for this reason. The saving the split existed for is kept: a
+  prose-only diff still skips the suite and the specs, now on a verdict the
+  change guard states rather than on a trigger filter that cannot express it.
+
 - The end-to-end mutation tests for Verilog and VHDL now run in CI instead of
   reporting as skipped. Every other language a source mutation checks is
   checked with the tool that also runs that project's tests -- `cargo check`

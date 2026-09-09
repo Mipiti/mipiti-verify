@@ -558,7 +558,12 @@ class Runner:
         # (see _sign_with_sigstore); it is never transmitted to Mipiti. For
         # Sigstore signing, the token MUST have `aud=sigstore` — Fulcio
         # and sigstore-python's IdentityToken validator both require it.
-        self.oidc_token = oidc_token or _auto_detect_oidc("sigstore")
+        # An explicitly supplied token is used exactly as given: its lifetime
+        # is the caller's to manage. A detected one is re-minted at the point
+        # of use (see _fresh_oidc_token); what is kept here is the fact that
+        # OIDC is AVAILABLE, which is what the checks below ask.
+        self._oidc_explicit = oidc_token or ""
+        self.oidc_token = self._oidc_explicit or _auto_detect_oidc("sigstore")
         self.sigstore_tuf_url = sigstore_tuf_url or os.environ.get(
             "MIPITI_SIGSTORE_TUF_URL", ""
         ) or None
@@ -754,6 +759,34 @@ class Runner:
             console.print(f"  [dim]Tier {tier} attestation: none (submitting unsigned)[/dim]")
         return "", "", "", ""
 
+    def _fresh_oidc_token(self) -> str:
+        """A token minted now, rather than the one detected at construction.
+
+        A workload identity token is short-lived by design, and a run spends
+        as long as its evidence takes between constructing this object and
+        signing its first statement -- long enough, on a repository of any
+        size, for the token detected at startup to have expired before it is
+        ever used. The credential that MINTS tokens stays valid for the whole
+        job, so asking for one at the point of use is the only form that
+        cannot have aged out in between.
+
+        The failure this prevents is quiet and easy to misread: an expired
+        token and a token that was never valid are reported identically, as
+        malformed or missing claims, because the underlying validator wraps
+        every rejection in one message. So a run that had a perfectly good
+        identity would report that its identity was malformed, drop the
+        attestation, and -- where one is required -- fail for a reason that
+        names nothing a reader could act on.
+
+        An explicitly supplied token is returned unchanged; re-minting would
+        substitute an identity the caller did not choose.
+        """
+        if self._oidc_explicit:
+            return self._oidc_explicit
+        # Fall back to the startup token only if a fresh mint is unavailable:
+        # a stale token that may still be in date beats no attempt at all.
+        return _auto_detect_oidc("sigstore") or self.oidc_token
+
     def _sign_with_sigstore(
         self,
         *,
@@ -775,9 +808,10 @@ class Runner:
         """
         if not self.oidc_token:
             return ""
+        token = self._fresh_oidc_token()
         try:
             return sign_verification_statement(
-                self.oidc_token,
+                token,
                 model_id=model_id,
                 tier=tier,
                 content_hash=content_hash,
@@ -789,7 +823,8 @@ class Runner:
             )
         except Exception as e:
             console.print(
-                f"  [yellow]Sigstore signing failed: {e} — submitting without attestation[/yellow]"
+                f"  [yellow]Sigstore signing failed: {e}{_expiry_hint(token)} — "
+                "submitting without attestation[/yellow]"
             )
             return ""
 
@@ -1803,6 +1838,31 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
         if result.get(fact) is not None:
             row[fact] = result[fact]
     return row
+
+
+def _expiry_hint(token: str) -> str:
+    """`` (expired at ...)`` when the token says so, otherwise empty.
+
+    The validator answers "malformed or missing claims" for every rejection,
+    expiry included, which sends a reader looking for a broken token when they
+    have a stale one. The claim is read WITHOUT verifying the signature and is
+    used only to word a message -- nothing is trusted on the strength of it,
+    and an unreadable token simply adds nothing.
+    """
+    import base64
+    import json
+    import time
+
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        if exp and float(exp) < time.time():
+            age = int(time.time() - float(exp))
+            return f" (the identity token expired {age}s ago)"
+    except Exception:
+        pass
+    return ""
 
 
 def _auto_detect_oidc(audience: str = "") -> str:
