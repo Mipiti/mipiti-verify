@@ -26,11 +26,29 @@ ABORT_BODY = {
     "swift": f'{{ fatalError("{DISABLED_MESSAGE}") }}',
     "c": "{ abort(); }",
     "cpp": "{ abort(); }",
+    # Injected by the node adapter at runtime, never written to a file:
+    # jest, vitest and mocha replace the export through a mocking setup file.
+    # Present here so both strategies say the same thing to a reader of the
+    # test output; see MUTATION_LANGUAGES for why that is not a mutation set.
     "javascript": f'{{ throw new Error("{DISABLED_MESSAGE}"); }}',
     "typescript": f'{{ throw new Error("{DISABLED_MESSAGE}"); }}',
 }
 
-MUTATION_LANGUAGES = tuple(ABORT_BODY)
+#: The languages a mechanism is disabled in by REWRITING ITS SOURCE. This is a
+#: policy, not a reading of ``ABORT_BODY``: that table also carries the bodies
+#: the node adapter injects at runtime, and membership there says nothing about
+#: whether a file should be rewritten.
+#:
+#: A language belongs here only when ``checks.CHECKS`` DEFINES a check for it.
+#: That is a weaker statement than "the tree is known to build" -- the tool it
+#: names may be absent on the machine -- but the two are reported differently
+#: and both are safe: an absent tool yields a reason without the
+#: ``checks.TOOLCHAIN_REJECTED`` marker, so the pair errors rather than passing.
+#: What is NOT safe is admitting a language with no check at all: the only exit
+#: from that branch is "does not compile" naming a check that was never
+#: written, for a tree that compiles fine.
+#: ``tests/test_mutation_languages.py`` holds the set to that rule.
+MUTATION_LANGUAGES = ("go", "rust", "java", "kotlin", "csharp", "swift", "c", "cpp")
 
 _CONTROL_WORDS = {
     "return", "if", "else", "while", "for", "switch", "case", "throw", "new",

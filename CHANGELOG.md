@@ -132,6 +132,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A JavaScript or TypeScript mechanism run through the command runner is
+  refused with the reason it is refused for, instead of being rewritten on
+  disk and then failed against a check that does not exist. The set of
+  languages disabled by rewriting their source was read off the table of
+  aborting bodies, which also carries the bodies the node adapter injects at
+  runtime; that swept JavaScript and TypeScript into the command runner's
+  mutation set, where no compile check is defined for them. Such a pair
+  demanded a clean git checkout, wrote the file, and then always errored with
+  `mutated tree does not compile` for a tree that compiled — no input could
+  make it succeed. The mutation set is now stated rather than derived, so the
+  pair is refused before the file is touched and the message names the runner
+  that does disable these at runtime. The outcome was `error` throughout, so
+  nothing was ever credited that should not have been.
+
 - The semantic judge is no longer asked to locate what the mechanical tier
   already located. A `test_attested` assertion whose mechanism is imported
   rather than defined (a framework middleware class, say) showed the judge
