@@ -521,6 +521,7 @@ class Runner:
         auto_component_path: bool = True,
         test_file_pattern: str | None = None,
         tier2_consistency_n: int | None = None,
+        rejudge: "frozenset[str] | set[str] | list[str] | None" = None,
     ) -> None:
         self.client = client
         # Extra test-file identification, on top of the layout heuristic.
@@ -554,6 +555,11 @@ class Runner:
             self.tier2_consistency_n = max(1, int(_n_env))
         else:
             self.tier2_consistency_n = 3
+        #: Assertion ids to judge again even where a stored verdict matches the
+        #: evidence. The escape hatch for a verdict frozen on an unlucky split:
+        #: without it the only way to reopen one is to edit the evidence, which
+        #: invites a no-op change made solely to clear a verdict.
+        self.rejudge = frozenset(rejudge or ())
         # The raw OIDC token is used only locally to mint a Sigstore bundle
         # (see _sign_with_sigstore); it is never transmitted to Mipiti. For
         # Sigstore signing, the token MUST have `aud=sigstore` — Fulcio
@@ -1573,10 +1579,24 @@ class Runner:
             # a first sighting of this evidence), fall through and judge. Only
             # DECISIVE verdicts are ever cached (see the aggregation below).
             cached = assertion.get("tier2_cached") if isinstance(assertion, dict) else None
+            a_id = str(assertion.get("id", "")) if isinstance(assertion, dict) else ""
             if (
                 isinstance(cached, dict)
                 and cached.get("evidence_hash") == ev_hash
-                and cached.get("status") in ("pass", "fail")
+                and cached.get("status") in _REUSABLE_TIER2_STATUSES
+                # A verdict earned over at least as many judgments as this run
+                # asks for already clears the bar being asked about, so a run
+                # wanting less scrutiny reuses it rather than re-judging at a
+                # weaker one. A run wanting MORE gets what it paid for: judged
+                # again at the higher count, and the stored verdict replaced
+                # with that answer whatever it turns out to be.
+                and int(cached.get("consistency_n", 0) or 0) >= self.tier2_consistency_n
+                # An operator can name an assertion to judge again. It is the
+                # one route past a stored verdict without the evidence changing,
+                # and deliberately per-assertion: a blanket form would sit in a
+                # CI configuration and re-judge everything every run, which is
+                # the repetition this caching exists to prevent.
+                and a_id not in self.rejudge
             ):
                 return {
                     "status": cached["status"],
@@ -1584,6 +1604,7 @@ class Runner:
                     "reasoning": str(cached.get("reasoning", "")),
                     "reviewer": "cache",
                     "tier2_evidence_hash": ev_hash,
+                    "tier2_consistency_n": int(cached.get("consistency_n", 0) or 0),
                 }
 
             provider = get_provider(
@@ -1636,10 +1657,12 @@ class Runner:
             # borderline one never caches green.
             if npass == n:
                 return {"status": "pass", "details": last_pass, "reasoning": last_pass,
-                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash}
+                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash,
+                        "tier2_consistency_n": n}
             if nfail == n:
                 return {"status": "fail", "details": last_fail, "reasoning": last_fail,
-                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash}
+                        "reviewer": reviewer, "tier2_evidence_hash": ev_hash,
+                        "tier2_consistency_n": n}
             if ndiscard == n:
                 return {
                     "status": "skipped",
@@ -1655,9 +1678,23 @@ class Runner:
                     ),
                     "reasoning": last_discard,
                     "reviewer": reviewer,
+                    "tier2_evidence_hash": ev_hash,
+                    "tier2_consistency_n": n,
                 }
+            # A split is a verdict the judge REACHED without deciding, and it
+            # is stored like any other: it carries the evidence hash, so the
+            # same question is not asked again while nothing about it has
+            # changed. Re-asking would let repetition settle it, and since a
+            # stored verdict is reused rather than improved upon, the only
+            # outcome repetition can arrive at is the unanimous one.
+            #
+            # `skipped`, not `fail`: judgments disagreeing is not a finding that
+            # the evidence is bad. Neither credits anything, and the split is in
+            # the details either way.
             return {
-                "status": "fail",
+                "status": "skipped",
+                "tier2_evidence_hash": ev_hash,
+                "tier2_consistency_n": n,
                 "details": (
                     f"REASON: BORDERLINE - {n} judgments did not unanimously affirm "
                     f"this evidence ({npass} pass / {nfail} fail"
@@ -1793,6 +1830,13 @@ def _auto_detect_repo(project_root: Path) -> str:
     return ""
 
 
+#: Verdicts a stored result can be reused for. `pass` and `fail` are the
+#: judge's decisive answers; `skipped` is the answer it reached without
+#: deciding — its judgments split, or every one of them declined. All three are
+#: answers ABOUT the evidence, so all three are reusable while that evidence is
+#: unchanged. `pending` is the absence of an answer and is never one.
+_REUSABLE_TIER2_STATUSES = ("pass", "fail", "skipped")
+
 #: Bumped when the hashed payload changes shape. A bump voids every
 #: stored verdict once, which is the honest cost of correcting a key.
 _TIER2_HASH_SCHEMA = "t2v2"
@@ -1865,6 +1909,8 @@ def _result_row(a_id: str, a_type: str, tier: int, result: dict) -> dict:
         row["evidence_hash"] = result["evidence_hash"]
     if result.get("tier2_evidence_hash"):
         row["tier2_evidence_hash"] = result["tier2_evidence_hash"]
+    if result.get("tier2_consistency_n"):
+        row["tier2_consistency_n"] = int(result["tier2_consistency_n"])
     for fact in (*_RESULT_FACTS, *_RESULT_COUNTS):
         if result.get(fact) is not None:
             row[fact] = result[fact]

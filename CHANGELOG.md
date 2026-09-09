@@ -132,6 +132,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A tier-2 verdict whose judgments disagreed is kept, rather than discarded
+  and put to the judge again on the next run. A pass still requires every
+  judgment to agree, and a split still verifies nothing; what changes is that
+  it now carries its evidence hash like any other verdict, so the same
+  unchanged question is not asked repeatedly. It is reported `skipped` rather
+  than `failed`, because judgments disagreeing is not a finding that the
+  evidence is bad.
+
+- The number of judgments a verdict was reached over travels with it, so
+  `--tier2-consistency-n` acts on assertions that already have one: a run
+  asking for more scrutiny than a stored verdict carries judges again and
+  replaces it, and a run asking for the same or less reuses it.
+
+- `--rejudge <assertion_id>` judges one assertion again even where a stored
+  verdict matches its evidence. Repeatable, and deliberately per-assertion:
+  it is the way to get a second reading on a verdict reached from judgments
+  that disagreed, without editing evidence solely to clear it.
+
 - A tier-2 verdict is keyed on the evidence, not on where that evidence sits
   in its file. The judge for `function_exists` and `class_exists` is handed the
   isolated definition block — existence is settled mechanically and the
