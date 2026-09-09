@@ -265,7 +265,7 @@ jobs:
       # recorded as evidence; verification reads it and runs nothing itself.
       - run: pytest --junitxml=report.xml
 
-      - uses: Mipiti/mipiti-verify@7a8fcd9d3296914c45626045d6c412c5d0016ebe # v0.55.0
+      - uses: Mipiti/mipiti-verify@07d7f870008007c068e639ec655fc4b9e95756f0 # v0.55.1
         with:
           # Required
           api-key: ${{ secrets.MIPITI_API_KEY }}
