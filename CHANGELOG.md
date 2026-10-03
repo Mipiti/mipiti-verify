@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Floored, through `[tool.uv] constraint-dependencies`, `urllib3>=2.8.0`
+  (PYSEC-2026-4175, PYSEC-2026-4176, PYSEC-2026-4177), `pyjwt>=2.14.0`
+  (PYSEC-2026-4142), and for the audit toolchain `pip>=26.2.0`
+  (PYSEC-2026-3721) and `msgpack>=1.2.1` (PYSEC-2026-3625). The five
+  lockfiles are recompiled and only these packages move; `pip-audit` reports
+  no known vulnerabilities in any of them beyond the two advisories CI
+  already documents.
+
 ### Added
 
 - Two assertion types whose pass is a statement about EVERY site in a declared
