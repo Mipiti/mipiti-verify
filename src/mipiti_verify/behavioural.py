@@ -47,8 +47,9 @@ from typing import Optional
 
 #: The Apalache release certificates are checked with, as ``version`` prints
 #: it. A certificate naming another release is not re-checked here: a
-#: different release may decide the same module differently.
-APALACHE_VERSION = "0.61.0"
+#: different release may decide the same module differently. It needs a Java
+#: 21 runtime.
+APALACHE_VERSION = "0.62.4"
 #: The jar's entry point, and the thread stack the platform runs it with (a
 #: deep module overflows the JVM's default stack on some machines).
 APALACHE_MAIN_CLASS = "at.forsyte.apalache.tla.Tool"

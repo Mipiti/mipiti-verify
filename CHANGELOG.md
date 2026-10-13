@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `audit` lists how each mitigation group in a package was decided (a judge,
   the behavioural analysis, a model check) and re-checks what an analysis
-  decision rests on: each certificate with Apalache 0.61.0 (its three checks,
+  decision rests on: each certificate with Apalache 0.62.4 on Java 21 (its three checks,
   from the module text and invariant the package carries) and each proof
   with `tlapm` 3edc73c (every obligation must close), after checking that
   each is bound to its own texts and that a proof is of its certificate's

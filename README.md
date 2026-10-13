@@ -142,7 +142,7 @@ An analysis decision that credits with no judge rests on certificates, and the p
 - re-runs Apalache's three checks on each certificate (the invariant holds initially, every step keeps it, it implies the property), from the texts in the package;
 - re-runs `tlapm` on each proof, every obligation of which must close.
 
-Re-checking needs the pinned tools: Apalache 0.61.0 (`APALACHE_JAR`, or `apalache-mc` on PATH, with a Java runtime) and `tlapm` 3edc73c (`TLAPM`, or `tlapm` on PATH). A certificate or proof that does not hold up (a text that does not hash to what it names, a proof of another invariant, a check Apalache refutes, a proof step that does not close) fails the audit. One that could not be re-checked here (no tool, another release, a checker error or time-out) is a caveat; `--require-recheck` makes it a failure for any decision that credits with no judge, and so does a certificate the package names but does not carry. `--no-recheck` skips the tools and keeps the binding checks. A model check's explored result is listed with what it rests on (the runner pool and the agreement of two runs): it is not a proof an auditor can check independently, and the verifier does not re-run it.
+Re-checking needs the pinned tools: Apalache 0.62.4 (`APALACHE_JAR`, or `apalache-mc` on PATH, with a Java 21 runtime) and `tlapm` 3edc73c (`TLAPM`, or `tlapm` on PATH). A certificate or proof that does not hold up (a text that does not hash to what it names, a proof of another invariant, a check Apalache refutes, a proof step that does not close) fails the audit. One that could not be re-checked here (no tool, another release, a checker error or time-out) is a caveat; `--require-recheck` makes it a failure for any decision that credits with no judge, and so does a certificate the package names but does not carry. `--no-recheck` skips the tools and keeps the binding checks. A model check's explored result is listed with what it rests on (the runner pool and the agreement of two runs): it is not a proof an auditor can check independently, and the verifier does not re-run it.
 
 Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. When contributing runs are embedded, the deprecated top-level `results_hash` + `signature` pair is superseded: a divergence there is rendered informationally (`NOT SCORED`) and tamper conclusions come solely from the per-run checks. Older envelopes without these keys verify exactly as before — the legacy pair stays strict, and the trust contract reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
 
@@ -206,7 +206,7 @@ Every published audit can be re-checked offline using only:
 - The customer's workspace key fingerprint (auditor's out-of-band knowledge).
 - The customer's CI workflow identity (auditor's out-of-band knowledge).
 - For the customer-keyed offline DSSE path: the customer's public key, pinned out-of-band by the auditor via `--expected-customer-key`.
-- For the certificates and proofs of analysis decisions: Apalache 0.61.0 and `tlapm` 3edc73c, run on the texts the package carries.
+- For the certificates and proofs of analysis decisions: Apalache 0.62.4 (on Java 21) and `tlapm` 3edc73c, run on the texts the package carries.
 
 No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
 
