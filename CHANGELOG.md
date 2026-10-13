@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `audit` lists how each mitigation group in a package was decided (a judge,
+  the behavioural analysis, a model check) and re-checks what an analysis
+  decision rests on: each certificate with Apalache 0.61.0 (its three checks,
+  from the module text and invariant the package carries) and each proof
+  with `tlapm` 3edc73c (every obligation must close), after checking that
+  each is bound to its own texts and that a proof is of its certificate's
+  invariant. A certificate or proof that does not hold up fails the audit;
+  one not re-checked here is a caveat, or a failure under
+  `--require-recheck`, as is one the package names and does not carry.
+  `--no-recheck` keeps the binding checks without running the tools;
+  `--recheck-timeout` bounds each run. Objectives satisfied by design are
+  checked the same way.
 - Two assertion types whose pass is a statement about EVERY site in a declared
   scope rather than about one place. `sink_default_deny`: over every source
   file in `scope`, every site of a declared sink receives, at each guarded

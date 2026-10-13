@@ -132,6 +132,18 @@ Verification state in a report accumulates across (often partial) CI runs — ea
 
 The verifier checks each run independently: SHA-256 recomputed over the exact `results_canonical` bytes against `results_hash`, the signature over the hash with the run's key (embedded PEM or JWKS lookup by fingerprint), and the per-run Sigstore bundle when present. Each run is reported as `VERIFIED`, `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`, or `UNSIGNED`. A run whose `content_integrity` declares `unverifiable_serialization` (signed material exists but the signed bytes can no longer be re-derived; the serialization predates canonical freezing) is a coverage limitation — reported distinctly from a hash mismatch and never treated as tampering. A genuine mismatch over present `results_canonical` fails the audit.
 
+### Group decisions and what each rests on (`objective_judgements`)
+
+A package for a model with a behavioural model states, per control objective, how each mitigation group was decided: by a judge, by the behavioural analysis alone (`static`), or by a model check (`model_check`), each with a reading that words it as what it is (a possible threat found by analysis is never reported as a judged insufficiency). The verifier lists every decision with its source.
+
+An analysis decision that credits with no judge rests on certificates, and the package carries each one: the obligation's module text, the invariant Apalache checked, and the Apalache release. Where its proof closed it also carries the proof: the proof text, the module text, the `tlapm` build, and each step's time limit. An objective satisfied by design (every obligation holding with no control) carries its certificates the same way. The verifier:
+
+- checks that each certificate is bound to its own texts (the module text hashes to the module hash it names, the module it names is the module the text declares, the outcome is certified), and that each proof is of its certificate's module and invariant;
+- re-runs Apalache's three checks on each certificate (the invariant holds initially, every step keeps it, it implies the property), from the texts in the package;
+- re-runs `tlapm` on each proof, every obligation of which must close.
+
+Re-checking needs the pinned tools: Apalache 0.61.0 (`APALACHE_JAR`, or `apalache-mc` on PATH, with a Java runtime) and `tlapm` 3edc73c (`TLAPM`, or `tlapm` on PATH). A certificate or proof that does not hold up (a text that does not hash to what it names, a proof of another invariant, a check Apalache refutes, a proof step that does not close) fails the audit. One that could not be re-checked here (no tool, another release, a checker error or time-out) is a caveat; `--require-recheck` makes it a failure for any decision that credits with no judge, and so does a certificate the package names but does not carry. `--no-recheck` skips the tools and keeps the binding checks. A model check's explored result is listed with what it rests on (the runner pool and the agreement of two runs): it is not a proof an auditor can check independently, and the verifier does not re-run it.
+
 Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. When contributing runs are embedded, the deprecated top-level `results_hash` + `signature` pair is superseded: a divergence there is rendered informationally (`NOT SCORED`) and tamper conclusions come solely from the per-run checks. Older envelopes without these keys verify exactly as before — the legacy pair stays strict, and the trust contract reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
 
 ### Each check the verifier runs
@@ -181,6 +193,7 @@ The verifier exits non-zero on any of:
 - Bundle-bind signature present but no platform key resolvable (would be silent skip otherwise).
 - Document signature on the PDF/HTML body is missing or invalid.
 - Pinning flags supplied to a format that can't honour them (e.g. identity pins on an HTML report — fails-closed instead of silently dropping the pin).
+- A certificate or proof an analysis decision carries does not hold up: its texts do not hash to what it names, a proof is not of its certificate's invariant, Apalache refutes a check, or a proof step does not close. Under `--require-recheck`, also any certificate or proof a no-judge decision credits on that was not re-checked here or is not carried.
 
 There is no `--allow-unsigned`, no soft-fail, and no fallback that treats a missing signature as "good." When the auditor needs to enforce attestation on the producer side too (CI runner), use `--require-attestation` on `mipiti-verify run` to make missing/failed signing a non-zero exit.
 
@@ -193,6 +206,7 @@ Every published audit can be re-checked offline using only:
 - The customer's workspace key fingerprint (auditor's out-of-band knowledge).
 - The customer's CI workflow identity (auditor's out-of-band knowledge).
 - For the customer-keyed offline DSSE path: the customer's public key, pinned out-of-band by the auditor via `--expected-customer-key`.
+- For the certificates and proofs of analysis decisions: Apalache 0.61.0 and `tlapm` 3edc73c, run on the texts the package carries.
 
 No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
 

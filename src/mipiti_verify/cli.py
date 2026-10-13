@@ -2977,6 +2977,77 @@ def _render_findings(pkg: dict) -> bool:
     return False
 
 
+_RECHECK_MARKUP = {
+    "rechecked": "[green]RE-CHECKED[/green]",
+    "failed": "[red]FAILED[/red]",
+    "not_rechecked": "[yellow]NOT RE-CHECKED[/yellow]",
+    "missing": "[yellow]MISSING[/yellow]",
+}
+
+_SOURCE_LABEL = {
+    "judge": "judge",
+    "static": "analysis",
+    "model_check": "model check",
+    "design": "design",
+    "": "none",
+}
+
+
+def _render_behavioural(report, pkg: dict) -> None:
+    """Render what each group decision rests on (``objective_judgements``):
+    its source and how it reads, and for an analysis decision each
+    certificate and proof with its re-check. The full listing; the summary
+    output prints counts (``_behavioural_summary_lines``)."""
+    from .behavioural import readings
+
+    console.print("\n[bold]Group decisions (what each rests on)[/bold]")
+    legend = readings(pkg)
+    for d in report.decisions:
+        source = _SOURCE_LABEL.get(d.source, d.source)
+        disp = f" {d.disposition}" if d.disposition else ""
+        console.print(f"  [bold]{d.co_id}[/bold] {d.subject}: {source}{disp}  "
+                      f"[dim]{d.reading or 'no reading'}[/dim]")
+        meaning = legend.get(d.reading, "")
+        if meaning and d.source != "judge":
+            console.print(f"      [dim]{meaning}[/dim]")
+        if d.runs_limit:
+            console.print(f"      [yellow]{d.runs_limit}[/yellow]")
+        for r in d.rechecks:
+            detail = f" — {r.detail}" if r.detail else ""
+            console.print(f"      {r.kind} of {r.obligation_id or '?'}: "
+                          f"{_RECHECK_MARKUP.get(r.status, r.status)}{detail}")
+    for tool, why in sorted(report.tools_missing.items()):
+        console.print(f"  [yellow]Not re-checked here: {why}[/yellow]")
+
+
+def _behavioural_summary_lines(report) -> list[str]:
+    """The summary output's account of the group decisions: how many each
+    source decided, and how their certificates and proofs fared."""
+    by_source: dict = {}
+    for d in report.decisions:
+        label = _SOURCE_LABEL.get(d.source, d.source)
+        by_source[label] = by_source.get(label, 0) + 1
+    lines = ["  Decisions: " + ", ".join(f"{n} by {s}" for s, n in sorted(by_source.items()))]
+    for kind in ("certificate", "proof"):
+        total = sum(1 for r in report.rechecks() if r.kind == kind)
+        if not total:
+            continue
+        parts = [f"{report.count('rechecked', kind)} re-checked"]
+        for status, word in (("failed", "failed"), ("not_rechecked", "not re-checked"),
+                             ("missing", "missing")):
+            n = report.count(status, kind)
+            if n:
+                colour = "red" if status == "failed" else "yellow"
+                parts.append(f"[{colour}]{n} {word}[/{colour}]")
+        lines.append(f"  {kind.capitalize()}s: {total} — " + ", ".join(parts))
+    for d in report.decisions:
+        for r in d.rechecks:
+            if r.status == "failed":
+                lines.append(f"    [red]✗ {d.co_id} {d.subject}: {r.kind} of "
+                             f"{r.obligation_id or '?'} — {r.detail}[/red]")
+    return lines
+
+
 # Known top-level audit-pack sections a signed manifest may cover, for
 # documentation and test fixtures. Verification does NOT depend on
 # this list: section hashes are, by contract, SHA-256 over the
@@ -4232,6 +4303,40 @@ def _verify_contributing_runs(
     ),
 )
 @click.option(
+    "--no-recheck",
+    "no_recheck",
+    is_flag=True,
+    default=False,
+    help=(
+        "Do not run Apalache or tlapm on the certificates and proofs an "
+        "analysis decision carries. Each is still checked to be bound to "
+        "its own texts; it is reported NOT RE-CHECKED."
+    ),
+)
+@click.option(
+    "--require-recheck",
+    "require_recheck",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail the audit when a decision that credits with no judge (an "
+        "analysis decision that covers its objective, or an objective "
+        "satisfied by design) rests on a certificate or proof this run did "
+        "not re-check, or one the package does not carry. Without it such "
+        "a decision is listed as a caveat. Re-checking needs the pinned "
+        "Apalache (APALACHE_JAR, or apalache-mc on PATH, and java) and "
+        "tlapm (TLAPM, or tlapm on PATH)."
+    ),
+)
+@click.option(
+    "--recheck-timeout",
+    "recheck_timeout",
+    default=600,
+    type=int,
+    show_default=True,
+    help="Seconds allowed for each Apalache check and each tlapm run.",
+)
+@click.option(
     "--full",
     "full_output",
     is_flag=True,
@@ -4267,6 +4372,9 @@ def audit(
     rekor_entry_snapshot_dir: str | None,
     require_verification: bool,
     allow_orphan_results: bool,
+    no_recheck: bool,
+    require_recheck: bool,
+    recheck_timeout: int,
     full_output: bool,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
@@ -4319,6 +4427,14 @@ def audit(
     verification chain is offline-replayable indefinitely with no
     live Mipiti or Rekor access required. Mutually exclusive with
     --rekor-anchor (URL-based one-shot vs directory-based search).
+
+    Group decisions: a package that states how each mitigation group was
+    decided lists each decision's source (a judge, the behavioural
+    analysis, a model check) and re-checks what an analysis decision rests
+    on: each certificate with Apalache, each proof with tlapm, from the
+    texts the package carries. A certificate or proof that does not hold
+    up fails the audit; one that could not be re-checked here is a caveat,
+    or a failure under --require-recheck.
     """
     render = _AuditRender(full=full_output)
     try:
@@ -4342,6 +4458,9 @@ def audit(
             rekor_entry_snapshot_dir=rekor_entry_snapshot_dir,
             require_verification=require_verification,
             allow_orphan_results=allow_orphan_results,
+            recheck=not no_recheck,
+            require_recheck=require_recheck,
+            recheck_timeout=recheck_timeout,
             render=render,
         )
     finally:
@@ -4374,6 +4493,9 @@ def _audit_impl(
     require_verification: bool,
     allow_orphan_results: bool,
     render: _AuditRender,
+    recheck: bool = True,
+    require_recheck: bool = False,
+    recheck_timeout: int = 600,
 ) -> None:
     """Audit-command implementation. See ``audit`` for the contract;
     ``render`` selects between the summary and full output modes."""
@@ -6122,6 +6244,29 @@ def _audit_impl(
     # older packs (renders nothing). Informational — never fails the audit.
     _render_findings(pkg)
 
+    # --- Group decisions (behavioural model) ---
+    # Additive signed section: how each mitigation group was decided, and
+    # for an analysis decision the certificates and proofs it rests on,
+    # re-checked here from the texts the package carries. Absent on packages
+    # without a behavioural model. A certificate or proof that does not hold
+    # up fails the audit; one not re-checked here fails it only under
+    # --require-recheck (else it is a caveat).
+    behavioural_report = None
+    if isinstance(pkg.get("objective_judgements"), dict):
+        from .behavioural import check as _behavioural_check
+
+        behavioural_report = _behavioural_check(
+            pkg, run_tools=recheck, timeout=float(recheck_timeout))
+        _render_behavioural(behavioural_report, pkg)
+        if behavioural_report.failed:
+            has_failure = True
+        if require_recheck and behavioural_report.unsettled():
+            console.print(
+                f"  [red]{len(behavioural_report.unsettled())} certificate(s) or "
+                "proof(s) a decision credits on were not re-checked here, and "
+                "--require-recheck is set.[/red]")
+            has_failure = True
+
     # --- Run-level provenance (contributing runs) ---
     # Additive envelope keys: `contributing_runs` (one entry per
     # status-determining run, each independently verifiable) and
@@ -6353,6 +6498,18 @@ def _audit_impl(
                 "(report predates run-level provenance disclosure; "
                 "latest-run evidence only)"
             )
+        if behavioural_report is not None and behavioural_report.rechecks():
+            _all = len(behavioural_report.rechecks())
+            _done = behavioural_report.count("rechecked")
+            if behavioural_report.failed:
+                state = "[red]FAILED[/red]"
+            elif _done == _all:
+                state = "[green]RE-CHECKED[/green]"
+            else:
+                state = "[yellow]PARTIAL[/yellow]"
+            console.print(
+                f"  Certificates & proofs:  {state} ({_done}/{_all} re-checked here)"
+            )
         # Auditor pin enforcement.
         pin_lines = [
             ("Identity (SAN/issuer):  ", expected_ci_identity, "--expected-ci-identity"),
@@ -6546,6 +6703,24 @@ def _audit_impl(
                 if row["status"] == _RUN_STATUS_VERIFIED:
                     for message, hint, _style in row["notes"]:
                         render.caveat(message, hint)
+        if behavioural_report is not None:
+            for tool, why in sorted(behavioural_report.tools_missing.items()):
+                render.caveat(f"Certificates and proofs not re-checked here: {why}.")
+            unsettled = behavioural_report.unsettled()
+            if unsettled:
+                missing = sum(1 for r in unsettled if r.status == "missing")
+                render.caveat(
+                    f"{len(unsettled)} certificate(s) or proof(s) a decision "
+                    f"credits on were not re-checked here"
+                    + (f" ({missing} not carried by the package)" if missing else "")
+                    + ".",
+                    "Re-run with the pinned Apalache and tlapm installed; pass "
+                    "--require-recheck to make this a failure.",
+                )
+            for d in behavioural_report.decisions:
+                if d.runs_limit and d.credits_alone:
+                    render.caveat(f"{d.co_id} {d.subject}: {d.runs_limit}")
+                    break
         if isinstance(comp_raw, dict):
             if comp_raw.get("available") is False:
                 err = comp_raw.get("error", "composition_compute_failed")
@@ -6741,6 +6916,10 @@ def _audit_impl(
         _print_disclosure_crosscheck()
         _print_caveats()
         _print_results_summary()
+        if behavioural_report is not None:
+            console.print("\n[bold]Group decisions[/bold]")
+            for line in _behavioural_summary_lines(behavioural_report):
+                console.print(line)
         if isinstance(comp_raw, dict):
             _render_composition_summary(comp_raw)
         evidence_detail = render.take_saved()
