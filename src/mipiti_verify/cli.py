@@ -3020,6 +3020,25 @@ def _render_behavioural(report, pkg: dict) -> None:
         console.print(f"  [yellow]Not re-checked here: {why}[/yellow]")
 
 
+def _render_strength(report) -> None:
+    """Render each control's evidence strength (``clause_strength``), each
+    clause recomputed from its edges, and every clause whose evidence no
+    longer passes; a strength its own record does not give is marked."""
+    console.print("\n[bold]Evidence strength (recomputed from each clause's evidence)[/bold]")
+    for c in report.controls:
+        mark = "[green]✓[/green]" if c.consistent else "[red]✗ not what its evidence gives[/red]"
+        basis = "" if c.basis == "now" else " [dim](as judged)[/dim]"
+        console.print(f"  [bold]{c.control_id}[/bold]: {c.served or 'unrecorded'}{basis} {mark}")
+        for cl in c.clauses:
+            notes = []
+            if not cl.consistent:
+                notes.append(f"[red]stated {cl.served}, its evidence gives {cl.recomputed}[/red]")
+            if cl.no_longer_passing:
+                notes.append(f"[yellow]no longer passing: {', '.join(cl.no_longer_passing)}[/yellow]")
+            if notes:
+                console.print(f"      {cl.clause}: {cl.recomputed} — " + "; ".join(notes))
+
+
 def _behavioural_summary_lines(report) -> list[str]:
     """The summary output's account of the group decisions: how many each
     source decided, and how their certificates and proofs fared."""
@@ -6265,6 +6284,18 @@ def _audit_impl(
                 f"  [red]{len(behavioural_report.unsettled())} certificate(s) or "
                 "proof(s) a decision credits on were not re-checked here, and "
                 "--require-recheck is set.[/red]")
+            has_failure = True
+
+    # --- Evidence strength (clause_strength) ---
+    # Additive signed section: each clause's strength beside its sufficiency,
+    # with the edges it was composed over. Recomputed here from the edges; a
+    # strength the package's own record does not give fails the audit.
+    if isinstance(pkg.get("clause_strength"), dict):
+        from .strength import check as _strength_check
+
+        strength_report = _strength_check(pkg)
+        _render_strength(strength_report)
+        if strength_report.inconsistent:
             has_failure = True
 
     # --- Run-level provenance (contributing runs) ---
