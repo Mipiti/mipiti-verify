@@ -132,7 +132,33 @@ Verification state in a report accumulates across (often partial) CI runs — ea
 
 The verifier checks each run independently: SHA-256 recomputed over the exact `results_canonical` bytes against `results_hash`, the signature over the hash with the run's key (embedded PEM or JWKS lookup by fingerprint), and the per-run Sigstore bundle when present. Each run is reported as `VERIFIED`, `UNRESOLVED KEY`, `UNVERIFIABLE SERIALIZATION`, `TAMPER-MISMATCH`, or `UNSIGNED`. A run whose `content_integrity` declares `unverifiable_serialization` (signed material exists but the signed bytes can no longer be re-derived; the serialization predates canonical freezing) is a coverage limitation — reported distinctly from a hash mismatch and never treated as tampering. A genuine mismatch over present `results_canonical` fails the audit.
 
+### Group decisions and what each rests on (`objective_judgements`)
+
+A package for a model with a behavioural model states, per control objective, how each mitigation group was decided: by a judge, by the behavioural analysis alone (`static`), or by a model check (`model_check`), each with a reading that words it as what it is (a possible threat found by analysis is never reported as a judged insufficiency). The verifier lists every decision with its source.
+
+An analysis decision that credits with no judge rests on certificates, and the package carries each one: the obligation's module text, the invariant Apalache checked, and the Apalache release. Where its proof closed it also carries the proof: the proof text, the module text, the `tlapm` build, and each step's time limit. An objective satisfied by design (every obligation holding with no control) carries its certificates the same way. The verifier:
+
+- checks that each certificate is bound to its own texts (the module text hashes to the module hash it names, the module it names is the module the text declares, the outcome is certified), and that each proof is of its certificate's module and invariant;
+- re-runs Apalache's three checks on each certificate (the invariant holds initially, every step keeps it, it implies the property), from the texts in the package;
+- re-runs `tlapm` on each proof, every obligation of which must close.
+
+Re-checking needs the pinned tools: Apalache 0.62.4 (`APALACHE_JAR`, or `apalache-mc` on PATH, with a Java 21 runtime) and `tlapm` 3edc73c (`TLAPM`, or `tlapm` on PATH). A certificate or proof that does not hold up (a text that does not hash to what it names, a proof of another invariant, a check Apalache refutes, a proof step that does not close) fails the audit. One that could not be re-checked here (no tool, another release, a checker error or time-out) is a caveat; `--require-recheck` makes it a failure for any decision that credits with no judge, and so does a certificate the package names but does not carry. `--no-recheck` skips the tools and keeps the binding checks. A model check's explored result is listed with what it rests on (the runner pool and the agreement of two runs): it is not a proof an auditor can check independently, and the verifier does not re-run it.
+
 Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. When contributing runs are embedded, the deprecated top-level `results_hash` + `signature` pair is superseded: a divergence there is rendered informationally (`NOT SCORED`) and tamper conclusions come solely from the per-run checks. Older envelopes without these keys verify exactly as before — the legacy pair stays strict, and the trust contract reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
+
+### Evidence strength (`clause_strength`)
+
+A package states, beside each control's sufficiency, how strongly each of its clauses is proven, on the order `none < claimed < witnessed < sound < constructed`, with the evidence each clause rests on and every fact the tier depends on: the evidence's soundness class, how it is bound to the clause, both verification tiers, whether its run was attested and its statement signed, whether its scope covers the path, and what an enumeration decided. A control is as strong as its weakest clause. The verifier recomputes every clause's tier and coverage from that evidence, and every control's from its clauses, with the platform's rules (held equal to them by a table of cases the platform decided), and fails a package whose stated strength its own record does not give. A strength stated as it was judged, for a superseded version, carries no evidence and is listed as such. Evidence that no longer passes is named beside its clause.
+
+### Declared controls (`declared_commitments`)
+
+A control a person declared a behavioural delta for is judged against that declaration rather than a decomposition of its text: one clause per edit, and one per thing the declaration says the text commits to that no edit states. Before such a control can read sufficient, its text is cross-checked once against the declaration for anything it commits to beyond it, and a person must dismiss every finding. The package states, per declared control, the declaration (its clauses, who declared it and when, the spans it says commit to nothing) and the cross-check with each finding and whether it was dismissed. The verifier:
+
+- recomputes each clause's id from its words and each finding's id from its words (held equal to the platform's by a table of cases the platform produced);
+- checks that a control served a verdict was declared over its text as the package states it;
+- checks that a control served sufficient has a completed cross-check, no finding left undismissed, and every span said to commit to nothing still reading in its text.
+
+A record that disagrees with itself, or with the status its control was served, fails the audit. An open finding on an insufficient control is why it reads insufficient, and is listed, not failed.
 
 ### Each check the verifier runs
 
@@ -181,6 +207,9 @@ The verifier exits non-zero on any of:
 - Bundle-bind signature present but no platform key resolvable (would be silent skip otherwise).
 - Document signature on the PDF/HTML body is missing or invalid.
 - Pinning flags supplied to a format that can't honour them (e.g. identity pins on an HTML report — fails-closed instead of silently dropping the pin).
+- A certificate or proof an analysis decision carries does not hold up: its texts do not hash to what it names, a proof is not of its certificate's invariant, Apalache refutes a check, or a proof step does not close. Under `--require-recheck`, also any certificate or proof a no-judge decision credits on that was not re-checked here or is not carried.
+- A clause or control's stated evidence strength is not what its own evidence gives.
+- A declared control's record disagrees with itself (a clause or finding whose id its words do not give, a declaration over another text than the one served a verdict), or its control is served sufficient with the cross-check missing, a finding no person dismissed, or a span said to commit to nothing that no longer reads.
 
 There is no `--allow-unsigned`, no soft-fail, and no fallback that treats a missing signature as "good." When the auditor needs to enforce attestation on the producer side too (CI runner), use `--require-attestation` on `mipiti-verify run` to make missing/failed signing a non-zero exit.
 
@@ -193,6 +222,7 @@ Every published audit can be re-checked offline using only:
 - The customer's workspace key fingerprint (auditor's out-of-band knowledge).
 - The customer's CI workflow identity (auditor's out-of-band knowledge).
 - For the customer-keyed offline DSSE path: the customer's public key, pinned out-of-band by the auditor via `--expected-customer-key`.
+- For the certificates and proofs of analysis decisions: Apalache 0.62.4 (on Java 21) and `tlapm` 3edc73c, run on the texts the package carries.
 
 No live Mipiti API access is required at audit time. The verifier produces the same verdict on the same input regardless of network reachability to api.mipiti.io.
 

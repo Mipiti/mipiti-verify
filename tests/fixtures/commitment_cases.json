@@ -1,0 +1,62 @@
+{
+  "clauses": [
+    {
+      "text": "Removes the transition that lets an unauthenticated caller read the session store (in the control's words: \"rejects requests without a valid token\")",
+      "fingerprint": "68174b86977641ec"
+    },
+    {
+      "text": "  Rejects   requests\nwithout a VALID token  ",
+      "fingerprint": "9cc535c4315f8131"
+    },
+    {
+      "text": "Café tokens are refused",
+      "fingerprint": "3b8650a2e3542316"
+    },
+    {
+      "text": "Café tokens are refused",
+      "fingerprint": "3b8650a2e3542316"
+    },
+    {
+      "text": "\"logs every refused request\" commits to detecting or reporting",
+      "fingerprint": "a96731f646f3d485"
+    },
+    {
+      "text": "\"The control's text\" commits to a commitment no edit states: rotates keys daily",
+      "fingerprint": "33032b448be04826"
+    },
+    {
+      "text": "",
+      "fingerprint": "0070e3e6052610a3"
+    }
+  ],
+  "findings": [
+    {
+      "text": "Removes the transition that lets an unauthenticated caller read the session store (in the control's words: \"rejects requests without a valid token\")",
+      "finding_id": "cabf85763c819923"
+    },
+    {
+      "text": "  Rejects   requests\nwithout a VALID token  ",
+      "finding_id": "e09d8705f0d9060f"
+    },
+    {
+      "text": "Café tokens are refused",
+      "finding_id": "e5f19b5e0b0c08dc"
+    },
+    {
+      "text": "Café tokens are refused",
+      "finding_id": "79f6fff936516a1e"
+    },
+    {
+      "text": "\"logs every refused request\" commits to detecting or reporting",
+      "finding_id": "27cdf47bdc182b02"
+    },
+    {
+      "text": "\"The control's text\" commits to a commitment no edit states: rotates keys daily",
+      "finding_id": "1b46f803689c601c"
+    },
+    {
+      "text": "",
+      "finding_id": "e3b0c44298fc1c14"
+    }
+  ]
+}
