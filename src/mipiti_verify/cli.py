@@ -3039,6 +3039,54 @@ def _render_strength(report) -> None:
                 console.print(f"      {cl.clause}: {cl.recomputed} — " + "; ".join(notes))
 
 
+def _strength_summary_lines(report) -> list[str]:
+    """The summary output's account of evidence strength: how many controls'
+    stated strength their evidence gives, and each that it does not."""
+    bad = report.inconsistent
+    lines = [f"  {len(report.controls) - len(bad)}/{len(report.controls)} control(s) "
+             "state the strength their evidence gives"]
+    for c in bad:
+        lines.append(f"    [red]✗ {c.control_id}: stated {c.served or 'unrecorded'}, "
+                     f"its evidence gives {c.recomputed or 'none'}[/red]")
+    return lines
+
+
+def _render_commitments(report) -> None:
+    """Render what each declared control was checked against
+    (``declared_commitments``): its declaration's clauses, who declared it,
+    and the cross-check with each finding and whether a person dismissed it;
+    every way the record disagrees with itself or its served status is marked."""
+    console.print("\n[bold]Declared controls (what each was checked against)[/bold]")
+    for c in report.controls:
+        mark = "[green]✓[/green]" if c.consistent else "[red]✗[/red]"
+        who = f" declared by {c.declared_by}" if c.declared_by else ""
+        when = f" at {c.declared_at}" if c.declared_at else ""
+        console.print(f"  [bold]{c.control_id}[/bold]: {c.served or 'unrecorded'}{who}{when} "
+                      f"{mark}")
+        for text in c.clauses:
+            console.print(f"      • {text}")
+        if not c.cross_check_completed:
+            console.print("      [yellow]cross-check not completed[/yellow]")
+        for f in c.findings:
+            state = "[dim]dismissed[/dim]" if f.get("dismissed") else "[yellow]open[/yellow]"
+            console.print(f"      cross-check finding ({state}): {f.get('text') or ''}")
+        for problem in c.problems:
+            console.print(f"      [red]{problem}[/red]")
+
+
+def _commitments_summary_lines(report) -> list[str]:
+    """The summary output's account of declared controls: how many, how many
+    cross-check findings stand open, and each record that disagrees."""
+    open_ = sum(len(c.open_findings) for c in report.controls)
+    lines = [f"  {len(report.controls)} declared control(s); "
+             + (f"[yellow]{open_} open cross-check finding(s)[/yellow]" if open_
+                else "no open cross-check finding")]
+    for c in report.inconsistent:
+        for problem in c.problems:
+            lines.append(f"    [red]✗ {c.control_id}: {problem}[/red]")
+    return lines
+
+
 def _behavioural_summary_lines(report) -> list[str]:
     """The summary output's account of the group decisions: how many each
     source decided, and how their certificates and proofs fared."""
@@ -3090,6 +3138,8 @@ _MANIFEST_SECTIONS: tuple[str, ...] = (
     "assertions_by_functional_test",
     "contributing_runs",
     "provenance_health",
+    "clause_strength",
+    "declared_commitments",
 )
 
 
@@ -4454,6 +4504,12 @@ def audit(
     texts the package carries. A certificate or proof that does not hold
     up fails the audit; one that could not be re-checked here is a caveat,
     or a failure under --require-recheck.
+
+    Evidence strength and declared controls: each clause's stated strength
+    is recomputed from the evidence the package carries for it, and each
+    declared control's record (its declaration and the cross-check's
+    findings) is re-checked against itself and the status its control was
+    served. A record that disagrees fails the audit.
     """
     render = _AuditRender(full=full_output)
     try:
@@ -6290,12 +6346,28 @@ def _audit_impl(
     # Additive signed section: each clause's strength beside its sufficiency,
     # with the edges it was composed over. Recomputed here from the edges; a
     # strength the package's own record does not give fails the audit.
+    strength_report = None
     if isinstance(pkg.get("clause_strength"), dict):
         from .strength import check as _strength_check
 
         strength_report = _strength_check(pkg)
         _render_strength(strength_report)
         if strength_report.inconsistent:
+            has_failure = True
+
+    # --- Declared controls (declared_commitments) ---
+    # Additive signed section: what each declared control was checked
+    # against, its declaration and the cross-check's findings. Each clause's
+    # and finding's id is recomputed from its words; a record that disagrees
+    # with itself, or a control served sufficient with its cross-check
+    # missing or a finding no person dismissed, fails the audit.
+    commitments_report = None
+    if isinstance(pkg.get("declared_commitments"), dict):
+        from .commitments import check as _commitments_check
+
+        commitments_report = _commitments_check(pkg)
+        _render_commitments(commitments_report)
+        if commitments_report.inconsistent:
             has_failure = True
 
     # --- Run-level provenance (contributing runs) ---
@@ -6950,6 +7022,14 @@ def _audit_impl(
         if behavioural_report is not None:
             console.print("\n[bold]Group decisions[/bold]")
             for line in _behavioural_summary_lines(behavioural_report):
+                console.print(line)
+        if strength_report is not None and strength_report.controls:
+            console.print("\n[bold]Evidence strength[/bold]")
+            for line in _strength_summary_lines(strength_report):
+                console.print(line)
+        if commitments_report is not None and commitments_report.controls:
+            console.print("\n[bold]Declared controls[/bold]")
+            for line in _commitments_summary_lines(commitments_report):
                 console.print(line)
         if isinstance(comp_raw, dict):
             _render_composition_summary(comp_raw)

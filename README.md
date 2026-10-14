@@ -146,6 +146,20 @@ Re-checking needs the pinned tools: Apalache 0.62.4 (`APALACHE_JAR`, or `apalach
 
 Assertions carried by the report's records but determined by no embedded run are reported as **manifest-only provenance**, cross-checked against `provenance_health.assertions_manifest_only`. When contributing runs are embedded, the deprecated top-level `results_hash` + `signature` pair is superseded: a divergence there is rendered informationally (`NOT SCORED`) and tamper conclusions come solely from the per-run checks. Older envelopes without these keys verify exactly as before — the legacy pair stays strict, and the trust contract reports run-level provenance as `UNKNOWN` (latest-run evidence only), never as a failure.
 
+### Evidence strength (`clause_strength`)
+
+A package states, beside each control's sufficiency, how strongly each of its clauses is proven, on the order `none < claimed < witnessed < sound < constructed`, with the evidence each clause rests on and every fact the tier depends on: the evidence's soundness class, how it is bound to the clause, both verification tiers, whether its run was attested and its statement signed, whether its scope covers the path, and what an enumeration decided. A control is as strong as its weakest clause. The verifier recomputes every clause's tier and coverage from that evidence, and every control's from its clauses, with the platform's rules (held equal to them by a table of cases the platform decided), and fails a package whose stated strength its own record does not give. A strength stated as it was judged, for a superseded version, carries no evidence and is listed as such. Evidence that no longer passes is named beside its clause.
+
+### Declared controls (`declared_commitments`)
+
+A control a person declared a behavioural delta for is judged against that declaration rather than a decomposition of its text: one clause per edit, and one per thing the declaration says the text commits to that no edit states. Before such a control can read sufficient, its text is cross-checked once against the declaration for anything it commits to beyond it, and a person must dismiss every finding. The package states, per declared control, the declaration (its clauses, who declared it and when, the spans it says commit to nothing) and the cross-check with each finding and whether it was dismissed. The verifier:
+
+- recomputes each clause's id from its words and each finding's id from its words (held equal to the platform's by a table of cases the platform produced);
+- checks that a control served a verdict was declared over its text as the package states it;
+- checks that a control served sufficient has a completed cross-check, no finding left undismissed, and every span said to commit to nothing still reading in its text.
+
+A record that disagrees with itself, or with the status its control was served, fails the audit. An open finding on an insufficient control is why it reads insufficient, and is listed, not failed.
+
 ### Each check the verifier runs
 
 | Check | Anchor | Fails when | What it defends against |
@@ -194,6 +208,8 @@ The verifier exits non-zero on any of:
 - Document signature on the PDF/HTML body is missing or invalid.
 - Pinning flags supplied to a format that can't honour them (e.g. identity pins on an HTML report — fails-closed instead of silently dropping the pin).
 - A certificate or proof an analysis decision carries does not hold up: its texts do not hash to what it names, a proof is not of its certificate's invariant, Apalache refutes a check, or a proof step does not close. Under `--require-recheck`, also any certificate or proof a no-judge decision credits on that was not re-checked here or is not carried.
+- A clause or control's stated evidence strength is not what its own evidence gives.
+- A declared control's record disagrees with itself (a clause or finding whose id its words do not give, a declaration over another text than the one served a verdict), or its control is served sufficient with the cross-check missing, a finding no person dismissed, or a span said to commit to nothing that no longer reads.
 
 There is no `--allow-unsigned`, no soft-fail, and no fallback that treats a missing signature as "good." When the auditor needs to enforce attestation on the producer side too (CI runner), use `--require-attestation` on `mipiti-verify run` to make missing/failed signing a non-zero exit.
 

@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--no-recheck` keeps the binding checks without running the tools;
   `--recheck-timeout` bounds each run. Objectives satisfied by design are
   checked the same way.
+- `audit` recomputes each clause's evidence strength (`clause_strength`) from
+  the evidence the package carries for it, and each control's from its
+  clauses, with the platform's rules, and fails a package whose stated
+  strength its own record does not give.
+- `audit` re-checks what each declared control was checked against
+  (`declared_commitments`): each clause's and cross-check finding's id from
+  its words, that a control served a verdict was declared over its text as the
+  package states it, and that a control served sufficient has a completed
+  cross-check with every finding dismissed by a person. A record that
+  disagrees with itself or its served status fails the audit. The summary
+  output states both sections.
 - Two assertion types whose pass is a statement about EVERY site in a declared
   scope rather than about one place. `sink_default_deny`: over every source
   file in `scope`, every site of a declared sink receives, at each guarded
