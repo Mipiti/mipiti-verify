@@ -32,13 +32,21 @@ nobody can invoke. These properties pin the four together:
       the params the catalogue publishes offer exactly those names, and the
       verifier's own reader accepts each of them and refuses a name outside
 
-T1, T2, T6, T7 and T8 need the catalogue (``mipiti_mcp.assertion_types``);
-when it is not installed, or predates a vocabulary, those are reported as
-not established and the exit status still reflects only what was checked.
-T3-T5 need nothing beyond this package.
+T1, T2, T6, T7 and T8 need the catalogue (``mipiti_mcp.assertion_types``).
+Found by itself (the installed ``mipiti-mcp`` package, else a ``mipiti-mcp``
+checkout beside this one, at ``../mcp-server``), a catalogue that is absent or predates a vocabulary leaves those
+properties reported as not established, and the exit status reflects only
+what was checked. T3-T5 need nothing beyond this package.
+
+``--catalogue PATH`` names the catalogue file to compare against instead, and
+makes the comparison the point of the run: the file must exist and every
+property must be established, so a catalogue the run cannot read, or one
+that predates a vocabulary, fails it. This is the form a release gate runs,
+with the catalogue and the verifier at the commits being released together.
 
 Usage:
     python formal/check_types.py
+    python formal/check_types.py --catalogue <mipiti-mcp checkout>/src/mipiti_mcp/assertion_types.py
 """
 
 from __future__ import annotations
@@ -70,18 +78,23 @@ _TEMPLATES = _ROOT / "src" / "mipiti_verify" / "templates"
 # Catalogue
 # ---------------------------------------------------------------------------
 
-def _load_catalogue():
+def _load_catalogue(named: Path | None = None):
     """The catalogue module, or ``None`` when it is not available.
 
-    Loaded from the file the installed ``mipiti_mcp`` package ships, or from
-    a sibling checkout, without importing the package itself: the catalogue
-    is pure data and the package's entry point is a running server.
+    ``named`` is the one file to read. Otherwise the file the installed
+    ``mipiti-mcp`` package ships, or a ``mipiti-mcp`` checkout's beside this
+    one. Either way the
+    file is loaded without importing the package itself: the catalogue is
+    pure data and the package's entry point is a running server.
     """
     candidates: list[Path] = []
-    spec = importlib.util.find_spec("mipiti_mcp")
-    if spec is not None and spec.submodule_search_locations:
-        candidates += [Path(p) / "assertion_types.py" for p in spec.submodule_search_locations]
-    candidates.append(_ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py")
+    if named is not None:
+        candidates.append(named)
+    else:
+        spec = importlib.util.find_spec("mipiti_mcp")
+        if spec is not None and spec.submodule_search_locations:
+            candidates += [Path(p) / "assertion_types.py" for p in spec.submodule_search_locations]
+        candidates.append(_ROOT.parent / "mcp-server" / "src" / "mipiti_mcp" / "assertion_types.py")
     for path in candidates:
         if path.is_file():
             module_spec = importlib.util.spec_from_file_location("_assertion_catalogue", path)
@@ -611,12 +624,24 @@ def _report(label: str, count: int, violations: List[str]) -> bool:
     return True
 
 
-def main() -> int:
+def main(argv: List[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Formal verification of the assertion-type design.")
+    parser.add_argument(
+        "--catalogue", type=Path, default=None,
+        help="the catalogue file (assertion_types.py) to compare against; "
+             "every property must then be established")
+    args = parser.parse_args(argv)
+
     print("=" * 70)
     print("ASSERTION TYPE DESIGN")
     print("=" * 70)
     _load_all()
-    catalogue = _load_catalogue()
+    if args.catalogue is not None and not args.catalogue.is_file():
+        print(f"\nTYPE PROPERTIES: FAILED (no catalogue at {args.catalogue})")
+        return 1
+    catalogue = _load_catalogue(args.catalogue)
     all_pass = True
     established: List[str] = []
     not_established: List[str] = []
@@ -671,6 +696,11 @@ def main() -> int:
     print(f"\n{'=' * 70}")
     if not all_pass:
         print("TYPE PROPERTIES: FAILED")
+        return 1
+    if not_established and args.catalogue is not None:
+        print(f"TYPE PROPERTIES: FAILED ({', '.join(not_established)} NOT ESTABLISHED "
+              f"against the named catalogue {args.catalogue})")
+        print(f"{'=' * 70}")
         return 1
     if not_established:
         print(f"TYPE PROPERTIES {', '.join(established)} VERIFIED; "

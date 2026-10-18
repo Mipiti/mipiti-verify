@@ -96,12 +96,26 @@ jobs:
 
           # On the push trigger, the release commit is the squash-merge of
           # the release pipeline's version-bump PR: a tree that differs
-          # from its parent only in pyproject.toml, and within that file
-          # only in the version line. Assert exactly that shape.
+          # from its parent in pyproject.toml, only in the version line,
+          # and in CHANGELOG.md, only by the version's section, added as
+          # one block that opens with its heading. Assert exactly that
+          # shape.
           if [ "$EVENT_NAME" = "push" ]; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD)
-            if [ "$CHANGED" != "pyproject.toml" ]; then
-              echo "::error::Release commit must change only pyproject.toml; it changes: ${CHANGED:-nothing}"
+            CHANGED=$(git diff --name-only HEAD~1 HEAD | tr '\n' ' ')
+            if [ "$CHANGED" != "CHANGELOG.md pyproject.toml " ]; then
+              echo "::error::Release commit must change only CHANGELOG.md and pyproject.toml; it changes: ${CHANGED:-nothing}"
+              exit 1
+            fi
+            SECTION=$(git diff --unified=0 HEAD~1 HEAD -- CHANGELOG.md | awk '/^(@@|[+-])/ && !/^(\+\+\+|---) /')
+            # The first added line that is not blank: a diff may place the
+            # block's surrounding blank line on either side of it.
+            FIRST_ADDED=$(printf '%s\n' "$SECTION" | grep -m1 '^+.' || true)
+            VERSION_RE=$(printf '%s' "$PYPROJECT_VERSION" | sed 's/\./\\./g')
+            if [ "$(printf '%s\n' "$SECTION" | grep -c '^@@')" -ne 1 ] \
+               || printf '%s\n' "$SECTION" | grep -q '^-' \
+               || ! printf '%s\n' "$FIRST_ADDED" | grep -qxE "\+## \[${VERSION_RE}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}"; then
+              echo "::error::Release commit must add only the CHANGELOG.md section for $PYPROJECT_VERSION, as one block opening with its heading"
+              printf '%s\n' "$SECTION" | head -5
               exit 1
             fi
             # Every changed line must be a version line, with the new one
