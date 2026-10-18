@@ -5,9 +5,9 @@ All notable changes to `mipiti-verify` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Every merged change is released, so there is no "Unreleased" section: a
-version's section is written by its release, from the changelog entry in the
-description of each pull request it ships.
+Every merged change is released: a version's section is written by its
+release, from the changelog entry in the description of each pull request it
+ships.
 
 ## [0.56.0 and earlier]
 
