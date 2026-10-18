@@ -9,6 +9,16 @@ Every merged change is released: a version's section is written by its
 release, from the changelog entry in the description of each pull request it
 ships.
 
+## [0.56.1] - 2026-10-18
+
+### Changed
+
+- Bump python from `2f17fc0` to `a6e34c5` (#441)
+- Bump actions/create-github-app-token from 3.2.0 to 3.3.0 in the github-actions group (#442)
+- `formal/check_types.py --catalogue PATH` compares the verifiers with the named assertion-type catalogue and fails unless every property is established against it, including when the file is absent or predates a vocabulary. `mipiti-mcp` is no longer a development dependency. (#443)
+- Each release's notes are its CHANGELOG.md section, written when it is released; the changelog has no Unreleased section. (#443)
+- CHANGELOG.md's opening paragraph states how each version's section is written. (#444)
+
 ## [0.56.0 and earlier]
 
 ### Security
