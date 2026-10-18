@@ -1,10 +1,13 @@
 """``formal/check_types.py`` runs under the ordinary test suite.
 
-T3-T5 (templates, clauses, evidence class) need only this package. T1-T2
-compare the registry with the assertion-type catalogue and run when it is
-importable; otherwise the checker reports them as not established and this
-test asserts that wording, so a missing catalogue is visible rather than
-silently green.
+T3-T5 (templates, clauses, evidence class) need only this package. T1, T2
+and T6-T8 compare the registry with the assertion-type catalogue and run when
+one is reachable; otherwise the checker reports them as not established and
+this test asserts that wording, so a missing catalogue is visible rather than
+silently green. This package does not install the catalogue: the comparison
+that gates a release runs where both packages are checked out at the commits
+being released, with ``--catalogue`` naming the file, and the tests below hold
+that form to failing on a catalogue it cannot read or that lacks a vocabulary.
 """
 
 from __future__ import annotations
@@ -67,6 +70,56 @@ def test_every_type_property_is_verified():
                 f"{', '.join(missing)} NOT ESTABLISHED") in result.stdout, result.stdout
     for prop in ("T3 templates", "T4 fail-closed + injection clauses", "T5 evidence class"):
         assert f"{prop} (" in result.stdout and "FAILED" not in result.stdout, result.stdout
+
+
+def _run_named(path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(CHECKER), "--catalogue", str(path)],
+        cwd=ROOT, capture_output=True, text=True, timeout=600,
+    )
+
+
+def test_a_named_catalogue_that_is_absent_fails_the_run(tmp_path):
+    """A gate that names a catalogue and cannot read it has checked nothing
+    against it: it fails rather than reporting the comparison as not
+    established and exiting 0."""
+    result = _run_named(tmp_path / "assertion_types.py")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "TYPE PROPERTIES: FAILED (no catalogue at" in result.stdout, result.stdout
+
+
+def test_a_named_catalogue_must_establish_every_property(tmp_path):
+    """A catalogue that predates a vocabulary leaves T6-T8 unestablished.
+    Found by itself that is reported and passes; named, it fails, so a
+    release cannot ship a verifier compared against less than the whole
+    catalogue."""
+    path = tmp_path / "assertion_types.py"
+    path.write_text("ASSERTION_TYPES = ()\n", encoding="utf-8")
+    result = _run_named(path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert ("TYPE PROPERTIES: FAILED (T6, T7, T8 NOT ESTABLISHED against the named catalogue"
+            in result.stdout), result.stdout
+
+
+def test_a_named_catalogue_is_the_one_compared(tmp_path):
+    """Naming a file reads that file, not an installed mipiti-mcp or a
+    mipiti-mcp checkout beside this one: a catalogue publishing a type the registry has no verifier for
+    fails T1 on that type."""
+    path = tmp_path / "assertion_types.py"
+    path.write_text(
+        "from dataclasses import dataclass, field\n"
+        "@dataclass\n"
+        "class T:\n"
+        "    name: str\n"
+        "    required_params: tuple = ()\n"
+        "    optional_params: tuple = ()\n"
+        "    params: tuple = ()\n"
+        "ASSERTION_TYPES = (T('a_type_no_verifier_has'),)\n",
+        encoding="utf-8",
+    )
+    result = _run_named(path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "catalogue type 'a_type_no_verifier_has' has no structural verifier" in result.stdout, result.stdout
 
 
 def _checker_module():

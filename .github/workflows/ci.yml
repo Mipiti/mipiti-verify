@@ -430,7 +430,8 @@ jobs:
     #
     # Skipped on automated version-bump PRs (head branch
     # `release/v*`, title `chore: release v*`). Those PRs only edit
-    # pyproject.toml's version string — they don't touch the spec,
+    # pyproject.toml's version string and add the version's CHANGELOG.md
+    # section — they don't touch the spec,
     # the implementation, or any code path the BFS exercises. The
     # heavy Fulcio-OIDC-minting run adds no signal there. Required-
     # check satisfaction is preserved: a job skipped via job-level

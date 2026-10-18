@@ -5,8 +5,9 @@ name: Update README Pin
 #
 #   1. Create (or move) the vX.Y.Z tag at the pin commit, so
 #      `git checkout vX.Y.Z` lands on the verified image reference.
-#   2. Create (or update) the GitHub Release at that tag, with a
-#      digest-pinned Docker Image reference lifted from action.yml.
+#   2. Create (or update) the GitHub Release at that tag: the version's
+#      CHANGELOG.md section, then a digest-pinned Docker Image reference
+#      lifted from action.yml.
 #      (Moved from publish.yml so the release links to the pin commit,
 #      not the pre-pin release commit.)
 #   3. Rewrite the README's copy-paste `uses:` snippet to the new
@@ -139,6 +140,19 @@ jobs:
           Digest: \`${DIGEST}\`
           NOTES
           )
+
+          # The version's CHANGELOG.md section, which the release commit
+          # wrote, opens the notes.
+          CHANGES=$(awk -v h="## [${TAG#v}]" '
+            index($0, h) == 1 {flag=1; next}
+            flag && /^## \[/ {exit}
+            flag {print}
+          ' CHANGELOG.md)
+          if [ -n "$(printf '%s' "$CHANGES" | tr -d '[:space:]')" ]; then
+            NOTES="${CHANGES}
+
+          ${NOTES}"
+          fi
 
           if gh release view "$TAG" --json body >/dev/null 2>&1; then
             echo "Release $TAG already exists; appending Docker note if not present"
