@@ -1,0 +1,5 @@
+--- ls4-1.0.orig/core/Main.cc
++++ ls4-1.0/core/Main.cc
+@@ -853 +853 @@
+-#if defined(__linux__)
++#if defined(__linux__) && defined(_FPU_EXTENDED)

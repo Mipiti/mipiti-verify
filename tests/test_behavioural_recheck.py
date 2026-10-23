@@ -1,28 +1,34 @@
 """The group decisions an audit package states, and the re-check of the
 certificates and proofs an analysis decision rests on.
 
-The checkers are faked here except in the last test, which runs the pinned
-Apalache on a small certificate when one is installed."""
+The certificate and proof are the platform's own, read from the design proof
+bundle in ``tests/fixtures/design-bundle`` (a certificate and a proof of one
+obligation of a synthetic model). The checkers are faked here except in the
+last tests, which run the pinned tools on them where they are installed."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
-import os
-import shutil
+import shlex
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from mipiti_verify import behavioural as B
+from mipiti_verify import design_bundle as DB
 from mipiti_verify.cli import main
 
-MODULE = ("---- MODULE Cert_M ----\nEXTENDS Integers\nVARIABLE\n  \\* @type: Int;\n  x\n"
-          "CInit == TRUE\nInit == x = 0\nNext == x' = x\n====\n")
-INVARIANT = ("---- MODULE Cert_M_inv ----\nEXTENDS Cert_M\nIndInv == x = 0\n"
-             "InitInv == IndInv\nProp == x = 0\n====\n")
-PROOF = ("---- MODULE Cert_M_proof ----\nEXTENDS Cert_M\nTHEOREM TRUE\n  OBVIOUS\n====\n")
+FIXTURE = Path(__file__).parent / "fixtures" / "design-bundle"
+BUNDLE = DB.read((FIXTURE / "design-proof-bundle.tar.gz").read_bytes())
+_CERT_ROW = BUNDLE.json("certificates.json")[0]
+_PROOF_ROW = BUNDLE.json("proofs.json")[0]
+MODULE_NAME = _CERT_ROW["module_name"]
+MODULE = BUNDLE.text(f"modules/{_CERT_ROW['key_hash']}/{MODULE_NAME}.tla")
+INVARIANT = _CERT_ROW["invariant"]
+PROOF = _PROOF_ROW["proof_text"]
 
 
 def _sha(text: str) -> str:
@@ -30,21 +36,11 @@ def _sha(text: str) -> str:
 
 
 def _cert(**over) -> dict:
-    return {"obligation_id": "ob1", "claim_id": "P1", "attacker_class": "c1",
-            "key_hash": "k1", "module_name": "Cert_M", "module_text": MODULE,
-            "module_hash": _sha(MODULE), "invariant": INVARIANT,
-            "invariant_source": "p_and_type", "invariant_hash": "cands",
-            "form": "state", "apalache_rev": B.APALACHE_VERSION,
-            "outcome": B.CERTIFIED, "computed_at": "", "stored": True, **over}
+    return {**_CERT_ROW, "module_text": MODULE, "stored": True, **over}
 
 
 def _proof(**over) -> dict:
-    return {"obligation_id": "ob1", "claim_id": "P1", "key_hash": "p1",
-            "module_name": "Cert_M", "module_text": MODULE, "module_hash": _sha(MODULE),
-            "invariant_hash": _sha(INVARIANT), "proof_text": PROOF,
-            "tlapm_rev": B.TLAPM_VERSION, "outcome": B.PROVED,
-            "step_backends": {"3: THEOREM TRUE": "smt"}, "step_seconds": 5.0,
-            "computed_at": "", **over}
+    return {**_PROOF_ROW, "module_text": MODULE, **over}
 
 
 def _section(group_extra=None, design=None) -> dict:
@@ -61,6 +57,9 @@ def _section(group_extra=None, design=None) -> dict:
                                           "groups": [judged]}]}}
 
 
+FAKE = B.LocalTools("/fake/apalache.jar", "/fake/tlapm")
+
+
 @pytest.fixture
 def no_tools(monkeypatch):
     monkeypatch.setattr(B, "find_apalache", lambda: (None, "Apalache is not installed"))
@@ -72,16 +71,16 @@ def tools(monkeypatch):
     """Checkers that answer as configured, recording what they were given."""
     calls = {"apalache": [], "tlapm": []}
     answers = {"apalache": [("init", "holds", ""), ("step", "holds", ""),
-                            ("property", "holds", "")],
+                            ("property", "holds", ""), ("init state", "fails", ""),
+                            ("start state", "fails", "")],
                "tlapm": {"exit": 0, "timed_out": False, "statuses": {"1": "proved"}}}
-    monkeypatch.setattr(B, "find_apalache", lambda: ("/fake/apalache.jar", ""))
-    monkeypatch.setattr(B, "find_tlapm", lambda: ("/fake/tlapm", ""))
+    monkeypatch.setattr(B, "local_tools", lambda: (FAKE, {}))
 
-    def apalache(jar, name, module, invariant, form, timeout):
+    def apalache(tools, name, module, invariant, form, timeout):
         calls["apalache"].append((name, module, invariant, form))
         return answers["apalache"]
 
-    def tlapm(exe, name, module, proof, *, step_seconds, timeout):
+    def tlapm(tools, name, module, proof, *, step_seconds, timeout):
         calls["tlapm"].append((name, module, proof, step_seconds))
         return answers["tlapm"]
 
@@ -116,6 +115,63 @@ def test_a_package_without_the_section_has_no_decisions():
     assert B.decisions({}) == [] and B.decisions({"objective_judgements": "x"}) == []
 
 
+# --- what a certificate must be about ----------------------------------------------------
+
+
+def test_the_platforms_certificate_and_proof_are_about_their_module_and_claim():
+    assert B.certificate_problems(MODULE, MODULE_NAME, INVARIANT, "step", "one_way") == []
+    assert B.proof_problems(PROOF, MODULE, MODULE_NAME, INVARIANT, "step") == []
+
+
+_MUTANTS = [
+    ("Prop == ClaimStep_0", "Prop == TRUE", "not the module's claim"),
+    ("EXTENDS Cert_030f7e6c67, Apalache", "EXTENDS Cert_030f7e6c67, Apalache, Naturals",
+     "extend exactly"),
+    ("InitInv == Assign /\\ IndInv", "InitInv == Assign", "InitInv is not"),
+    ("  /\\ fl2 = Gen(1)", "  /\\ fl2 = Gen(1)\n  /\\ now = 0", "Assign's 'now = 0'"),
+    ("CInit == H = 0 /\\", "CInit == H = 0 /\\ H = 1 /\\", "does not bind one constant"),
+    ("Hi_0_0 = 2\n", "Hi_0_0 = 2 /\\ Extra = 1\n", "exactly the module's constants"),
+    ("CInit == H = 0", "CInit == H = Inst", "does not bind one constant to a value"),
+    ("IndInv ==\n", "Init == TRUE\nIndInv ==\n", "redefines Init"),
+    ("IndInv ==\n", "ASSUME FALSE\nIndInv ==\n", "declares"),
+    ("  /\\ Inv_7\n", "  /\\ Inv_7\n  /\\ Elsewhere\n", "IndInv is not a conjunction"),
+]
+
+
+@pytest.mark.parametrize("old,new,why", _MUTANTS)
+def test_a_certificate_that_could_hold_without_checking_the_claim_is_refused(old, new, why):
+    assert old in INVARIANT
+    problems = B.certificate_problems(MODULE, MODULE_NAME, INVARIANT.replace(old, new),
+                                      "step", "one_way")
+    assert any(why in p for p in problems), problems
+
+
+def test_a_certificate_of_another_kind_or_form_is_refused():
+    # An availability claim is certified through Answerable, as a state property.
+    assert B.certificate_problems(MODULE, MODULE_NAME, INVARIANT, "step", "availability")
+    assert B.certificate_problems(MODULE, MODULE_NAME, INVARIANT, "state", "one_way")
+
+
+_PROOF_MUTANTS = [
+    ("BY InitHolds, StepHolds, PropHolds, PTL DEF Spec", "OMITTED", "omits a step"),
+    ("THEOREM Holds == Spec => [][Prop]_vars", "THEOREM Holds == Init => IndInv",
+     "theorem Holds is not"),
+    ("THEOREM InitHolds", "AXIOM Cheat == FALSE\nTHEOREM InitHolds", "declares"),
+    ("EXTENDS Cert_030f7e6c67, FiniteSetTheorems, TLAPS",
+     "EXTENDS Cert_030f7e6c67, FiniteSetTheorems, TLAPS, Other", "libraries only"),
+    ("Prop == ClaimStep_0", "Prop == TRUE", "Prop is not the certificate's"),
+    ("  /\\ Inv_7\n", "  /\\ Inv_6\n", "IndInv is not the certificate's"),
+]
+
+
+@pytest.mark.parametrize("old,new,why", _PROOF_MUTANTS)
+def test_a_proof_that_is_not_of_the_claim_at_every_scope_is_refused(old, new, why):
+    assert old in PROOF
+    problems = B.proof_problems(PROOF.replace(old, new), MODULE, MODULE_NAME, INVARIANT,
+                                "step")
+    assert any(why in p for p in problems), problems
+
+
 # --- certificates ---------------------------------------------------------------------
 
 
@@ -124,29 +180,35 @@ def test_a_package_without_the_section_has_no_decisions():
     ({"outcome": "not_certified"}, B.FAILED),
     ({"module_text": ""}, B.FAILED),
     ({"module_name": "Other"}, B.FAILED),
+    ({"invariant": INVARIANT.replace("Prop == ClaimStep_0", "Prop == TRUE")}, B.FAILED),
     ({"apalache_rev": "0.50.0"}, B.NOT_RECHECKED),
     ({"stored": False}, B.MISSING),
 ])
-def test_a_certificate_is_bound_to_its_texts_before_anything_runs(tools, over, status):
+def test_a_certificate_is_checked_before_anything_runs(tools, over, status):
     calls, _ = tools
-    assert B.recheck_certificate(_cert(**over), "/fake/apalache.jar", 10).status == status
+    assert B.recheck_certificate(_cert(**over), FAKE, 10).status == status
     assert calls["apalache"] == []
 
 
-def test_a_certificate_holds_only_when_the_three_checks_hold_here(tools):
+def test_a_certificate_holds_only_when_the_checks_hold_and_are_not_vacuous(tools):
     calls, answers = tools
-    r = B.recheck_certificate(_cert(), "/fake/apalache.jar", 10)
+    r = B.recheck_certificate(_cert(), FAKE, 10)
     assert r.status == B.RECHECKED
-    assert calls["apalache"] == [("Cert_M", MODULE, INVARIANT, "state")]
+    assert calls["apalache"] == [(MODULE_NAME, MODULE, INVARIANT, "step")]
     answers["apalache"] = [("init", "holds", ""), ("step", "fails", "")]
-    r = B.recheck_certificate(_cert(), "/fake/apalache.jar", 10)
+    r = B.recheck_certificate(_cert(), FAKE, 10)
     assert r.status == B.FAILED and "step" in r.detail
+    # No state the checks start from: they hold of nothing.
+    answers["apalache"] = [("init", "holds", ""), ("step", "holds", ""),
+                           ("property", "holds", ""), ("init state", "holds", "")]
+    r = B.recheck_certificate(_cert(), FAKE, 10)
+    assert r.status == B.FAILED and "vacuously" in r.detail
     # A checker that could not answer is not a refutation.
     answers["apalache"] = [("init", "error", "parse error")]
-    assert B.recheck_certificate(_cert(), "/fake/apalache.jar", 10).status == B.NOT_RECHECKED
+    assert B.recheck_certificate(_cert(), FAKE, 10).status == B.NOT_RECHECKED
     answers["apalache"] = [("init", "holds", ""), ("step", "timeout", "")]
-    assert B.recheck_certificate(_cert(), "/fake/apalache.jar", 10).status == B.NOT_RECHECKED
-    # Without Apalache the binding is still checked, and nothing is claimed.
+    assert B.recheck_certificate(_cert(), FAKE, 10).status == B.NOT_RECHECKED
+    # Without Apalache the certificate is still checked, and nothing is claimed.
     assert B.recheck_certificate(_cert(), None, 10).status == B.NOT_RECHECKED
     assert B.recheck_certificate(_cert(module_hash="x"), None, 10).status == B.FAILED
 
@@ -157,32 +219,70 @@ def test_a_certificate_holds_only_when_the_three_checks_hold_here(tools):
 @pytest.mark.parametrize("over,cert,status", [
     ({"module_hash": "0" * 64}, _cert(), B.FAILED),
     ({"invariant_hash": _sha("another invariant")}, _cert(), B.FAILED),
-    ({}, _cert(module_text="---- MODULE Cert_M ----\n====\n",
-               module_hash=_sha("---- MODULE Cert_M ----\n====\n")), B.FAILED),
     ({}, None, B.FAILED),
     ({}, _cert(stored=False), B.FAILED),
     ({"outcome": "holds_certified"}, _cert(), B.FAILED),
-    ({"tlapm_rev": "abc1234"}, _cert(), B.NOT_RECHECKED),
+    ({"proof_text": PROOF.replace("BY InitHolds, StepHolds, PropHolds, PTL DEF Spec",
+                                  "OMITTED")}, _cert(), B.FAILED),
+    ({"tlapm_rev": "3edc73c"}, _cert(), B.NOT_RECHECKED),
 ])
 def test_a_proof_is_of_its_certificate_before_anything_runs(tools, over, cert, status):
     calls, _ = tools
-    assert B.recheck_proof(_proof(**over), cert, "/fake/tlapm", 10).status == status
+    assert B.recheck_proof(_proof(**over), cert, FAKE, 10).status == status
     assert calls["tlapm"] == []
 
 
 def test_a_proof_holds_only_when_every_obligation_closes_here(tools):
     calls, answers = tools
-    assert B.recheck_proof(_proof(), _cert(), "/fake/tlapm", 10).status == B.RECHECKED
+    assert B.recheck_proof(_proof(), _cert(), FAKE, 10).status == B.RECHECKED
     # At the step limit it was checked under.
-    assert calls["tlapm"] == [("Cert_M", MODULE, PROOF, 5.0)]
+    assert calls["tlapm"] == [(MODULE_NAME, MODULE, PROOF, _PROOF_ROW["step_seconds"])]
     answers["tlapm"] = {"exit": 1, "timed_out": False,
                         "statuses": {"1": "proved", "2": "failed"}}
-    assert B.recheck_proof(_proof(), _cert(), "/fake/tlapm", 10).status == B.FAILED
+    assert B.recheck_proof(_proof(), _cert(), FAKE, 10).status == B.FAILED
     answers["tlapm"] = {"exit": None, "timed_out": True, "statuses": {}}
-    assert B.recheck_proof(_proof(), _cert(), "/fake/tlapm", 10).status == B.NOT_RECHECKED
+    assert B.recheck_proof(_proof(), _cert(), FAKE, 10).status == B.NOT_RECHECKED
     answers["tlapm"] = {"exit": 0, "timed_out": False, "statuses": {}}
-    assert B.recheck_proof(_proof(), _cert(), "/fake/tlapm", 10).status == B.NOT_RECHECKED
+    assert B.recheck_proof(_proof(), _cert(), FAKE, 10).status == B.NOT_RECHECKED
     assert B.recheck_proof(_proof(), _cert(), None, 10).status == B.NOT_RECHECKED
+
+
+# --- the commands are the platform's ---------------------------------------------------
+
+
+def _script_commands() -> list:
+    """The commands the bundle's recheck.sh runs, as the platform wrote
+    them, with its variables bound."""
+    out = []
+    for line in BUNDLE.text("recheck.sh").splitlines():
+        if '(cd "$WORK" && ' not in line:
+            continue
+        inner = line[line.index("&& ") + 3:line.index(") > ")]
+        inner = (inner.replace('"$WORK"', "/W").replace('"$APALACHE_JAR"', "/J")
+                 .replace('"$TLAPM"', "/T"))
+        out.append(shlex.split(inner))
+    return out
+
+
+def test_the_commands_are_the_ones_the_platform_runs():
+    local = B.LocalTools("/J", "/T")
+    *checks, prover = _script_commands()
+    form = _CERT_ROW["form"]
+    inv_name = B._module_name(INVARIANT)
+    assert checks == [local.apalache("/W", args, inv_name) for _c, args in
+                      B.apalache_checks(form)]
+    proof_name = B._module_name(PROOF)
+    assert prover == local.prover("/W", proof_name, _PROOF_ROW["step_seconds"])
+
+
+def test_the_image_runs_the_same_commands_with_no_network():
+    image = B.ImageTools("img@sha256:" + "0" * 64)
+    argv = image.prover("/host/work", "P_proof", 20.0)
+    run = image.container(argv, "/host/work", "n")
+    assert run[:3] == ["docker", "run", "--rm"] and "--network=none" in run
+    assert run[run.index("--volume") + 1] == "/host/work:/work"
+    assert run[run.index("--entrypoint") + 1] == B.IMAGE_TLAPM
+    assert run[-len(argv) + 1:] == argv[1:] and "/work/cache" in argv
 
 
 def test_a_report_settles_only_what_ran(no_tools):
@@ -190,7 +290,6 @@ def test_a_report_settles_only_what_ran(no_tools):
     assert not report.failed
     assert {r.status for r in report.rechecks()} == {B.NOT_RECHECKED}
     assert len(report.unsettled()) == 2 and set(report.tools_missing) == {"apalache", "tlapm"}
-    # A decision a judge answered rests on no certificate of its own.
     off = B.check({"objective_judgements": _section()}, run_tools=False)
     assert set(off.tools_missing) == {"all"}
 
@@ -232,8 +331,8 @@ def test_the_audit_lists_each_decisions_source_and_rechecks(tmp_path, tools):
     assert "Group decisions" in result.output
     assert "CO-01 group 1: analysis covered" in result.output
     assert "CO-01 group 2: judge covered" in result.output
-    assert "certificate of ob1: RE-CHECKED" in result.output
-    assert "proof of ob1: RE-CHECKED" in result.output
+    assert "certificate of FlagStays: RE-CHECKED" in result.output
+    assert "proof of FlagStays: RE-CHECKED" in result.output
     assert "Certificates & proofs:  RE-CHECKED (2/2 re-checked here)" in result.output
 
 
@@ -259,7 +358,6 @@ def test_a_decision_crediting_with_no_certificate_at_all_is_said_so(tools):
     report = B.check({"objective_judgements": bare})
     (missing,) = report.unsettled()
     assert missing.status == B.MISSING and "carries no certificate" in missing.detail
-    # A judge's covered answer rests on no certificate of its own.
     assert all(r.status == B.MISSING for r in report.rechecks())
 
 
@@ -273,18 +371,26 @@ def test_a_certificate_the_package_does_not_carry_is_never_passed_over(tmp_path,
     assert CliRunner().invoke(main, ["audit", path, "--require-recheck"]).exit_code == 1
 
 
-# --- the pinned Apalache, where installed -----------------------------------------------
+# --- the pinned tools, where installed -----------------------------------------------------
 
 
-def _apalache_installed() -> bool:
-    if not (os.environ.get("APALACHE_JAR") or shutil.which("apalache-mc")):
-        return False
-    return B.find_apalache()[0] is not None
+def _installed() -> tuple:
+    tools, missing = B.local_tools()
+    return tools, missing
 
 
-@pytest.mark.skipif(not _apalache_installed(), reason="the pinned Apalache is not installed")
-def test_a_real_certificate_is_rechecked_and_a_wrong_one_refuted():
-    jar, _ = B.find_apalache()
-    assert B.recheck_certificate(_cert(), jar, 300).status == B.RECHECKED
-    wrong = INVARIANT.replace("Prop == x = 0", "Prop == x = 1")
-    assert B.recheck_certificate(_cert(invariant=wrong), jar, 300).status == B.FAILED
+@pytest.mark.skipif(bool(_installed()[1].get("apalache")),
+                    reason="the pinned Apalache is not installed")
+def test_the_platforms_certificate_is_rechecked_and_a_wrong_one_refuted():
+    tools, _ = _installed()
+    assert B.recheck_certificate(_cert(), tools, 600).status == B.RECHECKED
+    empty = INVARIANT.replace("Lo_0_0 = 0 /\\ Hi_0_0 = 2", "Lo_0_0 = 3 /\\ Hi_0_0 = 2")
+    r = B.recheck_certificate(_cert(invariant=empty), tools, 600)
+    assert r.status == B.FAILED and "vacuously" in r.detail
+
+
+@pytest.mark.skipif(bool(_installed()[1].get("tlapm")),
+                    reason="the pinned tlapm is not installed")
+def test_the_platforms_proof_is_rechecked():
+    tools, _ = _installed()
+    assert B.recheck_proof(_proof(), _cert(), tools, 900).status == B.RECHECKED

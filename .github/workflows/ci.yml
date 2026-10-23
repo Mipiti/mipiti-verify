@@ -205,6 +205,16 @@ jobs:
           MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
 
+      - name: Re-check a design proof bundle in the pinned tools image
+        # The platform's certificate and proof in tests/fixtures/design-bundle,
+        # re-checked by Apalache and tlapm in the image design_check_image.json
+        # pins, as a user runs it.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        run: |
+          mipiti-verify design-bundle tests/fixtures/design-bundle/design-proof-bundle.tar.gz \
+            --platform-pubkey tests/fixtures/design-bundle/platform-key.pem \
+            --recheck --tools image
+
       - name: Formal verification (Python BFS + cross-check)
         # Fail-safe inert skip: RUN unless detect-changes succeeded AND
         # judged the diff inert. detect-changes failure ⇒ runs.
