@@ -4,14 +4,16 @@ name: Publish design check tools image
 # ghcr.io/mipiti/mipiti-design-check:<key>, the key being a hash of every file
 # the image is built from (the same key src/mipiti_verify/design_check_image.json
 # records beside the digest mipiti-verify pins). A key is published once and
-# never pushed again. Each image carries a Sigstore build provenance
-# attestation tying its digest to this workflow and commit:
+# never pushed again. Images are published only from main. Each image
+# carries a Sigstore build provenance attestation tying its digest to this
+# workflow and commit:
 #
 #   gh attestation verify oci://ghcr.io/mipiti/mipiti-design-check@<digest> \
 #     --repo Mipiti/mipiti-verify
 
 on:
   push:
+    branches: [main]
     paths:
       - 'design-check/**'
       - '.github/workflows/publish-design-check.yml'
@@ -21,6 +23,7 @@ permissions: {}
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
