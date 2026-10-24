@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "certifi>=2024.7.4",
+    "certifi>=2026.10.19",  # security floor: <2026.10.19 carries PYSEC-2026-4320
     "click>=8.3.3",  # security floor: <8.3.3 carries PYSEC-2026-2132
     "cryptography>=50.0.0",  # security floor (direct + transitive via sigstore): <50.0.0 carries PYSEC-2026-3552; <48.0.1 carried GHSA-537c-gmf6-5ccf
     "google-re2>=1.1",

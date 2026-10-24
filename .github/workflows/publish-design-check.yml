@@ -1,0 +1,102 @@
+name: Publish design check tools image
+
+# Builds design-check/Dockerfile for amd64 and arm64 and pushes
+# ghcr.io/mipiti/mipiti-design-check:<key>, the key being a hash of every file
+# the image is built from (the same key src/mipiti_verify/design_check_image.json
+# records beside the digest mipiti-verify pins). A key is published once and
+# never pushed again. Each image carries a Sigstore build provenance
+# attestation tying its digest to this workflow and commit:
+#
+#   gh attestation verify oci://ghcr.io/mipiti/mipiti-design-check@<digest> \
+#     --repo Mipiti/mipiti-verify
+
+on:
+  push:
+    paths:
+      - 'design-check/**'
+      - '.github/workflows/publish-design-check.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell \
+            /usr/share/swift || true
+          docker system prune -af >/dev/null || true
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.0.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute the content key
+        id: key
+        run: |
+          key=$(python3 - <<'EOF'
+          import hashlib
+          h = hashlib.sha256()
+          for rel in ("design-check/Dockerfile", "design-check/tlapm-ls4-fpu.patch"):
+              data = open(rel, "rb").read()
+              h.update(f"{rel}\0{len(data)}\0".encode())
+              h.update(data)
+          print(h.hexdigest()[:16])
+          EOF
+          )
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Skip when this key is already published
+        id: exists
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+        run: |
+          if docker manifest inspect "ghcr.io/mipiti/mipiti-design-check:$KEY" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::mipiti-design-check:$KEY is already published"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push
+        id: build
+        if: steps.exists.outputs.hit != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: design-check
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/mipiti/mipiti-design-check:${{ steps.key.outputs.key }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Mipiti/mipiti-verify
+            org.opencontainers.image.description=Apalache, tlapm and Z3 at the releases mipiti-verify re-checks design proof bundles with
+          cache-from: type=gha,scope=design-check
+          cache-to: type=gha,mode=max,scope=design-check
+      - name: Attest image provenance (Sigstore)
+        if: steps.exists.outputs.hit != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ghcr.io/mipiti/mipiti-design-check
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: The digest to pin
+        if: steps.exists.outputs.hit != 'true'
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "::notice::design_check_image.json: {\"key\": \"$KEY\", \"image\": \"ghcr.io/mipiti/mipiti-design-check@$DIGEST\"}"
