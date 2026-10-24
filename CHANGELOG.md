@@ -9,6 +9,19 @@ Every merged change is released: a version's section is written by its
 release, from the changelog entry in the description of each pull request it
 ships.
 
+## [0.57.0] - 2026-10-24
+
+### Added
+
+- `design-bundle`: verify a design proof bundle's signature, files, coverage and decisions, and that each certificate and proof is about its own claim; `--recheck` re-runs every certificate and proof with the pinned Apalache and TLAPS, installed or in the published tools image, with `--sample`/`--seed` and `--jobs`. (#448)
+- `audit`: re-checks proofs with the full prover pin and the platform's tlapm command, applies the same structural checks to certificates and proofs, and takes `--tools`. (#448)
+- Dependencies: the `certifi` floor is raised to 2026.10.19, past PYSEC-2026-4320. (#448)
+
+### Changed
+
+- Bump pypa/gh-action-pypi-publish from 1.14.2 to 1.14.3 in the github-actions group (#449)
+- Publish the design check tools image only from main (#450)
+
 ## [0.56.1] - 2026-10-18
 
 ### Changed
