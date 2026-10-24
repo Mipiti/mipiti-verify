@@ -4406,6 +4406,18 @@ def _verify_contributing_runs(
     help="Seconds allowed for each Apalache check and each tlapm run.",
 )
 @click.option(
+    "--tools",
+    "tools_mode",
+    type=click.Choice(["local", "image", "auto"]),
+    default="local",
+    show_default=True,
+    help=(
+        "Where the checkers run: the pinned Apalache and tlapm installed "
+        "here (local), the pinned tools image through Docker (image), or "
+        "the installed tools where both are and the image otherwise (auto)."
+    ),
+)
+@click.option(
     "--full",
     "full_output",
     is_flag=True,
@@ -4444,6 +4456,7 @@ def audit(
     no_recheck: bool,
     require_recheck: bool,
     recheck_timeout: int,
+    tools_mode: str,
     full_output: bool,
 ) -> None:
     """Verify an audit package, signed HTML report, or signed PDF report.
@@ -4536,6 +4549,7 @@ def audit(
             recheck=not no_recheck,
             require_recheck=require_recheck,
             recheck_timeout=recheck_timeout,
+            tools_mode=tools_mode,
             render=render,
         )
     finally:
@@ -4571,6 +4585,7 @@ def _audit_impl(
     recheck: bool = True,
     require_recheck: bool = False,
     recheck_timeout: int = 600,
+    tools_mode: str = "local",
 ) -> None:
     """Audit-command implementation. See ``audit`` for the contract;
     ``render`` selects between the summary and full output modes."""
@@ -6329,9 +6344,11 @@ def _audit_impl(
     behavioural_report = None
     if isinstance(pkg.get("objective_judgements"), dict):
         from .behavioural import check as _behavioural_check
+        from .design_bundle import pinned_image as _pinned_image
 
         behavioural_report = _behavioural_check(
-            pkg, run_tools=recheck, timeout=float(recheck_timeout))
+            pkg, run_tools=recheck, timeout=float(recheck_timeout),
+            tools_mode=tools_mode, image=_pinned_image())
         _render_behavioural(behavioural_report, pkg)
         if behavioural_report.failed:
             has_failure = True
@@ -7043,3 +7060,128 @@ def _audit_impl(
     console.print()
 
     sys.exit(1 if (has_failure or total_fail > 0) else 0)
+
+
+@main.command(name="design-bundle")
+@click.argument("bundle_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--key-url", default="",
+              help="JWKS URL of the Mipiti instance that signed the bundle "
+                   "(default: https://api.mipiti.io/.well-known/jwks)")
+@click.option("--platform-pubkey", "platform_pubkey_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="PEM public key of the platform, held by the auditor, used "
+                   "instead of the JWKS.")
+@click.option("--recheck", is_flag=True, default=False,
+              help="Run Apalache on every certificate and tlapm on every proof.")
+@click.option("--tools", "tools_mode", type=click.Choice(["auto", "local", "image"]),
+              default="auto", show_default=True,
+              help="Where the checkers run: the pinned tools installed here "
+                   "(local), the pinned tools image through Docker (image), or "
+                   "the installed tools where both are and the image otherwise.")
+@click.option("--image", "image", default="",
+              help="A tools image you built yourself from mipiti-verify's "
+                   "design-check/ directory, by tag or digest, instead of the "
+                   "image this release pins. It must hold the pinned tool "
+                   "releases.")
+@click.option("--jobs", default=1, type=click.IntRange(1, 64), show_default=True,
+              help="Certificates and proofs re-checked at once.")
+@click.option("--sample", default=0, type=click.IntRange(0), show_default=True,
+              help="Re-check only this many obligations, drawn with --seed "
+                   "(0: every one).")
+@click.option("--seed", default=None, type=int,
+              help="Seed of the sample, so another reader draws the same one.")
+@click.option("--timeout", "recheck_timeout", default=600, type=int, show_default=True,
+              help="Seconds allowed for each Apalache check and each tlapm run.")
+def design_bundle(bundle_file: str, key_url: str, platform_pubkey_path: str | None,
+                  recheck: bool, tools_mode: str, image: str, jobs: int, sample: int,
+                  seed: int | None, recheck_timeout: int) -> None:
+    """Verify a design proof bundle, and re-check its certificates and proofs.
+
+    Checks the platform's signature over the manifest, every file against
+    the manifest's hash, the coverage it states against the obligations
+    it lists, and that every obligation decided by a certificate or proof
+    has it, of that obligation and its kind. Each certificate and proof is
+    checked to be about its own module and claim: the invariant's module
+    extends only the certificate's module, states the module's claim, binds
+    the constants and nothing else; a proof assumes nothing of its own,
+    omits no step, and proves the claim of every behaviour of the module.
+
+    With --recheck, Apalache's three checks run on every certificate (and
+    two witnesses that they are not vacuous), and tlapm on every proof,
+    with the commands the platform runs, built here: nothing in the bundle
+    is executed. --sample K --seed S re-checks K obligations drawn with S.
+
+    Exit 0 when everything holds (and, with --recheck, every certificate
+    and proof selected was re-checked here); 1 otherwise.
+    """
+    from . import behavioural as B
+    from . import design_bundle as DB
+
+    try:
+        with open(bundle_file, "rb") as fh:
+            bundle = DB.read(fh.read())
+        fp = DB.embedded_fingerprint(bundle)
+    except DB.BundleError as e:
+        console.print(f"[red]Not a design proof bundle: {e}[/red]")
+        sys.exit(1)
+
+    trusted = None
+    if platform_pubkey_path:
+        from cryptography.hazmat.primitives import serialization
+
+        with open(platform_pubkey_path, "rb") as fh:
+            trusted = serialization.load_pem_public_key(fh.read())
+        console.print(f"  Platform key:    {platform_pubkey_path}")
+    elif fp:
+        trusted, _, used = _resolve_pubkey_from_jwks(fp, key_url)
+        console.print(f"  Platform key:    {fp[:16]}... from {used}")
+
+    tools = None
+    if recheck:
+        tools, missing = B.resolve_tools(tools_mode, image or DB.pinned_image())
+        for why in missing.values():
+            console.print(f"  [yellow]{why}[/yellow]")
+
+    result = DB.check(bundle, trusted, recheck=recheck, tools=tools,
+                      timeout=float(recheck_timeout), jobs=jobs, sample=sample, seed=seed)
+    m = result.manifest
+    console.print(f"\n[bold]Design proof bundle[/bold] {m.get('title', '')!s} "
+                  f"(model {m.get('model_id', '?')} v{m.get('model_version', '?')}, "
+                  f"{m.get('status', '?')})")
+    if result.key_fingerprint:
+        console.print(f"  Signed by:       {result.key_fingerprint[:16]}...")
+    cov = result.coverage
+    if cov:
+        console.print(f"  Obligations:     {cov['obligations']}: {cov['proved']} proved, "
+                      f"{cov['certified']} certified, {cov['to_judge']} to the judge, "
+                      f"{cov['not_evaluated']} not evaluated")
+    for problem in result.problems:
+        console.print(f"  [red]✗ {problem}[/red]")
+    for kind in ("certificate", "proof"):
+        total = sum(1 for r in result.rechecks if r.kind == kind)
+        if not total:
+            continue
+        failed = result.count(B.FAILED, kind)
+        if recheck:
+            parts = [f"{result.count(B.RECHECKED, kind)} re-checked"]
+            if result.count(B.NOT_RECHECKED, kind):
+                parts.append(f"{result.count(B.NOT_RECHECKED, kind)} not re-checked")
+        else:
+            parts = [f"{total - failed} about their module and claim"]
+        if failed:
+            parts.append(f"{failed} failed")
+        console.print(f"  {kind.capitalize() + 's:':<17}{total}: " + ", ".join(parts))
+    for r in result.rechecks:
+        if r.status != B.RECHECKED and (recheck or r.status == B.FAILED):
+            colour = "red" if r.status == B.FAILED else "yellow"
+            console.print(f"    [{colour}]{r.kind} of {r.obligation_id}: {r.status}"
+                          f"{' — ' + r.detail if r.detail else ''}[/{colour}]")
+    if result.not_sampled:
+        console.print(f"  Sample:          {sample} obligation(s) drawn with seed {seed}; "
+                      f"{result.not_sampled} not re-checked in this run")
+    if not recheck and not result.failed:
+        console.print("  [dim]Certificates and proofs checked, not re-run: pass --recheck "
+                      "to run Apalache and tlapm on them.[/dim]")
+    ok = not result.failed and not (recheck and result.unsettled())
+    console.print(f"\n  Verdict:         {'[green]VERIFIED[/green]' if ok else '[red]FAILED[/red]'}")
+    sys.exit(0 if ok else 1)

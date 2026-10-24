@@ -110,6 +110,9 @@ jobs:
     # `oidc_token=None`, breaking ~15 assume-no-OIDC tests. The BFS
     # spec test that needs real Fulcio bundles runs in a separate
     # job (test-spec-invariants) below.
+    permissions:
+      contents: read
+      packages: read  # pull the pinned design check tools image
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -204,6 +207,24 @@ jobs:
         env:
           MIPITI_TEST_REQUIRE_TOOLCHAINS: "iverilog vvp verilator ghdl go cc javac"
         run: python -m pytest -v --ignore=tests/test_spec_invariants.py
+
+      - name: Log in to GHCR
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-check a design proof bundle in the pinned tools image
+        # The platform's certificate and proof in tests/fixtures/design-bundle,
+        # re-checked by Apalache and tlapm in the image design_check_image.json
+        # pins, as a user runs it.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.docs_only != 'true' }}
+        run: |
+          mipiti-verify design-bundle tests/fixtures/design-bundle/design-proof-bundle.tar.gz \
+            --platform-pubkey tests/fixtures/design-bundle/platform-key.pem \
+            --recheck --tools image
 
       - name: Formal verification (Python BFS + cross-check)
         # Fail-safe inert skip: RUN unless detect-changes succeeded AND
