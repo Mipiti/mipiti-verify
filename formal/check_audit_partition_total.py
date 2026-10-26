@@ -264,7 +264,7 @@ _BIND_INIT_PATTERN = re.compile(
 
 
 def _check_bind_partition(tla_text: str, key_sources: set[str]) -> None:
-    """Config 2's per-key_source sub-split (audit_bind_*.cfg ⇒
+    r"""Config 2's per-key_source sub-split (audit_bind_*.cfg ⇒
     Spec_bind_<class> ⇒ Init_bind_<class> == InitBaseFor({...}) /\ PinsNone)
     is total over KeySources \ {KS_CUSTOMER_DSSE} and pairwise disjoint.
     customer_dsse is excluded losslessly (COMPOSITION.md, "Config-2
@@ -294,7 +294,7 @@ def _check_bind_partition(tla_text: str, key_sources: set[str]) -> None:
     if expected - union:
         _die(f"CONFIG-2 TOTALITY VIOLATED — {sorted(expected - union)} covered by no audit_bind_*.cfg")
     if union - expected:
-        _die(f"CONFIG-2 BAD allowedKS — {sorted(union - expected)} outside KeySources \ {{KS_CUSTOMER_DSSE}}")
+        _die(f"CONFIG-2 BAD allowedKS — {sorted(union - expected)} outside KeySources \\ {{KS_CUSTOMER_DSSE}}")
     names = sorted(cfg_to_ks)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
