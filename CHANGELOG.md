@@ -9,6 +9,12 @@ Every merged change is released: a version's section is written by its
 release, from the changelog entry in the description of each pull request it
 ships.
 
+## [0.57.1] - 2026-10-26
+
+### Fixed
+
+- Formal checker `check_audit_partition_total.py` no longer raises invalid escape sequence warnings. (#454)
+
 ## [0.57.0] - 2026-10-24
 
 ### Added
