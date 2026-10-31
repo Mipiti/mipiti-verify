@@ -81,5 +81,7 @@ constraint-dependencies = [
     "pyjwt>=2.14.0",   # PYSEC-2026-4142 (pyjwt<2.14.0); PYSEC-2026-175/177/178/179 (<2.13.0); transitive via sigstore
     "pip>=26.2.0",     # PYSEC-2026-3721 (pip<26.2.0 vulnerable; transitive via pip-audit in requirements-audit.lock)
     "msgpack>=1.2.1",  # PYSEC-2026-3625 (msgpack<1.2.1 vulnerable; transitive via pip-audit's cachecontrol)
-    "pyasn1>=0.6.4",   # PYSEC-2026-3455/3456/3457 (pyasn1<0.6.4 vulnerable; transitive via sigstore)
+    "pyasn1>=0.6.5",   # CVE-2026-119194..119197 (pyasn1<0.6.5); PYSEC-2026-3455/3456/3457 (<0.6.4); transitive via sigstore
+    "tuf>=7.0.0",      # GHSA-qp9x-wp8f-qgjj (tuf<=6.0.0 vulnerable; transitive via sigstore, which allows tuf<8)
+    "dnspython>=2.9.0",  # CVE-2026-114605 (dnspython<2.9.0 vulnerable; transitive via email-validator)
 ]
