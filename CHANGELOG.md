@@ -9,6 +9,16 @@ Every merged change is released: a version's section is written by its
 release, from the changelog entry in the description of each pull request it
 ships.
 
+## [0.57.2] - 2026-10-31
+
+### Changed
+
+- Bump the github-actions group with 2 updates (#458)
+
+### Fixed
+
+- Dependencies: pyasn1 0.6.5, tuf 7.0.1, dnspython 2.9.1 (security advisories). (#459)
+
 ## [0.57.1] - 2026-10-26
 
 ### Fixed
