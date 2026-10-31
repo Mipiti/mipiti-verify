@@ -5,3 +5,4 @@
 # Avoids an unhashed `pip install pip-audit==X` that would otherwise
 # trust whatever PyPI returns for the version pin.
 pip-audit==2.10.0
+filelock>=4.2.1  # CVE-2026-112935 and siblings (filelock<4.2.1 vulnerable; via pip-audit's cachecontrol)
