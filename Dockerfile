@@ -1,6 +1,6 @@
 # Digest-pinned so a rebuild of the same commit resolves the same base
 # image. Dependabot (docker ecosystem) bumps the digest.
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 COPY requirements-all.lock /tmp/requirements-all.lock
 RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-all.lock
