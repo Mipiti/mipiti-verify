@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -58,20 +60,45 @@ def is_dot_segment(seg: str) -> bool:
     return read.lower().replace("%2e", ".") in (".", "..")
 
 
+def _seg(value: Any) -> str:
+    """``value`` as exactly one path segment: percent-encoded so nothing in it
+    acts as structure (``/``, ``\\``, ``?``, ``#``, ``%``, controls), and
+    refused when empty or a dot segment, which no encoding stops a resolver
+    reading. Every id a request path carries goes through here
+    (``tests/test_path_guard.py`` fails a path that interpolates anything
+    else)."""
+    text = str(value)
+    if not text or is_dot_segment(text):
+        raise UnsafePath(f"refused {text!r} as a path segment")
+    return quote(text, safe="")
+
+
 class _GuardedClient(httpx.Client):
-    """An ``httpx.Client`` that refuses a request whose path has a dot
-    segment before it is resolved. The paths interpolate ids (a model id from
-    the configuration, ids the API returns), and httpx resolves dot segments:
-    an id of ``..`` would move the request, with the key, to another endpoint
-    than the one meant. No id is a dot segment, so nothing legitimate is
-    refused; a guarded path resolves to itself (``tests/test_path_guard.py``
-    drives this guard against httpx's own resolution)."""
+    """An ``httpx.Client`` that sends a request only to the path it was
+    written for. Ids reach paths encoded (``_seg``); this is the backstop for
+    any path. httpx builds the request, resolving the path as it will send
+    it, and the request is refused unless that path is the path as written
+    (both read with percent-encoding undone): whatever httpx would drop or
+    climb is caught without a list of the forms it reads as dots. The dot
+    forms httpx leaves alone (``is_dot_segment``) are refused too, since a
+    proxy on the way may resolve them."""
 
     def build_request(self, method, url, *args, **kwargs):
-        path = str(url).split("?", 1)[0].split("#", 1)[0]
-        if any(is_dot_segment(seg) for seg in path.split("/")):
-            raise UnsafePath(f"refused a request path with a dot segment: {path!r}")
-        return super().build_request(method, url, *args, **kwargs)
+        text = str(url)
+        absolute = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text) is not None
+        written = text.split("#", 1)[0].split("?", 1)[0]
+        if absolute:
+            written = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", written)
+        if any(is_dot_segment(seg) for seg in written.split("/")):
+            raise UnsafePath(f"refused a request path with a dot segment: {written!r}")
+        request = super().build_request(method, url, *args, **kwargs)
+        sent = request.url.raw_path.decode("ascii").split("?", 1)[0]
+        if not absolute:
+            written = self.base_url.raw_path.decode("ascii").rstrip("/") + written
+        if unquote(sent) != unquote(written):
+            raise UnsafePath(f"refused a request path the resolver moves: {written!r} "
+                             f"would be sent as {sent!r}")
+        return request
 
 
 class MipitiClient:
@@ -124,7 +151,7 @@ class MipitiClient:
         if repo:
             params["repo"] = repo
         resp = self._client.get(
-            f"/api/models/{model_id}/verification/pending",
+            f"/api/models/{_seg(model_id)}/verification/pending",
             params=params,
         )
         _raise_for_status_with_body(resp)
@@ -143,7 +170,7 @@ class MipitiClient:
         if repo:
             params["repo"] = repo
         resp = self._client.get(
-            f"/api/models/{model_id}/verification/assertions",
+            f"/api/models/{_seg(model_id)}/verification/assertions",
             params=params,
         )
         _raise_for_status_with_body(resp)
@@ -195,7 +222,7 @@ class MipitiClient:
             body["dsse_bundle"] = dsse_bundle
 
         resp = self._client.post(
-            f"/api/models/{model_id}/verification/results",
+            f"/api/models/{_seg(model_id)}/verification/results",
             json=body,
         )
         _raise_for_status_with_body(resp)
@@ -217,7 +244,7 @@ class MipitiClient:
 
     def get_model(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id} — full model with controls."""
-        resp = self._client.get(f"/api/models/{model_id}")
+        resp = self._client.get(f"/api/models/{_seg(model_id)}")
         _raise_for_status_with_body(resp)
         return resp.json()
 
@@ -226,13 +253,13 @@ class MipitiClient:
         params: dict[str, str] = {}
         if component_id:
             params["component_id"] = component_id
-        resp = self._client.get(f"/api/models/{model_id}/controls", params=params)
+        resp = self._client.get(f"/api/models/{_seg(model_id)}/controls", params=params)
         _raise_for_status_with_body(resp)
         return resp.json()
 
     def get_verification_report(self, model_id: str) -> dict[str, Any]:
         """GET /api/models/{id}/verification/report"""
-        resp = self._client.get(f"/api/models/{model_id}/verification/report")
+        resp = self._client.get(f"/api/models/{_seg(model_id)}/verification/report")
         _raise_for_status_with_body(resp)
         return resp.json()
 

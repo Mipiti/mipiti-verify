@@ -41,3 +41,67 @@ def test_the_client_uses_the_guard():
     client = MipitiClient(api_key="k", base_url=BASE)
     with pytest.raises(UnsafePath):
         client._client.build_request("GET", "/api/models/../admin")
+
+
+def test_every_path_interpolation_is_one_encoded_segment():
+    """Every id a request path carries goes through _seg: read from the
+    source, so a method added later cannot skip it."""
+    import ast
+    import pathlib
+
+    import mipiti_verify.client as client_mod
+
+    tree = ast.parse(pathlib.Path(client_mod.__file__).read_text())
+    raw, paths = [], 0
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.JoinedStr) and node.values
+                and isinstance(node.values[0], ast.Constant)
+                and str(node.values[0].value).startswith(("/", "?"))):
+            paths += 1
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue) and not (
+                        isinstance(part.value, ast.Call)
+                        and getattr(part.value.func, "id", "") == "_seg"):
+                    raw.append(f"line {node.lineno}: {ast.unparse(part.value)}")
+    assert paths >= 6 and not raw, raw
+
+
+@pytest.mark.parametrize("value,encoded", [
+    ("m1", "m1"), ("a/b", "a%2Fb"), ("a?b", "a%3Fb"), ("a#b", "a%23b"), ("100%", "100%25"),
+])
+def test_a_segment_is_encoded_whole(value, encoded):
+    from mipiti_verify.client import _seg
+
+    assert _seg(value) == encoded
+
+
+@pytest.mark.parametrize("value", ["", ".", "..", "%2e%2e", ".\t."])
+def test_an_empty_or_dot_segment_is_refused(value):
+    from mipiti_verify.client import _seg
+
+    with pytest.raises(UnsafePath):
+        _seg(value)
+
+
+_CHARS = list(".%2eE/\\?#;:@&=+ \t\nab09-_~") + ["．", "。", "／", "＼", "%2e", "%2E", "%2f", "%5c"]
+
+
+def test_a_random_id_is_one_segment_sent_intact():
+    """Seeded property: any id is refused (empty or a dot segment) or reaches
+    the server as exactly one segment that decodes to the id."""
+    import random
+    from urllib.parse import unquote
+
+    from mipiti_verify.client import _seg
+
+    rng = random.Random(20261118)
+    client = _GuardedClient(base_url=BASE)
+    for _ in range(4000):
+        ident = "".join(rng.choice(_CHARS) for _ in range(rng.randint(1, 6)))
+        try:
+            seg = _seg(ident)
+        except UnsafePath:
+            assert ident == "" or is_dot_segment(ident), repr(ident)
+            continue
+        parts = client.build_request("GET", f"/api/models/{seg}/x").url.raw_path.decode().split("/")
+        assert len(parts) == 5 and parts[4] == "x" and unquote(parts[3]) == ident, repr(ident)
