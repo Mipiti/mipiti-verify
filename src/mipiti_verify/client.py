@@ -44,6 +44,36 @@ def _raise_for_status_with_body(resp: httpx.Response) -> None:
     )
 
 
+class UnsafePath(ValueError):
+    """A request path with a dot segment: an id that would move the request
+    to another endpoint."""
+
+
+def is_dot_segment(seg: str) -> bool:
+    """Whether a path segment is a dot segment in any form a URL resolver
+    reads as one: ``.`` or ``..``, with either dot written ``%2e`` (either
+    case), and with any tab or newline deleted, as the WHATWG URL standard
+    reads it (httpx does neither, but a proxy on the way may)."""
+    read = seg.replace("\t", "").replace("\n", "").replace("\r", "")
+    return read.lower().replace("%2e", ".") in (".", "..")
+
+
+class _GuardedClient(httpx.Client):
+    """An ``httpx.Client`` that refuses a request whose path has a dot
+    segment before it is resolved. The paths interpolate ids (a model id from
+    the configuration, ids the API returns), and httpx resolves dot segments:
+    an id of ``..`` would move the request, with the key, to another endpoint
+    than the one meant. No id is a dot segment, so nothing legitimate is
+    refused; a guarded path resolves to itself (``tests/test_path_guard.py``
+    drives this guard against httpx's own resolution)."""
+
+    def build_request(self, method, url, *args, **kwargs):
+        path = str(url).split("?", 1)[0].split("#", 1)[0]
+        if any(is_dot_segment(seg) for seg in path.split("/")):
+            raise UnsafePath(f"refused a request path with a dot segment: {path!r}")
+        return super().build_request(method, url, *args, **kwargs)
+
+
 class MipitiClient:
     """Sync httpx client for pulling pending assertions and submitting results."""
 
@@ -63,7 +93,7 @@ class MipitiClient:
             )
         self.key_scope = "verifier" if self.api_key.startswith("mv_") else "developer"
         from ._tls import tls_context
-        self._client = httpx.Client(
+        self._client = _GuardedClient(
             base_url=self.base_url,
             headers={"X-API-Key": self.api_key},
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
