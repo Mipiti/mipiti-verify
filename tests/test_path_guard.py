@@ -105,3 +105,31 @@ def test_a_random_id_is_one_segment_sent_intact():
             continue
         parts = client.build_request("GET", f"/api/models/{seg}/x").url.raw_path.decode().split("/")
         assert len(parts) == 5 and parts[4] == "x" and unquote(parts[3]) == ident, repr(ident)
+
+
+def test_a_random_raw_path_is_sent_as_written_or_refused():
+    """Seeded property over raw, unencoded paths of 1 to 8 random segments:
+    a path the guard passes is sent exactly as written, and a path httpx
+    would move is refused."""
+    import random
+    from urllib.parse import unquote
+
+    rng = random.Random(20261118 + 1)
+    guarded = _GuardedClient(base_url=BASE)
+    plain = httpx.Client(base_url=BASE)
+    for _ in range(4000):
+        segs = ["".join(rng.choice(_CHARS) for _ in range(rng.randint(1, 6)))
+                for _ in range(rng.randint(1, 8))]
+        path = "/api/models/" + "/".join(segs)
+        written = unquote(path.split("?")[0].split("#")[0])
+        try:
+            moved = unquote(plain.build_request("GET", path).url.raw_path.decode()
+                            .split("?")[0]) != written
+        except httpx.InvalidURL:
+            continue  # httpx refuses it itself; nothing is sent
+        try:
+            sent = guarded.build_request("GET", path).url.raw_path.decode().split("?")[0]
+        except (UnsafePath, httpx.InvalidURL):
+            continue
+        assert not moved, path
+        assert unquote(sent) == written, path
