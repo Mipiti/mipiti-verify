@@ -90,11 +90,18 @@ def mechanism_spans(project_root: Path, mechanism: str) -> tuple[list[tuple[int,
     from .languages.definitions import SCOPE_SYMBOL, language_of, locate
     from .verifiers.tests import mechanism_kinds
 
+    from .verifiers import PathTraversalError, safe_resolve_path
+
     try:
         mech = parse_mechanism(mechanism)
     except DisableError as e:
         return [], str(e)
-    path = project_root / mech.file
+    try:
+        # The mechanism's file under the project root, never outside it
+        # (formal/RepoContainment.tla).
+        path = safe_resolve_path(project_root, mech.file)
+    except PathTraversalError as e:
+        return [], str(e)
     if not path.is_file():
         return [], f"{mech.file} is not a file under the project root"
     try:

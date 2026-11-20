@@ -377,13 +377,15 @@ def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
     read fails — the caller's pre-LLM fail-closed guard catches that
     case before invoking the LLM.
     """
-    import glob
+    from .verifiers import safe_glob
 
     pattern = (params.get("pattern") or "").strip()
     if not pattern:
         return ""
     try:
-        matches = glob.glob(str(project_root / pattern), recursive=True)
+        # Files under the project root alone: a pattern that would leave it
+        # reads nothing (formal/RepoContainment.tla).
+        matches = [str(p) for p in safe_glob(project_root, pattern)]
     except Exception:
         return ""
     if not matches:
@@ -490,6 +492,57 @@ def attestation_assertion_records(
         {k: a[k] for k in ATTESTED_ASSERTION_FIELDS if k in a}
         for a in all_assertions
     ]
+
+
+#: The most a submission's attested payload (the assertion records and
+#: results an attestation signs) holds, in bytes of JSON. An attestation
+#: carries its payload base64-encoded, a third larger, and the platform takes
+#: an attestation of at most 4 MiB; at this size one carries about 2 MB, so it
+#: stays well inside that with room for its certificate and log entry. A
+#: tier's results past it go in several submissions, each a run of its own.
+SUBMISSION_PAYLOAD_BYTES = 1_500_000
+
+
+def payload_cost(result: dict[str, Any], record: dict[str, Any]) -> int:
+    """What one result adds to an attested payload: its JSON and its
+    assertion's record's (``formal/ChunkedSubmission.tla``'s ``Size``)."""
+    return (len(json.dumps(result, separators=(",", ":")))
+            + len(json.dumps(record, separators=(",", ":"))))
+
+
+def result_chunks(
+    assertions: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    max_bytes: int | None = None,
+) -> list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    """``results`` split, in order, into ``(chunk assertions, chunk
+    results)``: each chunk's attested payload (its assertions' records and
+    its results, as JSON) within ``max_bytes``, a result larger than that
+    alone in a chunk of its own. Each chunk's assertions are exactly those
+    its results name, the set its content hash binds, as the platform
+    recomputes it from the results it receives. One chunk where everything
+    fits. ``max_bytes`` defaults to :data:`SUBMISSION_PAYLOAD_BYTES`."""
+    if max_bytes is None:
+        max_bytes = SUBMISSION_PAYLOAD_BYTES
+    by_id = {a.get("id", ""): a for a in assertions}
+    records = {r["id"]: r for r in attestation_assertion_records(assertions) if "id" in r}
+    chunks: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+    current_a: list[dict[str, Any]] = []
+    current_r: list[dict[str, Any]] = []
+    size = 0
+    for result in results:
+        aid = result.get("assertion_id", "")
+        cost = payload_cost(result, records.get(aid, {}))
+        if current_r and size + cost > max_bytes:
+            chunks.append((current_a, current_r))
+            current_a, current_r, size = [], [], 0
+        current_r.append(result)
+        if aid in by_id:
+            current_a.append(by_id[aid])
+        size += cost
+    if current_r:
+        chunks.append((current_a, current_r))
+    return chunks
 
 
 class Runner:
@@ -879,7 +932,17 @@ class Runner:
         comp_path = (target.get("path") or "").strip().strip("/")
         if not comp_path:
             return
-        new_root = (self.project_root / comp_path).resolve()
+        from .verifiers import PathTraversalError, safe_resolve_path
+        try:
+            # The component's directory under the project root, never outside
+            # it: every assertion of the run is resolved under the root this
+            # sets (formal/RepoContainment.tla). One that would leave stops the
+            # run rather than verify against the wrong tree.
+            new_root = safe_resolve_path(self.project_root, comp_path)
+        except PathTraversalError as e:
+            raise RuntimeError(
+                f"Component {self.component_id!r} declares a path outside the "
+                f"repository ({comp_path!r}); refusing to verify against it") from e
         if self.verbose:
             console.print(
                 f"  [dim]Component {self.component_id!r} declares path "
@@ -902,55 +965,17 @@ class Runner:
         # files. Shared by both tier submissions below. Independent of git/SVN/P4.
         pipeline["source_digest"] = _source_digest(self.project_root, t1_assertions)
 
-        t1_run_id = ""
+        t1_run_ids: list[str] = []
         if t1_results and not self.dry_run and not self._developer_key:
-            content_hash = compute_content_hash(t1_assertions, t1_results)
-            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
-                model_id=model_id,
-                tier=1,
-                content_hash=content_hash,
-                pipeline=pipeline,
-                assertions=attestation_assertion_records(t1_assertions),
-                results=t1_results,
-            )
-            resp = self.client.submit_results(
-                model_id,
-                pipeline=pipeline,
-                results=t1_results,
-                bundle=bundle,
-                signature=signature,
-                signed_hash=signed_hash,
-                content_hash=content_hash,
-                dsse_bundle=dsse_bundle,
-            )
-            t1_run_id = resp.get("run_id", "")
+            t1_run_ids = self._submit_tier(model_id, 1, t1_assertions, t1_results, pipeline)
 
         # --- Tier 2 ---
         t2_results, t2_details, t2_assertions = self._run_tier(model_id, tier=2)
         details.extend(t2_details)
 
-        t2_run_id = ""
+        t2_run_ids: list[str] = []
         if t2_results and not self.dry_run and not self._developer_key:
-            content_hash = compute_content_hash(t2_assertions, t2_results)
-            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
-                model_id=model_id,
-                tier=2,
-                content_hash=content_hash,
-                pipeline=pipeline,
-                assertions=attestation_assertion_records(t2_assertions),
-                results=t2_results,
-            )
-            resp = self.client.submit_results(
-                model_id,
-                pipeline=pipeline,
-                results=t2_results,
-                bundle=bundle,
-                signature=signature,
-                signed_hash=signed_hash,
-                content_hash=content_hash,
-                dsse_bundle=dsse_bundle,
-            )
-            t2_run_id = resp.get("run_id", "")
+            t2_run_ids = self._submit_tier(model_id, 2, t2_assertions, t2_results, pipeline)
 
         # --- Sufficiency ---
         # Evaluated server-side at assertion submission. Fetch for display.
@@ -983,8 +1008,12 @@ class Runner:
             "suff_sufficient": sum(1 for r in suff_all if r["result"] == "sufficient"),
             "suff_insufficient": sum(1 for r in suff_all if r["result"] == "insufficient"),
             "suff_skip": 0,
-            "tier1_run_id": t1_run_id,
-            "tier2_run_id": t2_run_id,
+            # The first submission's run, as before; every run of the tier,
+            # one per submission, in ``*_run_ids``.
+            "tier1_run_id": t1_run_ids[0] if t1_run_ids else "",
+            "tier2_run_id": t2_run_ids[0] if t2_run_ids else "",
+            "tier1_run_ids": t1_run_ids,
+            "tier2_run_ids": t2_run_ids,
             "content_hash": combined_content_hash,
             "dry_run": self.dry_run,
             "developer_key": self._developer_key,
@@ -992,6 +1021,48 @@ class Runner:
             "suff_details": suff_all,
             "repo_bound_assertions": getattr(self, "_repo_bound_assertions", 0),
         }
+
+    def _submit_tier(
+        self,
+        model_id: str,
+        tier: int,
+        assertions: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        pipeline: dict[str, Any],
+    ) -> list[str]:
+        """Submit a tier's results, in as many submissions as their attested
+        payload needs (:func:`result_chunks`), each with its own content hash
+        and attestation over exactly its own assertions and results; returns
+        the run id of each. A submission the platform refuses stops the rest:
+        the results already submitted stand, and the next run submits every
+        result again."""
+        chunks = result_chunks(assertions, results)
+        if self.verbose and len(chunks) > 1:
+            console.print(f"  [dim]Tier {tier}: {len(results)} results in "
+                          f"{len(chunks)} submissions[/dim]")
+        run_ids: list[str] = []
+        for chunk_assertions, chunk_results in chunks:
+            content_hash = compute_content_hash(chunk_assertions, chunk_results)
+            bundle, signature, signed_hash, dsse_bundle = self._choose_attestation(
+                model_id=model_id,
+                tier=tier,
+                content_hash=content_hash,
+                pipeline=pipeline,
+                assertions=attestation_assertion_records(chunk_assertions),
+                results=chunk_results,
+            )
+            resp = self.client.submit_results(
+                model_id,
+                pipeline=pipeline,
+                results=chunk_results,
+                bundle=bundle,
+                signature=signature,
+                signed_hash=signed_hash,
+                content_hash=content_hash,
+                dsse_bundle=dsse_bundle,
+            )
+            run_ids.append(resp.get("run_id", ""))
+        return run_ids
 
     def _run_tier(
         self, model_id: str, tier: int
