@@ -10,7 +10,6 @@ type without exception.
 
 from __future__ import annotations
 
-import glob as glob_mod
 from pathlib import Path
 
 from . import SOUNDNESS_PRESENCE, SOUNDNESS_WITNESS, VerifierResult, register
@@ -95,8 +94,13 @@ class TestExistsVerifier:
     """Check that test files matching a pattern exist."""
 
     def verify(self, params: dict, project_root: Path) -> VerifierResult:
+        from . import safe_glob
+
         pattern = params["pattern"]
-        matches = glob_mod.glob(str(project_root / pattern), recursive=True)
+        # Matches under the project root alone; a pattern that would leave
+        # it is refused, and the refusal fails the check
+        # (formal/RepoContainment.tla).
+        matches = safe_glob(project_root, pattern)
         if matches:
             return VerifierResult(
                 passed=True,

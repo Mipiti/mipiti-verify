@@ -100,6 +100,31 @@ def safe_resolve_path(project_root: Path, file_param: str) -> Path:
     return resolved
 
 
+def safe_glob(project_root: Path, pattern: str) -> list[Path]:
+    """The paths under the project root a glob pattern matches, sorted.
+
+    The pattern must be repository-relative: an absolute pattern, a drive
+    or a ``..`` segment is refused (``PathTraversalError``), as a scope entry
+    is. A match that resolves outside the project root (through a link) is
+    left out, never read or counted. ``formal/RepoContainment.tla``.
+    """
+    import glob as _glob
+
+    text = str(pattern or "").replace("\\", "/").strip()
+    if not _scope_entry_is_safe(text):
+        raise PathTraversalError(f"Pattern escapes or leaves the project root: {pattern!r}")
+    root = project_root.resolve()
+    out: list[Path] = []
+    for match in _glob.glob(str(project_root / text), recursive=True):
+        path = Path(match)
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        out.append(path)
+    return sorted(out)
+
+
 def safe_read_file(project_root: Path, file_param: str, max_size: int = 2 * 1024 * 1024) -> str | None:
     """Read a file safely within the project root.
 
