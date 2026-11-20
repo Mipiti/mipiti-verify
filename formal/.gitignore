@@ -2,4 +2,5 @@ tla2tools.jar
 states/
 *.dot
 cs_check.cfg
+rc_check.cfg
 .tlacache/

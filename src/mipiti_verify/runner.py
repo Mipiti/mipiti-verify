@@ -377,13 +377,15 @@ def _load_pattern_source(project_root: Path, params: dict[str, Any]) -> str:
     read fails — the caller's pre-LLM fail-closed guard catches that
     case before invoking the LLM.
     """
-    import glob
+    from .verifiers import safe_glob
 
     pattern = (params.get("pattern") or "").strip()
     if not pattern:
         return ""
     try:
-        matches = glob.glob(str(project_root / pattern), recursive=True)
+        # Files under the project root alone: a pattern that would leave it
+        # reads nothing (formal/RepoContainment.tla).
+        matches = [str(p) for p in safe_glob(project_root, pattern)]
     except Exception:
         return ""
     if not matches:
@@ -930,7 +932,17 @@ class Runner:
         comp_path = (target.get("path") or "").strip().strip("/")
         if not comp_path:
             return
-        new_root = (self.project_root / comp_path).resolve()
+        from .verifiers import PathTraversalError, safe_resolve_path
+        try:
+            # The component's directory under the project root, never outside
+            # it: every assertion of the run is resolved under the root this
+            # sets (formal/RepoContainment.tla). One that would leave stops the
+            # run rather than verify against the wrong tree.
+            new_root = safe_resolve_path(self.project_root, comp_path)
+        except PathTraversalError as e:
+            raise RuntimeError(
+                f"Component {self.component_id!r} declares a path outside the "
+                f"repository ({comp_path!r}); refusing to verify against it") from e
         if self.verbose:
             console.print(
                 f"  [dim]Component {self.component_id!r} declares path "
