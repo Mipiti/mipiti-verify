@@ -232,6 +232,27 @@ jobs:
         if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: python formal/check_pipeline.py
 
+      - name: Formal verification (chunked submission is ChunkedSubmission.tla)
+        # Every state of the module, the runner's real submissions from each
+        # finished one, and three regressions that must be caught.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
+        run: python formal/check_chunked_submission.py
+
+      - name: Formal proofs (TLAPS, in the pinned tools image)
+        # Every *Proofs.tla, checked by the tlapm the design-check image
+        # pins (design_check_image.json), network off.
+        if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
+        run: |
+          IMAGE=$(python -c "import json; print(json.load(open('src/mipiti_verify/design_check_image.json'))['image'])")
+          for proof in formal/*Proofs.tla; do
+            echo "--- TLAPS: $proof ---"
+            out=$(docker run --rm --network=none --user "$(id -u):$(id -g)" \
+              -v "$PWD/formal:/work" -w /work --entrypoint /tools/tlapm/bin/tlapm "$IMAGE" \
+              --cleanfp --cache-dir /tmp/tlapm-cache "$(basename "$proof")" 2>&1) || true
+            echo "$out" | grep -E "obligations|line [0-9]+, char" || true
+            echo "$out" | grep -q "All [0-9]* obligations proved" || { echo "$out" | tail -40; exit 1; }
+          done
+
       - name: Download TLC
         if: ${{ needs.detect-changes.result != 'success' || needs.detect-changes.outputs.inert != 'true' }}
         run: |
@@ -256,6 +277,18 @@ jobs:
           java $JAVA_OPTS -jar tla2tools.jar -config KeySourceResolver.cfg -workers auto KeySourceResolver.tla
           echo "--- TLC: Tier2RunnerSide (runner-side tier-2 rendering invariants T1-T5) ---"
           java $JAVA_OPTS -jar tla2tools.jar -config Tier2RunnerSide.cfg -workers auto Tier2RunnerSide.tla
+          echo "--- TLC: ChunkedSubmission (Partition, Bounded, HashBinds, AllSubmitted) ---"
+          java $JAVA_OPTS -jar tla2tools.jar -config ChunkedSubmission.cfg -workers auto ChunkedSubmission.tla
+          # Each mutant must break its property; each witness must be reached.
+          for pair in all_assertions:HashBinds no_split:Bounded drop_last:AllSubmitted \
+                      none:WitSeveral none:WitAlone; do
+            m=${pair%%:*}; p=${pair##*:}
+            sed -e "s/Mutant = \"none\"/Mutant = \"$m\"/" -e '/^INVARIANTS/,$d' ChunkedSubmission.cfg > cs_check.cfg
+            printf 'INVARIANTS\n    %s\nCHECK_DEADLOCK FALSE\n' "$p" >> cs_check.cfg
+            out=$(java $JAVA_OPTS -jar tla2tools.jar -config cs_check.cfg -workers auto ChunkedSubmission.tla 2>&1 || true)
+            echo "$out" | grep -q "Invariant $p is violated" || { echo "$m/$p not reached"; echo "$out" | tail -20; exit 1; }
+            echo "  $m: $p violated, as it must be"
+          done
         working-directory: formal
 
   audit-tlc:

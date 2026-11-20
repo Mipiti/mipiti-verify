@@ -1899,8 +1899,13 @@ def _text_output(report: dict, verbose: bool, model_title: str | None = None) ->
     elif report.get("developer_key"):
         console.print("\n  [yellow]Developer key — results not submitted. Use a verifier key (mv_) for CI.[/yellow]")
     else:
-        console.print(f"\n  Submitted: tier1 run={report.get('tier1_run_id', 'n/a')}  "
-                      f"tier2 run={report.get('tier2_run_id', 'n/a')}")
+        def _runs(tier: int) -> str:
+            # Every run of the tier: one per submission, several where the
+            # tier's results were too large for one attestation.
+            ids = report.get(f"tier{tier}_run_ids") or (
+                [report[f"tier{tier}_run_id"]] if report.get(f"tier{tier}_run_id") else [])
+            return ",".join(ids) if ids else "n/a"
+        console.print(f"\n  Submitted: tier1 run={_runs(1)}  tier2 run={_runs(2)}")
 
     if verbose:
         prefix_v = f"{prefix} " if prefix else ""
