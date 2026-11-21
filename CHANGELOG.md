@@ -9,6 +9,19 @@ Every merged change is released: a version's section is written by its
 release, from the changelog entry in the description of each pull request it
 ships.
 
+## [0.58.0] - 2026-11-21
+
+### Added
+
+- A tier's results are submitted in as many submissions as their attestations need, each a run of its own; the report adds `tier1_run_ids` and `tier2_run_ids`. (#465)
+- Every id in a request path is encoded as one path segment, and the client sends a request only to the path it was written for. (#465)
+- Every file read or counted for an assertion lies under the project root: glob patterns that are absolute or contain `..` are refused, matches resolving outside the root are left out, and a component path outside the repository stops the run. (#465)
+- Dependencies: dnspython 2.9.2 (security advisory). (#465)
+
+### Changed
+
+- Bump docker/login-action from 4.7.0 to 4.8.0 in the github-actions group (#464)
+
 ## [0.57.2] - 2026-10-31
 
 ### Changed
